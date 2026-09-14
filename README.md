@@ -10,7 +10,7 @@
 
 ## 📢 News
 - `[2026-1-31]` Our follow-up work [IR-WM](https://arxiv.org/abs/2510.16729) is accepted by ICRA 2026! Please see the [`ir-wm`](https://github.com/yuyang-cloud/Drive-OccWorld/tree/ir-wm) branch for more details.
-  
+
 - `[2024-12-10]` Our Drive-OccWorld is accepted by AAAI 2025 (Oral)!
 
 - `[2024-10-14]` We released our project website [here](https://drive-occworld.github.io/).
@@ -30,7 +30,7 @@
 
 ## 📝 Getting Started
 
-- [Installation](DOCS/INSTALL.MD) 
+- [Installation](DOCS/INSTALL.MD)
 
 - [Prepare Dataset](DOCS/DATASET.MD)
 
@@ -40,7 +40,7 @@
 
 Drive-OccWorld understands how the world evolves by accurately modeling the dynamics of movable objects and the future states of the static environment.
 
-### Scene 1 (Lane Change)
+<!-- ### Scene 1 (Lane Change)
 <div style="text-align:center;">
     <img src="assets/figures/forecasting_1.gif" alt="Local GIF" width="600px" />
 </div>
@@ -53,14 +53,14 @@ Drive-OccWorld understands how the world evolves by accurately modeling the dyna
 ### Scene 3 (Vehicle Following)
 <div style="text-align:center;">
     <img src="assets/figures/forecasting_3.gif" alt="Local GIF" width="600px" />
-</div>
+</div> -->
 
 
 ## 🚗 Demo of Continuous Forecasting and Planning (E2E Planning)
 
 Drive-OccWorld plans trajectories through forecasting future occupancy state and selecting optimal trajectory based on a comprehensive occupancy-based cost function.
 
-### Scene 1 (Turn Left to Avoid Stopped Vehicle)
+<!-- ### Scene 1 (Turn Left to Avoid Stopped Vehicle)
 <div style="text-align:center;">
     <img src="assets/figures/planning_1.png" width="600px" />
 </div>
@@ -85,7 +85,7 @@ Drive-OccWorld plans trajectories through forecasting future occupancy state and
 
 <div style="text-align:center;">
     <img src="assets/figures/planning_3.gif" alt="Local GIF" width="300px" />
-</div>
+</div> -->
 
 
 ## Acknowledgments
