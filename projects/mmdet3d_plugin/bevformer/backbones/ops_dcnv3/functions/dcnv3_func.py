@@ -13,7 +13,14 @@ import torch.nn.functional as F
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.cuda.amp import custom_bwd, custom_fwd
-import DCNv3
+
+# 注释的原代码：该写法要求 DCNv3 已安装为 Python 环境中的顶层扩展模块，
+# 仅执行 ``python setup.py build_ext --inplace`` 时，从项目根目录启动可能无法找到它。
+# import DCNv3
+
+# 增加中文注释：使用包内相对导入，直接加载 ops_dcnv3 目录中就地编译生成的
+# DCNv3*.so，无需再把该目录额外加入 PYTHONPATH 或安装到 site-packages。
+from .. import DCNv3
 
 
 class DCNv3Function(Function):

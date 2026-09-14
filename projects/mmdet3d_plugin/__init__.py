@@ -9,4 +9,7 @@ from .datasets.pipelines import (
 from .models.utils import *
 from .models.opt.adamw import AdamW2
 from .bevformer import *
-from .dd3d import *
+
+# 注释原因：仓库当前提供的 Drive-OccWorld 配置未使用 DD3D 检测模型，
+# 无条件导入会额外要求安装 Detectron2。后续启用 NuscenesDD3D 时再恢复此行。
+# from .dd3d import *

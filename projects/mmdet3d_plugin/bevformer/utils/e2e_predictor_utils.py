@@ -83,11 +83,15 @@ def get_bev_grids_3d(H, W, Z, bs=1, device='cuda', dtype=torch.float):
     return ref_3d
 
 
-# JIT
-from torch.utils.cpp_extension import load
-dvxlr = load("dvxlr", sources=[
-    "third_lib/dvxlr/dvxlr.cpp",
-    "third_lib/dvxlr/dvxlr.cu"], verbose=True)
+# 注释的原代码：每次在新环境或缓存丢失后，导入本文件都会触发 PyTorch JIT 编译。
+# from torch.utils.cpp_extension import load
+# dvxlr = load("dvxlr", sources=[
+#     "third_lib/dvxlr/dvxlr.cpp",
+#     "third_lib/dvxlr/dvxlr.cu"], verbose=True)
+
+# 增加中文注释：直接导入在 third_lib/dvxlr 目录中一次性就地编译好的 CUDA 扩展，
+# 避免训练或多进程启动阶段重复触发 JIT 编译。
+from third_lib.dvxlr import dvxlr
 class DifferentiableVoxelRenderingLayer(torch.autograd.Function):
 
     @staticmethod
@@ -116,9 +120,13 @@ DifferentiableVoxelRendering = DifferentiableVoxelRenderingLayer.apply
 
 
 # differentiable volume rendering v2.
-dvxlr_v2 = load("dvxlr_v2", sources=[
-    "third_lib/dvxlr/dvxlr_v2.cpp",
-    "third_lib/dvxlr/dvxlr_v2.cu"], verbose=True)
+# 注释的原代码：运行时通过 JIT 编译并加载 dvxlr_v2。
+# dvxlr_v2 = load("dvxlr_v2", sources=[
+#     "third_lib/dvxlr/dvxlr_v2.cpp",
+#     "third_lib/dvxlr/dvxlr_v2.cu"], verbose=True)
+
+# 增加中文注释：加载与 dvxlr 同时就地编译生成的 dvxlr_v2 CUDA 扩展。
+from third_lib.dvxlr import dvxlr_v2
 class DifferentiableVoxelRenderingLayerV2(torch.autograd.Function):
 
     @staticmethod
@@ -210,5 +218,4 @@ def _get_direction_of_each_query_points(points, origin=0.5):
     r = points - origin
     r_norm = r / torch.sqrt((r ** 2).sum(-1, keepdims=True))
     return r_norm
-
 
