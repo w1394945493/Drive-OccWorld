@@ -29,7 +29,11 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='MMDet test (and eval) a model')
     parser.add_argument('config', help='test config file path')
-    parser.add_argument('checkpoint', help='checkpoint file')
+    # 原代码要求 checkpoint 为必填位置参数：
+    # parser.add_argument('checkpoint', help='checkpoint file')
+    # 调试 dataloader/model forward 链路时，可不加载权重，让模型随机初始化运行。
+    # 注意：不加载 checkpoint 时评估结果没有实际意义，只能用于检查代码是否跑通。
+    parser.add_argument('checkpoint', nargs='?', default=None, help='checkpoint file')
     parser.add_argument('--out', help='output result file in pickle format')
     parser.add_argument(
         '--fuse-conv-bn',
@@ -209,17 +213,32 @@ def main():
     fp16_cfg = cfg.get('fp16', None)
     if fp16_cfg is not None:
         wrap_fp16_model(model)
-    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
+    # *==================================================#
+    # 原代码无条件加载 checkpoint：
+    # checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
+    # 现在允许 args.checkpoint=None，用于只测试 dataloader/model forward 链路。
+    if args.checkpoint is not None:
+        checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
+    else:
+        checkpoint = None
+        print('No checkpoint is provided. '
+              'The model will run with random initialized weights; '
+              'evaluation numbers are not meaningful.')
     if args.fuse_conv_bn:
         model = fuse_conv_bn(model)
+    # *==================================================#
     # old versions did not save class info in checkpoints, this walkaround is
     # for backward compatibility
-    if 'CLASSES' in checkpoint.get('meta', {}):
+    # 原代码默认 checkpoint 一定存在：
+    # if 'CLASSES' in checkpoint.get('meta', {}):
+    if checkpoint is not None and 'CLASSES' in checkpoint.get('meta', {}):
         model.CLASSES = checkpoint['meta']['CLASSES']
     else:
         model.CLASSES = dataset.CLASSES
     # palette for visualization in segmentation tasks
-    if 'PALETTE' in checkpoint.get('meta', {}):
+    # 原代码默认 checkpoint 一定存在：
+    # if 'PALETTE' in checkpoint.get('meta', {}):
+    if checkpoint is not None and 'PALETTE' in checkpoint.get('meta', {}):
         model.PALETTE = checkpoint['meta']['PALETTE']
     elif hasattr(dataset, 'PALETTE'):
         # segmentation dataset has `PALETTE` attribute
