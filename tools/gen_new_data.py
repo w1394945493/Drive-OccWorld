@@ -136,7 +136,7 @@ def get_sample_annotations(nusc, rec):
 
 def get_trajectory_sampling(nusc_can, scene_token_to_name,
                             scene_name_to_location, rec, future_length,
-                            sample_interval=0.5):
+                            sample_interval=0.5, can_bus_cache=None):
     """离线版 get_trajectory_sampling。
 
     对应 Dataset 中的 ``NuScenesWorldDatasetTemplate.get_trajectory_sampling``：
@@ -181,14 +181,34 @@ def get_trajectory_sampling(nusc_can, scene_token_to_name,
         # CAN bus 是车载控制器局域网数据；这里不是读未来 GT，而是读当前帧附近的
         # 车辆状态/控制反馈，用作候选轨迹采样的初始条件。
         scene_name = scene_token_to_name[rec['scene_token']]
-        # pose 消息中有自车状态，这里主要使用 vel[0] 作为当前纵向速度。
-        pose_msgs = nusc_can.get_messages(scene_name, 'pose')
-        pose_uts = [msg['utime'] for msg in pose_msgs]
-        # steeranglefeedback 消息中有方向盘转角反馈，用于近似当前曲率。
-        steer_msgs = nusc_can.get_messages(scene_name, 'steeranglefeedback')
-        steer_uts = [msg['utime'] for msg in steer_msgs]
+        #* ================== CAN bus scene 级缓存 ==================
+        # nusc_can.get_messages(scene_name, 'pose'/'steeranglefeedback') 返回的是
+        # “整个 scene 的 CAN bus 高频消息列表”，不是当前帧单独的一条消息。
+        # 因此同一个 scene 内不同 keyframe 可以复用同一批 pose_msgs/steer_msgs 列表；
+        # 真正每帧不同的是下面根据 rec['timestamp'] locate 出来的最近消息。
+        #
+        # 换句话说：
+        # - 缓存复用的是“scene 级 CAN bus 消息列表”；
+        # - 每一帧仍然会根据自己的 timestamp 取不同的 pose_data / steer_data。
+        if can_bus_cache is not None and scene_name in can_bus_cache:
+            pose_msgs, pose_uts, steer_msgs, steer_uts = can_bus_cache[scene_name]
+        else:
+            # pose 消息中有自车状态，这里主要使用 vel[0] 作为当前纵向速度。
+            pose_msgs = nusc_can.get_messages(scene_name, 'pose')
+            pose_uts = [msg['utime'] for msg in pose_msgs]
+            # steeranglefeedback 消息中有方向盘转角反馈，用于近似当前曲率。
+            steer_msgs = nusc_can.get_messages(scene_name, 'steeranglefeedback')
+            steer_uts = [msg['utime'] for msg in steer_msgs]
+            if can_bus_cache is not None:
+                can_bus_cache[scene_name] = (
+                    pose_msgs, pose_uts, steer_msgs, steer_uts)
 
         ref_utime = rec['timestamp']
+        #* ================== 当前帧 timestamp -> 当前帧最近 CAN bus 消息 ==================
+        # 虽然 pose_msgs/steer_msgs 是同一个 scene 共享的缓存列表，
+        # 但 ref_utime 是当前帧自己的 timestamp，所以每一帧 locate 出来的
+        # pose_index/steer_index 可以不同，对应的 pose_data/steer_data 也可以不同。
+        # 这保证了“复用列表”不等于“所有帧使用同一条 CAN bus 状态”。
         # 找到距离当前 sample timestamp 最近的 CAN bus pose/steering 消息。
         # “最近”表示时间戳最接近当前 keyframe；因此它表示当前帧附近状态，
         # 不是过去一段历史序列，也不是未来实际发生的动作序列。
@@ -278,6 +298,14 @@ def augment_infos(ann_file, out_file, nusc, nusc_can, traj_api,
 
     # 这两个 map 用来替代 Dataset 里 self.scene2map 的在线构建。
     scene_token_to_name, scene_name_to_location = build_scene_maps(nusc)
+    #* ================== CAN bus scene 级缓存入口 ==================
+    # key: scene_name
+    # value: (pose_msgs, pose_uts, steer_msgs, steer_uts)
+    # 作用：所有帧复用同一个 scene 的 CAN bus 消息列表；
+    #      每一帧仍然在 get_trajectory_sampling 中根据自己的 timestamp
+    #      locate 最近的 CAN bus 消息，因此不会把所有帧变成同一个速度/转角。
+    # 这是本脚本最直接的提速点之一，不改变 sample_traj 采样结果分布。
+    can_bus_cache = {}
     new_infos = []
 
     # tqdm 进度条会显示当前 split/pkl、处理速度和预计剩余时间。
@@ -336,7 +364,8 @@ def augment_infos(ann_file, out_file, nusc, nusc_can, traj_api,
                 scene_token_to_name=scene_token_to_name,
                 scene_name_to_location=scene_name_to_location,
                 rec=info,
-                future_length=planning_steps)
+                future_length=planning_steps,
+                can_bus_cache=can_bus_cache)
 
         new_infos.append(info)
 
@@ -367,6 +396,12 @@ def parse_args():
         help='future_length + 1 used by NuScenesTraj/sample_traj. '
              'For current configs future_length=4, so default is 5.')
     parser.add_argument(
+        '--seed',
+        type=int,
+        default=0,
+        help='Random seed for trajectory_sampler.sample(). '
+             'Set to a negative value to disable deterministic seeding.')
+    parser.add_argument(
         '--overwrite',
         action='store_true',
         # 默认不覆盖已有字段，方便重复运行；加 --overwrite 会强制重新计算。
@@ -376,6 +411,15 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # 固定 numpy 随机种子，确保 trajectory_sampler.sample() 生成的候选轨迹可复现。
+    # sample_traj 中的随机性主要来自随机加速度、随机目标速度和随机曲线参数。
+    # 默认 seed=0；如果希望每次运行都重新随机，可传 --seed -1。
+    if args.seed >= 0:
+        np.random.seed(args.seed)
+        print(f'Set numpy random seed to: {args.seed}')
+    else:
+        print('Skip setting numpy random seed; sample_traj will be non-deterministic.')
 
     # 只在脚本启动时初始化一次 SDK，避免 Dataset 每次构造都做这些在线查询。
     # SDK = Software Development Kit，即 nuScenes 官方提供的 Python 工具包/查询接口；
