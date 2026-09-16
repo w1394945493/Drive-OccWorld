@@ -1,0 +1,25 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "drive-occworld train",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/train.py",
+            "args": [
+                "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/fine_grained/action_condition_MMO_MSO_custom.py",
+                "--work-dir",
+                "out/mmo_mso/train",
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "console": "integratedTerminal"
+        }
+    ]
+}

@@ -1,14 +1,15 @@
-#---------------------------------------------------------------------------------#
+# ---------------------------------------------------------------------------------#
 # UniAD: Planning-oriented Autonomous Driving (https://arxiv.org/abs/2212.10156)  #
 # Source code: https://github.com/OpenDriveLab/UniAD                              #
 # Copyright (c) OpenDriveLab. All rights reserved.                                #
-#---------------------------------------------------------------------------------#
+# ---------------------------------------------------------------------------------#
 
 import torch
 import torch.nn as nn
 import numpy as np
 from skimage.draw import polygon
-from pytorch_lightning.metrics.metric import Metric
+# from pytorch_lightning.metrics.metric import Metric
+from torchmetrics import Metric
 
 
 class PlanningMetric_v2(Metric):
@@ -17,7 +18,8 @@ class PlanningMetric_v2(Metric):
         n_future=6,
         compute_on_step=False,
     ):
-        super().__init__(compute_on_step=compute_on_step)
+        # super().__init__(compute_on_step=compute_on_step)
+        super().__init__()
         dx, bx, _ = self.gen_dx_bx([-50.0, 50.0, 0.5], [-50.0, 50.0, 0.5], [-10.0, 10.0, 20.0])
         dx, bx = dx[:2], bx[:2]
         self.dx = nn.Parameter(dx, requires_grad=False)
@@ -44,7 +46,7 @@ class PlanningMetric_v2(Metric):
         nx = torch.LongTensor([(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]])
 
         return dx, bx, nx
-    
+
     def calculate_birds_eye_view_parameters(self, x_bounds, y_bounds, z_bounds):
         """
         Parameters

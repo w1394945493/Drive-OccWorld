@@ -5,3 +5,12 @@ python setup.py build_ext --inplace
 # * 2. 就地编译 dvxlr 和 dvxlr_v2
 cd third_lib/dvxlr
 python setup.py build_ext --inplace
+
+# drive-occworld train
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH="$(pwd)" \
+python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/train.py \
+    /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/fine_grained/action_condition_MMO_MSO_custom.py \
+    --work-dir out/mmo_mso/train
+
+

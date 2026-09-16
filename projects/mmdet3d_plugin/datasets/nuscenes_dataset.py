@@ -183,7 +183,9 @@ class CustomNuScenesDataset(NuScenesDataset):
             lidar2cam_rts = []
             cam_intrinsics = []
             for cam_type, cam_info in info['cams'].items():
+
                 image_paths.append(cam_info['data_path'])
+                
                 # obtain lidar to image transformation matrix
                 lidar2cam_r = np.linalg.inv(cam_info['sensor2lidar_rotation'])
                 lidar2cam_t = cam_info[
