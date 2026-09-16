@@ -7,6 +7,7 @@ import cv2
 import torch
 from pyquaternion import Quaternion
 from projects.mmdet3d_plugin.datasets.formating import cm_to_ious, format_iou_results
+from projects.mmdet3d_plugin.datasets.samplers import sampler as trajectory_sampler
 from projects.mmdet3d_plugin.bevformer.dense_heads.plan_head import calculate_birds_eye_view_parameters
 from mmdet3d.core.bbox import LiDARInstance3DBoxes
 from prettytable import PrettyTable
@@ -75,12 +76,12 @@ class NuScenesWorldDatasetTemplateOffline(CustomNuScenesDataset):
         #   self.traj_api = NuScenesTraj(...)
         # 离线版要求这些信息已由 tools/gen_new_data.py 写入 PKL，因此训练阶段不再依赖：
         #   - NuScenes：原来用于查 scene/log/sample/sample_annotation；
-        #   - NuScenesCanBus：原来用于查 CAN bus pose/steering 并采样 sample_traj；
+        #   - NuScenesCanBus：原来用于查 CAN bus pose/steering；
         #   - NuScenesTraj：原来用于在线生成 sdc_planning / mask / command。
         self.required_offline_keys = (
             'scene_name', 'location',
             'sdc_planning', 'sdc_planning_mask', 'command',
-            'sample_traj', 'sample_annotations')
+            'sample_traj_state', 'sample_annotations')
         self._check_offline_pkl_fields()
 
         # ignore_label_name
@@ -263,10 +264,35 @@ class NuScenesWorldDatasetTemplateOffline(CustomNuScenesDataset):
         return gt_future_boxes, segmentations
 
     def get_trajectory_sampling(self, rec, future_length, SAMPLE_INTERVAL=0.5):
-        raise RuntimeError(
-            'NuScenesWorldDatasetTemplateOffline does not sample trajectories '
-            'online. Please generate an augmented PKL with tools/gen_new_data.py '
-            "and read candidate trajectories from info['sample_traj'].")
+        #* ================== Offline：由轻量状态在线生成候选轨迹 ==================
+        # tools/gen_new_data.py 不再把完整 sample_traj 写入 PKL，而是写入：
+        #   rec['sample_traj_state'] = {'v0': ..., 'kappa': ...}
+        # 这样可避免每帧保存 [1800, future, 3] 大数组导致 PKL 暴涨。
+        #
+        # 与旧版在线 Dataset 的区别：
+        # - 旧版：训练时查 NuScenesCanBus 得到 v0/kappa，再采样 sample_traj；
+        # - 离线版：v0/kappa 已在 PKL 中，训练时只做纯 numpy 采样，不依赖 SDK。
+        state = rec['sample_traj_state']
+        v0 = state['v0']
+        kappa = state['kappa']
+
+        # 初始局部坐标方向，与原 Dataset 实现保持一致。
+        T0 = np.array([0.0, 1.0])
+        N0 = np.array([1.0, 0.0]) if kappa <= 0 else np.array([-1.0, 0.0])
+
+        # 构造细粒度时间轴，再抽成 0.5s 间隔。
+        t_start = 0
+        t_end = future_length * SAMPLE_INTERVAL
+        t_interval = SAMPLE_INTERVAL / 10
+        tt = np.arange(t_start, t_end + t_interval, t_interval)
+
+        # 采样 1800 条候选轨迹；随机性来自 sampler 内部的 np.random。
+        sampled_trajectories_fine = trajectory_sampler.sample(
+            v0, kappa, T0, N0, tt, 1800)
+        sampled_trajectories = sampled_trajectories_fine[:, ::10]
+        sampled_trajectories = (
+            sampled_trajectories[:, 1:] - sampled_trajectories[:, :-1])
+        return sampled_trajectories
 
     def get_data_info(self, index):
         """Also return lidar2ego transformations."""
@@ -517,20 +543,23 @@ class NuScenesWorldDatasetTemplateOffline(CustomNuScenesDataset):
                 gt_future_boxes=gt_future_boxes,
                 segmentation_bev=segmentation_bev,
             )
-        # todo ================== Offline 关键区别 3：规划标签和候选轨迹直接从 PKL 读取 ==================
+        # todo ================== Offline 关键区别 3：规划标签从 PKL 读，候选轨迹由 PKL 状态生成 ==================
         # 旧版这里会在线调用：
         #   self.traj_api.get_sdc_planning_label(info['token'])
         #   self.get_trajectory_sampling(info, self.future_length + 1)
-        # 离线版直接读取 tools/gen_new_data.py 写入 PKL 的字段：
+        # 离线版：
         # - sdc_planning / sdc_planning_mask / command 来自 NuScenesTraj 离线预计算；
-        # - sample_traj 来自 CAN bus pose/steering 离线采样。
+        # - sample_traj_state 来自 CAN bus pose/steering 离线提取；
+        # - sample_traj 在这里由 sample_traj_state 在线生成，避免写入巨大 PKL。
         if occ_load_flag:
             info = self.data_infos[index]
+            sample_traj = self.get_trajectory_sampling(
+                info, self.future_length + 1)
             input_dict.update(
                 sdc_planning=info['sdc_planning'],
                 sdc_planning_mask=info['sdc_planning_mask'],
                 command=info['command'],
-                sample_traj=info['sample_traj'],
+                sample_traj=sample_traj,
             )
         # 训练时预处理：聚合历史到未来窗口内的实例，并修补实例时序。
         #! inflated occupancy/flow 可直接读取离线 instance_dict；fine-grained 且不使用实例监督时可跳过此段。

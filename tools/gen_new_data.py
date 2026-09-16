@@ -10,8 +10,9 @@
     - scene_name: scene token 对应的 scene 名称。
     - sdc_planning / sdc_planning_mask / command:
       原来由 NuScenesTraj.get_sdc_planning_label() 在线生成。
-    - sample_traj:
-      原来由 NuScenesCanBus 的 pose/steering 消息在线采样生成。
+    - sample_traj_state:
+      原来由 NuScenesCanBus 的 pose/steering 消息在线读取，用于采样候选轨迹。
+      这里只保存轻量状态 v0/kappa，完整 sample_traj 由 offline Dataset 在线生成。
     - sample_annotations:
       当前帧自己的 nuScenes 3D annotation 信息。后续 Dataset 做滑窗时，
       可以直接从历史/当前/未来帧的 info['sample_annotations'] 收集目标，
@@ -134,15 +135,14 @@ def get_sample_annotations(nusc, rec):
     return sample_annotations
 
 
-def get_trajectory_sampling(nusc_can, scene_token_to_name,
-                            scene_name_to_location, rec, future_length,
-                            sample_interval=0.5, can_bus_cache=None):
-    """离线版 get_trajectory_sampling。
+def get_sample_traj_state(nusc_can, scene_token_to_name,
+                          scene_name_to_location, rec, can_bus_cache=None):
+    """离线提取生成 sample_traj 所需的轻量状态。
 
-    对应 Dataset 中的 ``NuScenesWorldDatasetTemplate.get_trajectory_sampling``：
-    根据当前帧 timestamp 对齐 CAN bus 的 pose 和 steering，得到/估计当前
-    自车运动状态，然后从这个“当前状态”出发，随机采样一批未来 ego trajectory
-    候选。
+    对应原 Dataset 中 ``get_trajectory_sampling`` 的前半段：
+    根据当前帧 timestamp 对齐 CAN bus 的 pose 和 steering，得到/估计当前自车
+    运动状态。为了避免 PKL 体积暴涨，这里不保存完整 [1800, future, 3] 的
+    sample_traj，只保存生成它所需的状态。
 
     更具体地说：
       - CAN bus 的 pose 消息提供当前帧附近的自车速度 vel，这里只取
@@ -150,31 +150,17 @@ def get_trajectory_sampling(nusc_can, scene_token_to_name,
       - CAN bus 的 steeranglefeedback 消息提供当前帧附近的方向盘转角 steering；
       - 当前曲率 kappa 不是直接从 CAN bus 读出的字段，而是用 steering
         近似换算得到：kappa = 2 * steering / 2.588；
-      - 未来加速度、未来目标速度也不是 CAN bus 直接给的 GT，而是在
-        trajectory_sampler.sample 里随机采样，用来扩展出多种可能动作。
-
-    这里的 sample_traj 不是 nuScenes 已经发生的未来 GT 轨迹，而是 planner
-    用来评估的“候选动作/候选轨迹”：
-      1. 先读取当前帧附近的 CAN bus 速度和方向盘转角；
-      2. 由方向盘转角近似得到当前曲率 kappa；
-      3. sampler 再随机采样加速度/目标速度，生成多条可能的运动曲线；
-      4. 默认采样 1800 条候选轨迹，原始在线 Dataset 注释为：
-         [720, 360, 720] = Left / Straight / Right；
-      5. 每条候选轨迹最后表示为 future_length 个 0.5s 相邻位移 step。
+      - 未来加速度、未来目标速度不在这里保存；offline Dataset 会调用
+        trajectory_sampler.sample 在线随机采样候选轨迹。
 
     Args:
         rec: 当前帧 info。
-        future_length: 输出的未来相邻位移 step 数。当前在线 Dataset 中常见
-            配置 future_length=4，但调用本函数时传入 future_length+1，因此
-            默认脚本用 5。也就是说默认会生成 5 个未来 0.5s step，覆盖
-            2.5s 的候选轨迹。
-        sample_interval: nuScenes 关键帧间隔，默认 0.5s。
 
     Returns:
-        sampled: shape 约为 [1800, future_length, 3]。
-            - 1800: 候选轨迹条数；
-            - future_length: 未来 step 数，默认 5；
-            - 3: 每个 step 的相邻增量，通常可理解为 dx/dy/dyaw。
+        sample_traj_state: dict，包含：
+            - v0: 当前纵向初速度；
+            - kappa: 由方向盘转角近似得到的当前曲率；
+            - scene_name/location: 调试和方向约定信息。
     """
     try:
         # 通过当前帧 scene_token 找到 scene_name，再从 CAN bus 中取该 scene 的消息。
@@ -231,8 +217,28 @@ def get_trajectory_sampling(nusc_can, scene_token_to_name,
         kappa = 2 * steering / 2.588
     except Exception:
         # 某些 scene 没有 CAN bus 数据，保持和在线 Dataset 一致的 fallback。
+        scene_name = scene_token_to_name.get(rec['scene_token'], '')
+        location = scene_name_to_location.get(scene_name, '')
         v0 = 6.6
         kappa = 0
+
+    return dict(
+        v0=float(v0),
+        kappa=float(kappa),
+        scene_name=scene_name,
+        location=location,
+    )
+
+
+def sample_trajectory_from_state(sample_traj_state, future_length,
+                                 sample_interval=0.5, sample_num=1800):
+    """根据轻量状态生成完整候选轨迹。
+
+    这个函数供调试/兼容使用；当前 gen_new_data.py 默认不再把它的输出写入 PKL，
+    offline Dataset 会在训练取样时用同样逻辑在线生成 sample_traj。
+    """
+    v0 = sample_traj_state['v0']
+    kappa = sample_traj_state['kappa']
 
     # T0/N0 定义采样轨迹的初始局部坐标方向：
     # - t0: tangent/front，车辆前向；这里 y 轴是前方；
@@ -258,7 +264,7 @@ def get_trajectory_sampling(nusc_can, scene_token_to_name,
     # - clothoid：曲率渐变的更平滑转弯候选。
     # 其中第 6 个参数 M=1800 表示候选轨迹总数；按默认概率 [0.4, 0.2, 0.4]
     # 可理解为约 720 条左转、360 条直行、720 条右转候选。
-    sampled_fine = trajectory_sampler.sample(v0, kappa, t0, n0, ts, 1800)
+    sampled_fine = trajectory_sampler.sample(v0, kappa, t0, n0, ts, sample_num)
 
     # sampled_fine 的时间分辨率是 0.05s，shape 约为 [1800, 51, 3]。
     # 每 10 个点取一次，相当于恢复到 nuScenes 关键帧 0.5s 间隔：
@@ -284,7 +290,8 @@ def augment_infos(ann_file, out_file, nusc, nusc_can, traj_api,
         - sdc_planning: 未来 SDC GT 轨迹，shape=[planning_steps, 3]，为 x/y/delta_yaw。
         - sdc_planning_mask: 未来 SDC GT 有效位，shape=[planning_steps, 2]。
         - command: 根据未来 GT 轨迹离散得到的 left/right/forward 命令。
-        - sample_traj: 基于当前速度和方向盘转角采样的候选 ego 轨迹，不是真实未来 GT。
+        - sample_traj_state: 基于当前速度和方向盘转角提取的轻量状态；
+          offline Dataset 可用它在线生成候选 ego 轨迹 sample_traj。
         - sample_annotations: 当前帧所有 nuScenes 3D annotation 的精简原始信息，
           用于后续 Dataset 在线滑窗组合 instance_dict，替代训练时 self.nusc.get(...)
           查询 sample / sample_annotation。
@@ -304,7 +311,8 @@ def augment_infos(ann_file, out_file, nusc, nusc_can, traj_api,
     # 作用：所有帧复用同一个 scene 的 CAN bus 消息列表；
     #      每一帧仍然在 get_trajectory_sampling 中根据自己的 timestamp
     #      locate 最近的 CAN bus 消息，因此不会把所有帧变成同一个速度/转角。
-    # 这是本脚本最直接的提速点之一，不改变 sample_traj 采样结果分布。
+    # 这是本脚本最直接的提速点之一；当前脚本只保存 sample_traj_state，
+    # 不再保存完整 sample_traj 大数组。
     can_bus_cache = {}
     new_infos = []
 
@@ -351,21 +359,24 @@ def augment_infos(ann_file, out_file, nusc, nusc_can, traj_api,
             info['command'] = command
 
         # *==========================================================================#
-        # 写入候选轨迹 sample_traj，替代训练阶段在线读取 CAN bus pose/steering 再采样。
-        # 注意 sample_traj 不是 nuScenes 中真实发生的未来轨迹；
-        # nuScenes 的真实未来自车轨迹已经写在上面的 sdc_planning 中。
-        # sample_traj 是根据“当前速度 v0 + 当前方向盘转角 steering/曲率 kappa”
-        # 通过 trajectory_sampler.sample() 采样出来的一组可能 ego motion proposals。
-        # 之所以叫“候选轨迹”，是因为 planner 可以在这些不同候选动作/轨迹上评估代价，
-        # 或将其作为规划/动作条件相关分支的输入。
-        if overwrite or 'sample_traj' not in info:
-            info['sample_traj'] = get_trajectory_sampling(
+        # 写入候选轨迹生成状态 sample_traj_state，而不是完整 sample_traj。
+        # 原完整 sample_traj shape 约 [1800, 5, 3]，逐帧保存会让 PKL 从几百 MB
+        # 膨胀到数 GB；因此这里只保存轻量状态：
+        #   - v0: 当前纵向速度；
+        #   - kappa: 由当前方向盘转角近似得到的曲率。
+        # offline Dataset 会用这个状态在线调用 trajectory_sampler.sample() 生成
+        # sample_traj，从而避免训练时依赖 NuScenesCanBus，同时显著减小 PKL 体积。
+        if overwrite or 'sample_traj_state' not in info:
+            info['sample_traj_state'] = get_sample_traj_state(
                 nusc_can=nusc_can,
                 scene_token_to_name=scene_token_to_name,
                 scene_name_to_location=scene_name_to_location,
                 rec=info,
-                future_length=planning_steps,
                 can_bus_cache=can_bus_cache)
+        # 如果输入 PKL 已经带有旧版完整 sample_traj，直接删除，避免新 PKL 继续被
+        # [1800, future, 3] 大数组撑大。offline Dataset 会用 sample_traj_state 在线生成。
+        if 'sample_traj' in info:
+            info.pop('sample_traj')
 
         new_infos.append(info)
 
@@ -393,13 +404,13 @@ def parse_args():
         '--planning-steps',
         type=int,
         default=5,
-        help='future_length + 1 used by NuScenesTraj/sample_traj. '
+        help='future_length + 1 used by NuScenesTraj. '
              'For current configs future_length=4, so default is 5.')
     parser.add_argument(
         '--seed',
         type=int,
         default=0,
-        help='Random seed for trajectory_sampler.sample(). '
+        help='Random seed kept for compatibility/debug sampling. '
              'Set to a negative value to disable deterministic seeding.')
     parser.add_argument(
         '--overwrite',
@@ -412,14 +423,14 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # 固定 numpy 随机种子，确保 trajectory_sampler.sample() 生成的候选轨迹可复现。
-    # sample_traj 中的随机性主要来自随机加速度、随机目标速度和随机曲线参数。
+    # 固定 numpy 随机种子。当前脚本默认只保存 sample_traj_state，不再保存完整
+    # sample_traj；如果后续调试时调用 sample_trajectory_from_state，可复现候选轨迹。
     # 默认 seed=0；如果希望每次运行都重新随机，可传 --seed -1。
     if args.seed >= 0:
         np.random.seed(args.seed)
         print(f'Set numpy random seed to: {args.seed}')
     else:
-        print('Skip setting numpy random seed; sample_traj will be non-deterministic.')
+        print('Skip setting numpy random seed; debug trajectory sampling will be non-deterministic.')
 
     # 只在脚本启动时初始化一次 SDK，避免 Dataset 每次构造都做这些在线查询。
     # SDK = Software Development Kit，即 nuScenes 官方提供的 Python 工具包/查询接口；
