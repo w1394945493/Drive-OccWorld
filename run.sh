@@ -13,4 +13,12 @@ python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/train.py \
     /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/fine_grained/action_condition_MMO_MSO_custom.py \
     --work-dir out/mmo_mso/train
 
+# offline pkl generate 在原pkl文件基础上，生成离线版本的v2.pkl文件
+python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/gen_new_data.py
 
+# use offline dataset 
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH="$(pwd)" \
+python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/train.py \
+    /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/fine_grained/action_condition_MMO_MSO_custom_offline.py \
+    --work-dir out/mmo_mso/train
