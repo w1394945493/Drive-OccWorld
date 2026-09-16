@@ -1,5 +1,5 @@
 import copy
-
+import os 
 import numpy as np
 from mmdet.datasets import DATASETS
 from mmdet3d.datasets import NuScenesDataset
@@ -102,7 +102,6 @@ class CustomNuScenesDataset(NuScenesDataset):
             queue.append(example)
         return self.union2one(queue)
 
-
     def union2one(self, queue):
         imgs_list = [each['img'].data for each in queue]
         metas_map = {}
@@ -183,9 +182,10 @@ class CustomNuScenesDataset(NuScenesDataset):
             lidar2cam_rts = []
             cam_intrinsics = []
             for cam_type, cam_info in info['cams'].items():
+                # image_paths.append(cam_info['data_path'])
+                file_name = os.path.join(self.data_root,cam_info["data_path"].replace("./data/nuscenes/",'')) # 实际图像文件路径
+                image_paths.append(file_name)
 
-                image_paths.append(cam_info['data_path'])
-                
                 # obtain lidar to image transformation matrix
                 lidar2cam_r = np.linalg.inv(cam_info['sensor2lidar_rotation'])
                 lidar2cam_t = cam_info[
