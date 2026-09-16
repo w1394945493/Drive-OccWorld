@@ -28,3 +28,9 @@ PYTHONPATH="$(pwd)" \
 python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/test.py \
     /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/fine_grained/action_condition_MMO_MSO_custom_offline.py \
     --eval bbox
+
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH="$(pwd)" \
+python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/test.py \
+    /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/fine_grained/action_condition_MMO_MSO_custom_offline_with_planning.py \
+    --eval bbox
