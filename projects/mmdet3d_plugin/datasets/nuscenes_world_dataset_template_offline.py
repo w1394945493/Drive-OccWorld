@@ -50,6 +50,7 @@ class NuScenesWorldDatasetTemplateOffline(CustomNuScenesDataset):
                  load_frame_interval=None,
                  rand_frame_interval=(1,),
                  plan_grid_conf=None,
+                 candidate_sample_num=1800,
                  can_bus_root='',
                  *args,
                  **kwargs):
@@ -101,6 +102,13 @@ class NuScenesWorldDatasetTemplateOffline(CustomNuScenesDataset):
         self.ego_mask = ego_mask            # (-0.8, -1.5, 0.8, 2.5)
         self.load_frame_interval = load_frame_interval  # 8
         self.rand_frame_interval = rand_frame_interval  # (-1, 1) # * 默认是(1,) 即为连续帧
+        #* 候选轨迹数量：默认 1800，可由 config 中的 candidate_sample_num 统一修改。
+        # 离线版 PKL 只保存 sample_traj_state，不保存完整 sample_traj，
+        # 因此候选轨迹数量可以在训练/评估时通过 config 在线调整。
+        # 需要和 PlanHead_v1.sample_num 保持一致，并且必须能被 3 整除，
+        # 因为 PlanHead_v1 会按 [Left, Straight, Right] 三组切分候选轨迹。
+        assert candidate_sample_num % 3 == 0
+        self.candidate_sample_num = candidate_sample_num
 
         # 初始化预处理：过滤历史帧或未来帧数量不足、以及跨越场景边界的样本。
         #! usable_index 或等价的 valid 标志可随固定 queue/future 配置写入 PKL；若配置会变化则应在线重算。
@@ -267,7 +275,7 @@ class NuScenesWorldDatasetTemplateOffline(CustomNuScenesDataset):
         #* ================== Offline：由轻量状态在线生成候选轨迹 ==================
         # tools/gen_new_data.py 不再把完整 sample_traj 写入 PKL，而是写入：
         #   rec['sample_traj_state'] = {'v0': ..., 'kappa': ...}
-        # 这样可避免每帧保存 [1800, future, 3] 大数组导致 PKL 暴涨。
+        # 这样可避免每帧保存 [candidate_sample_num, future, 3] 大数组导致 PKL 暴涨。
         #
         # 与旧版在线 Dataset 的区别：
         # - 旧版：训练时查 NuScenesCanBus 得到 v0/kappa，再采样 sample_traj；
@@ -286,9 +294,11 @@ class NuScenesWorldDatasetTemplateOffline(CustomNuScenesDataset):
         t_interval = SAMPLE_INTERVAL / 10
         tt = np.arange(t_start, t_end + t_interval, t_interval)
 
-        # 采样 1800 条候选轨迹；随机性来自 sampler 内部的 np.random。
+        #* 采样 self.candidate_sample_num 条候选轨迹；随机性来自 sampler 内部的 np.random。
+        # 该数量可由 config 中的 candidate_sample_num 控制，默认 1800。
+        # 注意：需要和 PlanHead_v1.sample_num 一致，且能被 3 整除。
         sampled_trajectories_fine = trajectory_sampler.sample(
-            v0, kappa, T0, N0, tt, 1800)
+            v0, kappa, T0, N0, tt, self.candidate_sample_num)
         sampled_trajectories = sampled_trajectories_fine[:, ::10]
         sampled_trajectories = (
             sampled_trajectories[:, 1:] - sampled_trajectories[:, :-1])

@@ -36,32 +36,92 @@ def calculate_birds_eye_view_parameters(x_bounds, y_bounds, z_bounds):
 
 
 class Cost_Function(nn.Module):
+    """候选自车轨迹总代价函数。
+
+    这个模块用于 PlanHead_v1 中的 cost-based planning：
+    - 输入一批候选轨迹 trajs；
+    - 根据预测/GT occupancy、可行驶区域和 BEV cost volume 计算每条轨迹的代价；
+    - 输出每条候选轨迹的总代价，后续 select() 会选择代价最小的轨迹。
+
+    当前实际启用的代价包括：
+    1. SafetyCost：候选轨迹是否和动态障碍物占用区域重叠；
+    2. HeadwayCost：候选轨迹前方一定距离内是否存在障碍物；
+    3. Rule：候选轨迹是否离开可行驶区域；
+    4. Cost_Volume：从网络预测的 cost_volume 上采样得到的可学习代价。
+
+    注释掉的 LR_divider / Comfort / Progress 是预留项，当前不会参与最终 cost。
+    """
+
     def __init__(self, cfg):
         super(Cost_Function, self).__init__()
 
+        #* ================== 1. 基于 occupancy / map rule 的手工代价 ==================
+        # SafetyCost: 计算自车 footprint 沿候选轨迹是否压到 instance_occupancy。
+        # instance_occupancy 来自语义 occupancy 中的动态目标类别。
         self.safetycost = SafetyCost(cfg)
+
+        # HeadwayCost: 计算自车前方安全距离区域是否存在障碍物。
+        # 它比 SafetyCost 更关注“前方一段距离”的潜在碰撞风险。
         self.headwaycost = HeadwayCost(cfg)
+
+        # 下面几个 cost 是预留/未启用项：
+        # - LR_divider: 可用于惩罚靠近/跨越车道线；
+        # - Comfort: 可用于惩罚过大加速度、横向加速度、jerk；
+        # - Progress: 可用于鼓励向前推进或靠近目标。
         # self.lrdividercost = LR_divider(cfg)
         # self.comfortcost = Comfort(cfg)
         # self.progresscost = Progress(cfg)
+
+        # Rule: 计算候选轨迹是否驶出 drivable_area。
+        # drivable_area 来自语义 occupancy 中的 driveable_surface 类别。
         self.rulecost = Rule(cfg)
+
+        #* ================== 2. 网络预测的可学习代价 ==================
+        # Cost_Volume: 在 PlanHead_v1 中由 costvolume_head(bev_feats) 预测得到。
+        # 这里沿候选轨迹在 cost_volume 上采样，把 BEV 特征学习到的风险/偏好转成轨迹代价。
         self.costvolume = Cost_Volume(cfg)
 
     def forward(self, cost_volume, trajs, instance_occupancy, drivable_area):
-        '''
-        trajs: torch.Tensor (B, N, 2)
-        cost_volume: torch.Tensor (B, 200, 200)
-        instance_occupancy: torch.Tensor(B, 200, 200)   instance_occupied=1
-        drivable_area: torch.Tensor(B, 200, 200)        driveable_surface=1
-        '''
+        """计算每条候选轨迹的总代价。
+
+        Args:
+            cost_volume: torch.Tensor, shape (B, H, W)。
+                PlanHead_v1 从 BEV 特征预测出的单通道代价图。
+            trajs: torch.Tensor, shape (B, N, 2)。
+                N 条候选轨迹在 BEV/自车坐标系下的位置点，这里只使用 x/y。
+                在 PlanHead_v1 中传入的是 trajs[:, :, :2]。
+            instance_occupancy: torch.Tensor, shape (B, H, W)。
+                动态障碍物占用图；有动态目标的位置为 1。
+            drivable_area: torch.Tensor, shape (B, H, W)。
+                可行驶区域图；可行驶区域为 1。
+
+        Returns:
+            cost_fo: torch.Tensor, shape 通常为 (B, N)。
+                每条候选轨迹的总代价。值越小表示轨迹越优。
+        """
+        #* Safety cost：惩罚候选轨迹与动态障碍物 occupancy 重叠。
+        # clamp 到 [0, 100] 是为了避免某一项代价数值过大，压制其他代价项。
         safetycost = torch.clamp(self.safetycost(trajs, instance_occupancy), 0, 100)                 # penalize overlap with instance_occupancy
+
+        #* Headway cost：惩罚候选轨迹前方安全距离内存在障碍物。
+        # 和 safety cost 相比，它更强调前方行驶空间是否安全。
         headwaycost = torch.clamp(self.headwaycost(trajs, instance_occupancy, drivable_area), 0, 100)# penalize overlap with front instance (10m)
+
+        # 未启用的代价项，保留作后续扩展。
         # lrdividercost = torch.clamp(self.lrdividercost(trajs, lane_divider), 0, 100)               # penalize distance with lane
         # comfortcost = torch.clamp(self.comfortcost(trajs), 0, 100)                                   # penalize high accelerations (lateral, longitudinal, jerk)
         # progresscost = torch.clamp(self.progresscost(trajs), -100, 100)                              # L2 loss
+
+        #* Rule cost：惩罚驶出可行驶区域。
+        # 如果候选轨迹 footprint 落在 drivable_area=0 的区域，代价会增大。
         rulecost = torch.clamp(self.rulecost(trajs, drivable_area), 0, 100)                          # penalize overlap with out of drivable_area
+
+        #* Learned cost volume：从网络预测的 cost_volume 上按轨迹位置采样。
+        # 这一项让 planner 不只依赖手工规则，也能利用 BEV 特征学习到的数据驱动代价。
         costvolume = torch.clamp(self.costvolume(trajs, cost_volume), 0, 100)                        # sample on costvolume
 
+        #* 最终总代价：当前实现直接等权相加。
+        # 后续 PlanHead_v1.select() 会对 cost_fo 做 topk(largest=False)，选择代价最小的候选轨迹。
         cost_fo = safetycost + headwaycost + costvolume + rulecost
         # cost_fc = progresscost
 

@@ -42,6 +42,10 @@ load_frame_interval = None  # use 1/8 nuscenes dataset for faster evaluation.
 turn_on_flow = False         # turn_on_flow=True: load flow_label and predict flow througn flow_branch
 # turn_on_plan = False
 turn_on_plan = True
+# 候选轨迹数量，默认 1800。
+# 该值会同时传给 Dataset 和 PlanHead_v1，二者必须保持一致。
+# 注意：PlanHead_v1 会按 [Left, Straight, Right] 三组切分，因此必须能被 3 整除。
+candidate_sample_num = 1800
 
 # World model.
 world_head_pred_history_frame_num = 0
@@ -315,6 +319,7 @@ model = dict(
     plan_head=dict(
         type='PlanHead_v1',
         plan_grid_conf=plan_grid_conf,
+        sample_num=candidate_sample_num,
         instance_cls=[2, 3, 4, 5, 6, 7, 9, 10], # fine-grained occupancy 类别下：# 这些类别被视为动态障碍物，用于 safety/headway cost。
         drivable_area_cls=[11], # 可行驶区域类别，用于 rule cost。
         bev_h=bev_h_,
@@ -421,6 +426,7 @@ data = dict(
         ego_mask=(-0.8, -1.5, 0.8, 2.5),
         load_frame_interval=load_frame_interval,
         plan_grid_conf=plan_grid_conf,
+        candidate_sample_num=candidate_sample_num,
         # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
         # and box_type_3d='Depth' in sunrgbd and scannet dataset.
         box_type_3d="LiDAR",
@@ -443,6 +449,7 @@ data = dict(
         future_length=future_queue_length_test,
         ego_mask=(-0.8, -1.5, 0.8, 2.5),
         plan_grid_conf=plan_grid_conf,
+        candidate_sample_num=candidate_sample_num,
     ),
     test=dict(
         type=dataset_type,
@@ -461,6 +468,7 @@ data = dict(
         future_length=future_queue_length_test,
         ego_mask=(-0.8, -1.5, 0.8, 2.5),
         plan_grid_conf=plan_grid_conf,
+        candidate_sample_num=candidate_sample_num,
     ),
     shuffler_sampler=dict(type="DistributedGroupSampler"),
     nonshuffler_sampler=dict(type="DistributedSampler"),

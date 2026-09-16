@@ -47,6 +47,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                  load_frame_interval=None,
                  rand_frame_interval=(1,),
                  plan_grid_conf=None,
+                 candidate_sample_num=1800,
                  can_bus_root='',
                  *args,
                  **kwargs):
@@ -110,6 +111,11 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         self.ego_mask = ego_mask            # (-0.8, -1.5, 0.8, 2.5)
         self.load_frame_interval = load_frame_interval  # 8
         self.rand_frame_interval = rand_frame_interval  # (-1, 1) # * 默认是(1,) 即为连续帧
+        #* 候选轨迹数量：默认 1800，可由 config 中的 candidate_sample_num 统一修改。
+        # 需要和 PlanHead_v1.sample_num 保持一致，并且必须能被 3 整除，
+        # 因为候选轨迹按 [Left, Straight, Right] 三组组织。
+        assert candidate_sample_num % 3 == 0
+        self.candidate_sample_num = candidate_sample_num
 
         # 初始化预处理：过滤历史帧或未来帧数量不足、以及跨越场景边界的样本。
         #! usable_index 或等价的 valid 标志可随固定 queue/future 配置写入 PKL；若配置会变化则应在线重算。
@@ -269,8 +275,8 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         # 而是从“当前自车速度 + 当前方向盘转角/曲率”出发构造的一批候选动作轨迹。
         # 后续 planner 会结合预测未来 occupancy，对这些候选轨迹计算 cost，再选更优轨迹。
         #
-        # 输出 shape 约为 [1800, future_length, 3]：
-        # - 1800: 候选轨迹条数；
+        # 输出 shape 约为 [self.candidate_sample_num, future_length, 3]：
+        # - self.candidate_sample_num: 候选轨迹条数，默认 1800，可由配置修改；
         # - future_length: 未来相邻位移 step 数；
         # - 3: 每个 step 的位移/朝向增量，通常可理解为 dx/dy/dyaw。
         #! 对固定 future_length、采样间隔和轨迹采样参数，可把 sample_traj 直接写入逐帧 PKL。
@@ -335,21 +341,23 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         t_interval = SAMPLE_INTERVAL / 10
         tt = np.arange(t_start, t_end + t_interval, t_interval)
 
-        #* 根据当前速度/曲率采样 1800 条候选轨迹。
+        #* 根据当前速度/曲率采样 self.candidate_sample_num 条候选轨迹。
         # trajectory_sampler.sample 内部会混合直线、圆弧、clothoid 曲线等运动形态，
         # 并随机采样加速度/目标速度，使候选轨迹覆盖不同速度和转向可能性。
-        # M=1800 表示候选轨迹总数；按默认比例可理解为：
-        # [720, 360, 720] = Left / Straight / Right。
-        sampled_trajectories_fine = trajectory_sampler.sample(v0, Kappa, T0, N0, tt, 1800)  # [720, 360, 720] Left,Straight,Right
+        # M=self.candidate_sample_num 表示候选轨迹总数；默认 1800。
+        # 注意：PlanHead_v1 会把候选按三等分理解为 Left / Straight / Right，
+        # 因此这里的数量必须和 plan_head.sample_num 一致，且能被 3 整除。
+        sampled_trajectories_fine = trajectory_sampler.sample(
+            v0, Kappa, T0, N0, tt, self.candidate_sample_num)  # sample_num, fine_time, 3
 
-        # sampled_trajectories_fine 的时间分辨率是 0.05s，shape 约为 [1800, 51, 3]。
+        # sampled_trajectories_fine 的时间分辨率是 0.05s，shape 约为 [sample_num, 51, 3]。
         # 每 10 个点取一次，相当于恢复到 nuScenes keyframe 的 0.5s 间隔：
         # 默认取到 [0, 0.5, 1.0, 1.5, 2.0, 2.5]，即 future_length+1 个位置点。
         sampled_trajectories = sampled_trajectories_fine[:, ::10]   # sample_num, start+future, 3
 
         #* 将“累计位置点”转成“相邻 step 位移”。
         # 因为包含起点 t=0，所以 future_length+1 个位置点做差后得到 future_length 段位移。
-        # 例如 6 个位置点 -> 5 段位移，最终默认 shape 为 [1800, 5, 3]。
+        # 例如 6 个位置点 -> 5 段位移，最终默认 shape 为 [sample_num, 5, 3]。
         sampled_trajectories = sampled_trajectories[:, 1:] - sampled_trajectories[:, :-1]  # sample_num, future, 3
         return sampled_trajectories
 

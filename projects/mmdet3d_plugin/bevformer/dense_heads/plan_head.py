@@ -149,6 +149,13 @@ class PoseDecoder(BaseModule):
 @HEADS.register_module()
 class PlanHead_v1(BaseModule):
     """Head of Ego-Trajectory Planning.
+
+    PlanHead_v1 是 Drive-OccWorld 中带「候选轨迹代价计算」的规划头：
+    1. 输入当前/未来 BEV 特征、候选自车轨迹 sample_traj、语义 occupancy 和 command；
+    2. 根据 command 从候选轨迹中筛选 left / forward / right 对应候选；
+    3. 从 BEV 特征预测 cost volume，并结合 occupancy / drivable area 计算每条候选轨迹代价；
+    4. 选择代价最小的候选轨迹作为 coarse plan；
+    5. 再用 PlanTransformer 基于 BEV 特征进一步 refine，回归下一步自车位移。
     """
 
     def __init__(self,
@@ -160,6 +167,7 @@ class PlanHead_v1(BaseModule):
                  # class
                  instance_cls = [2,3,4,5,6,7,9,10],
                  drivable_area_cls = [11],
+                 sample_num=1800,
 
                  # positional encoding
                  bev_h=200,
@@ -178,17 +186,58 @@ class PlanHead_v1(BaseModule):
 
         # BEV configuration of reference frame.
         super().__init__(**kwargs)
+        #* ================== 1. 轨迹代价函数 ==================
+        # Cost_Function 聚合多种 planning cost：
+        # - cost volume cost: 从 BEV 特征预测出的可学习代价图；
+        # - safety cost: 候选轨迹是否碰撞动态障碍物；
+        # - headway cost: 自车前向安全距离；
+        # - rule cost: 是否偏离可行驶区域。
+        # forward/select 阶段会用它给每条候选轨迹打分，然后选择总代价最小的候选。
         self.cost_function = Cost_Function(plan_grid_conf)
 
-        # cls
-        self.instance_cls = torch.tensor(instance_cls, requires_grad=False)  # 'bicycle', 'bus', 'car', 'construction', 'motorcycle', 'pedestrian', 'trailer', 'truck'
-        self.drivable_area_cls = torch.tensor(drivable_area_cls, requires_grad=False)  # 'drivable_area'
+        #* ================== 2. 语义类别定义：哪些是障碍物，哪些是可行驶区域 ==================
+        # instance_cls: 在 fine-grained occupancy 中被视作动态/可碰撞目标的类别。
+        # 默认对应 bicycle / bus / car / construction vehicle / motorcycle /
+        # pedestrian / trailer / truck 等交通参与者。
+        # forward 中会从 sem_occupancy 提取这些类别，得到 instance_occupancy，
+        # 用于 safety cost 和 headway cost。
+        # 原写法：只是普通 Tensor 属性，不会随 model.cuda()/model.to() 自动迁移设备。
+        # self.instance_cls = torch.tensor(instance_cls, requires_grad=False)  # 'bicycle', 'bus', 'car', 'construction', 'motorcycle', 'pedestrian', 'trailer', 'truck'
+        # register_buffer: 表示它不是可学习参数，但属于模块内常量状态；
+        # persistent=False 表示不写入 checkpoint，因为类别 id 已由 config 决定。
+        self.register_buffer(
+            'instance_cls',
+            torch.tensor(instance_cls, dtype=torch.long),
+            persistent=False)
 
-        # sample trajs
-        self.sample_num = 1800
+        # drivable_area_cls: 可行驶区域类别。
+        # forward 中会从 sem_occupancy 提取 drivable_area，
+        # 用于 rule cost，惩罚驶出可行驶区域的候选轨迹。
+        # 原写法：只是普通 Tensor 属性，不会随 model.cuda()/model.to() 自动迁移设备。
+        # self.drivable_area_cls = torch.tensor(drivable_area_cls, requires_grad=False)  # 'drivable_area'
+        # 同样注册成 buffer，避免 CPU/GPU 设备不一致问题。
+        self.register_buffer(
+            'drivable_area_cls',
+            torch.tensor(drivable_area_cls, dtype=torch.long),
+            persistent=False)
+
+        #* ================== 3. 候选轨迹组织方式 ==================
+        # Dataset 中 sample_traj 默认生成 sample_num 条候选自车轨迹。
+        # sample_num 默认 1800，可由 config 统一修改。
+        # 默认按三组排列：[Left, Straight, Right] = [600, 600, 600]。
+        # forward 时会根据 command 只取对应方向的一组候选，再 repeat 到同样数量，
+        # 这样让 planner 在指定高层驾驶指令下选局部最优候选轨迹。
+        # 注意：这里必须和 Dataset 中 candidate_sample_num 保持一致。
+        self.sample_num = sample_num
         assert self.sample_num % 3 == 0
         self.num = int(self.sample_num / 3)
 
+        #* ================== 4. BEV 坐标/分辨率对齐 ==================
+        # BEVFormer 产生的 BEV 特征网格和 planning cost 使用的网格分辨率不同：
+        # - bevformer_bev_conf: 原 BEVFormer BEV 范围/分辨率；
+        # - plan_grid_conf: planner/cost volume 使用的范围/分辨率。
+        # BevFeatureSlicer 负责把 BEV 特征采样/裁剪到 planning grid 上，
+        # 后续 costvolume_head 和 PlanTransformer 都在该 planning grid 上工作。
         bevformer_bev_conf = {
             'xbound': [-51.2, 51.2, 0.512],
             'ybound': [-51.2, 51.2, 0.512],
@@ -200,6 +249,10 @@ class PlanHead_v1(BaseModule):
         self.embed_dims = transformer.embed_dims
         self.with_adapter = with_adapter
         if with_adapter:
+            #* BEV adapter: 对采样后的 BEV 特征做一个轻量 residual refinement。
+            # 输入/输出 channel 都是 embed_dims，不改变 shape。
+            # 作用可以理解为：让原本服务于 occupancy/world model 的 BEV 特征，
+            # 进一步适配 planning/cost 任务。
             bev_adapter_block = nn.Sequential(
                 nn.Conv2d(self.embed_dims, self.embed_dims // 2, kernel_size=3, padding=1),
                 nn.ReLU(),
@@ -208,7 +261,11 @@ class PlanHead_v1(BaseModule):
             N_Blocks = 3
             bev_adapter = [copy.deepcopy(bev_adapter_block) for _ in range(N_Blocks)]
             self.bev_adapter = nn.Sequential(*bev_adapter)
-        
+
+        #* ================== 5. Cost volume 预测头 ==================
+        # 从 BEV 特征预测一个单通道 cost map/cost volume: [B, C, H, W] -> [B, 1, H, W]。
+        # 这个 costvolume 是可学习的轨迹代价图：候选轨迹经过的位置会在上面采样得到代价。
+        # 它会与 occupancy-based safety/headway/rule cost 一起组成最终候选轨迹代价。
         self.costvolume_head = nn.Sequential(
                 nn.Conv2d(self.embed_dims, self.embed_dims, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(self.embed_dims),
@@ -216,21 +273,33 @@ class PlanHead_v1(BaseModule):
                 nn.Conv2d(self.embed_dims, 1, kernel_size=1, padding=0),
         )
 
-        # build encoder
+        #* ================== 6. 选中候选轨迹的 pose encoder ==================
+        # select() 会从 sample_num 条候选中选出总代价最低的一条 coarse trajectory。
+        # pose_encoder 将该候选轨迹的 [dx, dy, dyaw] / [x, y, yaw] 三维描述
+        # 映射到 embed_dims 维特征，作为 PlanTransformer 的 prev_pose 条件。
         self.pose_encoder = nn.Sequential(
             nn.Linear(3, self.embed_dims),
             nn.ReLU(True),
             nn.Linear(self.embed_dims, self.embed_dims),
         )
 
-        # build transformer architecture.
+        #* ================== 7. PlanTransformer：基于 BEV refine 规划结果 ==================
+        # positional_encoding 为 planning BEV grid 构造位置编码。
+        # transformer 接收：
+        # - plan query / navigation command embedding；
+        # - 当前 BEV 特征；
+        # - cost 最小候选轨迹编码后的 prev_pose；
+        # 输出 refined plan query，用于最终回归下一步自车位移。
         self.bev_h = bev_h
         self.bev_w = bev_w
         self.positional_encoding = build_positional_encoding(
             positional_encoding)
         self.transformer = build_transformer(transformer)
 
-        # build decoder
+        #* ================== 8. 规划回归头 ==================
+        # 当前实现每次只回归下一步 planning pose，所以 planning_steps=1。
+        # reg_branch 将 PlanTransformer 输出的 plan feature 映射为 [dx, dy]。
+        # 多步未来规划是在 Drive_OccWorld.future_pred() 中逐帧自回归调用 plan_head 实现的。
         self.planning_steps = 1
         self.reg_branch = nn.Sequential(
             nn.Linear(self.embed_dims, self.embed_dims),
@@ -238,7 +307,11 @@ class PlanHead_v1(BaseModule):
             nn.Linear(self.embed_dims, self.planning_steps * 2),
         )
 
-        # loss
+        #* ================== 9. 规划损失 ==================
+        # loss_planning: 通常是 PlanningLoss，对预测自车轨迹和 GT sdc_planning 做 L2/ADE 类监督。
+        # loss_collision: 可选的 collision loss 列表；当前配置常设为空列表。
+        # 注意：候选轨迹 cost ranking 的 loss 不是这里定义的，
+        # 而是在 loss_cost() 中用 Cost_Function 单独计算。
         self.loss_planning = build_loss(loss_planning)
         self.loss_collision = []
         for cfg in loss_collision:
