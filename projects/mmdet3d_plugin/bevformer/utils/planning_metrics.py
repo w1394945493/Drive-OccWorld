@@ -82,13 +82,20 @@ class PlanningMetric_v2(Metric):
         traj: torch.Tensor (n_future, 2)
         segmentation: torch.Tensor (n_future, 200, 200)
         '''
+        #* 设备对齐：该 metric 里既有 numpy/skimage 计算，也有 torch 索引。
+        # traj/segmentation 可能在 GPU，而 self.dx/self.bx 可能还在 CPU；
+        # 后续 torch 计算统一使用 traj.device，避免 CPU/GPU 混用。
+        device = traj.device
+        dx = self.dx.to(device)
+        bx = self.bx.to(device)
+
         pts = np.array([
             [-self.H / 2. + 0.5, self.W / 2.],
             [self.H / 2. + 0.5, self.W / 2.],
             [self.H / 2. + 0.5, -self.W / 2.],
             [-self.H / 2. + 0.5, -self.W / 2.],
         ])  # [lidar_y, lidar_x]
-        pts = (pts - self.bx.cpu().numpy()) / (self.dx.cpu().numpy())   # [bev_w, bev_h]
+        pts = (pts - bx.cpu().numpy()) / (dx.cpu().numpy())   # [bev_w, bev_h]
         # pts[:, [0, 1]] = pts[:, [1, 0]] # [bev_w, bev_h]
         rr, cc = polygon(pts[:,1], pts[:,0])    # [bev_h, bev_w]
         rc = np.concatenate([rr[:,None], cc[:,None]], axis=-1)  # [bev_h, bev_w]
@@ -96,7 +103,7 @@ class PlanningMetric_v2(Metric):
         n_future, _ = traj.shape
         trajs = traj.view(n_future, 1, 2)   # delta_[lidar_x, lidar_y]
         # trajs[:,:,[0,1]] = trajs[:,:,[1,0]] # can also change original tensor  delta_[lidar_y, lidar_x]
-        trajs = trajs / self.dx # delta_[bev_h, bev_w]
+        trajs = trajs / dx # delta_[bev_h, bev_w]
         trajs = trajs.cpu().numpy() + rc # (n_future, 32, 2) [bev_h, bev_w]
 
         r = trajs[:,:,0].astype(np.int32)   # bev_h
@@ -123,16 +130,24 @@ class PlanningMetric_v2(Metric):
         gt_trajs: torch.Tensor (B, n_future, 2)
         segmentation: torch.Tensor (B, n_future, 200, 200)
         '''
+        #* 统一设备：trajs / gt_trajs / segmentation 在评估时可能位于 GPU。
+        # torch.arange 默认在 CPU，直接参与 CUDA tensor 索引会报 device mismatch。
+        device = segmentation.device
+        trajs = trajs.to(device)
+        gt_trajs = gt_trajs.to(device)
+        dx = self.dx.to(device)
+        bx = self.bx.to(device)
+
         B, n_future, _ = trajs.shape
 
-        obj_coll_sum = torch.zeros(n_future, device=segmentation.device)
-        obj_box_coll_sum = torch.zeros(n_future, device=segmentation.device)
+        obj_coll_sum = torch.zeros(n_future, device=device)
+        obj_box_coll_sum = torch.zeros(n_future, device=device)
 
         for i in range(B):
             gt_box_coll = self.evaluate_single_coll(gt_trajs[i], segmentation[i])
             xx, yy = trajs[i,:,0], trajs[i, :, 1]   # delta_[lidar_x, lidar_y]
-            xi = ((xx - self.bx[0]) / self.dx[0]).long()    # bev_h
-            yi = ((yy - self.bx[1]) / self.dx[1]).long()    # bev_w
+            xi = ((xx - bx[0]) / dx[0]).long()    # bev_h
+            yi = ((yy - bx[1]) / dx[1]).long()    # bev_w
 
             m1 = torch.logical_and(
                 torch.logical_and(xi >= 0, xi < self.bev_dimension[0]),
@@ -140,7 +155,8 @@ class PlanningMetric_v2(Metric):
             )
             m1 = torch.logical_and(m1, torch.logical_not(gt_box_coll))
 
-            ti = torch.arange(n_future)
+            # torch.arange 默认创建在 CPU；这里必须和 segmentation/m1 同设备。
+            ti = torch.arange(n_future, device=device)
             obj_coll_sum[ti[m1]] += segmentation[i, ti[m1], xi[m1], yi[m1]].long()
 
             m2 = torch.logical_not(gt_box_coll)
