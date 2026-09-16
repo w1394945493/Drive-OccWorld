@@ -16,10 +16,26 @@
                 "out/mmo_mso/train",
             ],
             "env": {
-                "CUDA_VISIBLE_DEVICES": "0",
+                "CUDA_VISIBLE_DEVICES": "4",
                 "PYTHONPATH": "${workspaceFolder}"
             },
             "console": "integratedTerminal"
-        }
+        },
+        {
+            "name": "drive-occworld train offline",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/train.py",
+            "args": [
+                "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/fine_grained/action_condition_MMO_MSO_custom_offline.py",
+                "--work-dir",
+                "out/mmo_mso/train",
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "4",
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "console": "integratedTerminal"
+        },        
     ]
 }
