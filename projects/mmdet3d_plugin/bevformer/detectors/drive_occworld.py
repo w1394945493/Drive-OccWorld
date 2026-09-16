@@ -325,20 +325,20 @@ class Drive_OccWorld(BEVFormer):
     def obtain_ref_bev_with_plan(self, img, img_metas, prev_bev, ref_sample_traj, ref_sem_occupancy, ref_command, ref_real_traj=None):
         # Extract current BEV features.
         # C1. Forward.
-        img_feats = self.extract_feat(img=img, img_metas=img_metas)
+        img_feats = self.extract_feat(img=img, img_metas=img_metas) # 4:(1 6 256 116 200) (1 6 256 58 100) (1 6 256 29 50) (1 6 256 15 25)
         if not img_metas[0]['prev_bev_exists']:
             prev_bev = None
 
         # C2. BEVFormer Encoder Forward.
         # ref_bev: bs, bev_h * bev_w, c
-        ref_bev = self.pts_bbox_head(img_feats, img_metas, prev_bev, only_bev=True)
+        ref_bev = self.pts_bbox_head(img_feats, img_metas, prev_bev, only_bev=True) # (1 40000 256)
 
         # C3. PlanHead
-        if 'v1' in self.plan_head_type:
+        if 'v1' in self.plan_head_type: # PlanHead_v1
             if ref_sem_occupancy is None:   # use pred_occupancy to calculate sample_traj cost during inference, GT_occupancy during training
-                ref_sem_occupancy = self.future_pred_head.forward_head(ref_bev.unsqueeze(0).unsqueeze(0))[-1, -1, 0].argmax(-1).detach()
+                ref_sem_occupancy = self.future_pred_head.forward_head(ref_bev.unsqueeze(0).unsqueeze(0))[-1, -1, 0].argmax(-1).detach() # (1 40000 16)
                 bs, hw, d = ref_sem_occupancy.shape
-                ref_sem_occupancy = ref_sem_occupancy.view(bs, self.bev_w, self.bev_h, d).transpose(1,2)
+                ref_sem_occupancy = ref_sem_occupancy.view(bs, self.bev_w, self.bev_h, d).transpose(1,2) # (1 200 200 16)
             ref_pose_pred, ref_pose_loss = self.plan_head(ref_bev, ref_sample_traj, ref_sem_occupancy, ref_command, ref_real_traj)
         elif 'v2' in self.plan_head_type:
             ref_pose_pred = self.plan_head(ref_bev, ref_command)
@@ -833,8 +833,8 @@ class Drive_OccWorld(BEVFormer):
         img = img[:, -1, ...]
         img_metas = [each[num_frames-1] for each in img_metas]
         if self.turn_on_plan:
-            ref_sample_traj = sample_traj[:, :, 0]
-            ref_command = command[:, 0]
+            ref_sample_traj = sample_traj[:, :, 0] # (1 1800 5 3) -> (1  1800 3)
+            ref_command = command[:, 0] # (1,)
             ref_sem_occupancy = None
             ref_bev, ref_pose_pred, _ = self.obtain_ref_bev_with_plan(img, img_metas, prev_bev, ref_sample_traj, ref_sem_occupancy, ref_command)
         else:
@@ -876,6 +876,7 @@ class Drive_OccWorld(BEVFormer):
             test_output.update(vpq=vpq)
         else:
             test_output.update(vpq=0.1)
+        # =============================================#
         # evluate plan
         if self.turn_on_plan:
             self.evaluate_plan(next_pose_preds, sdc_planning, sdc_planning_mask, segmentation_bev, img_metas)
