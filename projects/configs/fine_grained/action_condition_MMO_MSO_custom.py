@@ -313,8 +313,8 @@ model = dict(
             pc_range=point_cloud_range))))
 
 dataset_type = 'NuScenesWorldDatasetV1'
-data_root = "/c20250502/wangyushen/Datasets/NuScenes/v1.0-trainval/"
-# cam4docc_dataset_path = 'data/cam4docc/'
+data_root = "/c20250502/wangyushen/Datasets/NuScenes/v1.0-trainval/" # nuScenes数据集根目录
+can_bus_root = "/c20250502/wangyushen/Datasets/NuScenes" # can_bus根目录
 file_client_args = dict(backend='disk')
 
 
@@ -353,6 +353,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
+        can_bus_root=can_bus_root,
         ann_file="/c20250502/wangyushen/Weights/drive-occworld/nuscenes_infos_temporal_train_new.pkl",
         pipeline=train_pipeline,
         classes=class_names,
@@ -375,6 +376,7 @@ data = dict(
     val=dict(
         type=dataset_type,
         data_root=data_root,
+        can_bus_root=can_bus_root,
         ann_file="/c20250502/wangyushen/Weights/drive-occworld/nuscenes_infos_temporal_val_new.pkl",
         pipeline=test_pipeline,
         bev_size=(bev_h_, bev_w_),
@@ -393,6 +395,7 @@ data = dict(
     test=dict(
         type=dataset_type,
         data_root=data_root,
+        can_bus_root=can_bus_root,
         ann_file="/c20250502/wangyushen/Weights/drive-occworld/nuscenes_infos_temporal_val_new.pkl",
         pipeline=test_pipeline,
         bev_size=(bev_h_, bev_w_),
@@ -432,7 +435,8 @@ total_epochs = 24
 evaluation = dict(interval=1, pipeline=test_pipeline)
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
-load_from = 'pretrained/r101_dcn_fcos3d_pretrain.pth'
+# load_from = 'pretrained/r101_dcn_fcos3d_pretrain.pth'
+load_from = "/c20250502/wangyushen/Weights/pretrained/r101_dcn_fcos3d_pretrain.pth"
 log_config = dict(
     interval=50,
     hooks=[

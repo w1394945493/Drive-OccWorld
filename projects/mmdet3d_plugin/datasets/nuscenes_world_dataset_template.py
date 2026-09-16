@@ -31,6 +31,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                  load_frame_interval=None,
                  rand_frame_interval=(1,),
                  plan_grid_conf=None,
+                 can_bus_root='',
 
                  *args,
                  **kwargs):
@@ -49,22 +50,24 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         self.use_separate_classes = use_separate_classes
         self.use_fine_occ = use_fine_occ
         self.turn_on_flow = turn_on_flow
+
+        # ==================================================================================#
         # load origin nusc dataset for instance annotation
         self.nusc = NuScenes(version='v1.0-trainval', dataroot=self.data_root, verbose=False)
-        self.nusc_can = NuScenesCanBus(dataroot=self.data_root)
+        self.nusc_can = NuScenesCanBus(dataroot=can_bus_root)
 
         # scene2map
         self.scene2map = {}
         for sce in self.nusc.scene:
             log = self.nusc.get('log', sce['log_token'])
             self.scene2map[sce['name']] = log['location']
-        
+
         # traj_api
         self.traj_api = NuScenesTraj(self.nusc,
                                      self.CLASSES,
                                      self.box_mode_3d,
                                      planning_steps=future_length+1)
-        
+
         # ignore_label_name
         self.ignore_bbox_label_name = ['barrier', 'traffic_cone', 'animal', 'noise',
                                        'movable_object.debris', 'movable_object.pushable_pullable', 'static_object.bicycle_rack']
@@ -114,7 +117,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
 
         if not self.test_mode:
             self._set_group_flag()
-    
+
     def reframe_boxes(self, boxes, t_init, t_curr):
         l2e_r_mat_curr = t_curr['l2e_r']
         l2e_t_curr = t_curr['l2e_t']
@@ -134,7 +137,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         boxes.rotate(e2g_r_mat_curr.T)
         boxes.translate(e2g_t_curr)
 
-        # to bbox under initial ego frame, first inverse translate, then inverse rotate 
+        # to bbox under initial ego frame, first inverse translate, then inverse rotate
         boxes.translate(- e2g_t_init)
         m1 = np.linalg.inv(e2g_r_mat_init)
         boxes.rotate(m1.T)
@@ -145,7 +148,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         boxes.rotate(m2.T)
 
         return boxes
-    
+
     def get_future_bboxes(self, index):
         cur_info = self.data_infos[index]
 
@@ -218,7 +221,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 gt_bboxes_3d = None
                 segmentation = np.zeros(
                         (self.bev_dimension[1], self.bev_dimension[0])) # H,W = ignore
-            
+
             gt_future_boxes.append(gt_bboxes_3d)
             segmentations.append(segmentation)
 
@@ -288,7 +291,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
             vel_steering=info['vel_steering'],        # 1,4   vx(m/s),vy(m/s),v_yaw(rad/s),steering
         ))
         return input_dict
-    
+
     def get_lidar_pose(self, rec):
         '''
         Get global poses for following bbox transforming
@@ -297,9 +300,9 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         ego2global_rotation = rec['ego2global_rotation']
         trans = -np.array(ego2global_translation)
         rot = Quaternion(ego2global_rotation).inverse
-        
+
         return trans, rot
-    
+
     def get_ego2lidar_pose(self, rec):
         '''
         Get LiDAR poses in ego system
@@ -309,7 +312,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         trans = -np.array(lidar2ego_translation)
         rot = Quaternion(lidar2ego_rotation).inverse
         return trans, rot
-    
+
     def record_instance(self, idx, instance_map):
         """
         Record information about each visible instance in the sequence and assign a unique ID to it
@@ -325,7 +328,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         current_sample = self.nusc.get('sample', rec['token'])
         for annotation_token in current_sample['anns']:
             annotation = self.nusc.get('sample_annotation', annotation_token)
-            # Instance extraction for Cam4DOcc-V1 
+            # Instance extraction for Cam4DOcc-V1
             # Filter out all non vehicle instances
             # if 'vehicle' not in annotation['category_name']:
             #     continue
@@ -389,7 +392,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 self.instance_dict[annotation['instance_token']]['attribute_label'].append(instance_attribute)
 
         return instance_map
-    
+
     @staticmethod
     def _check_consistency(translation, prev_translation, threshold=1.0):
         """
@@ -416,14 +419,14 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 instance['attribute_label'].insert(pointer, instance['attribute_label'][pointer-1])
                 pointer += 1
                 continue
-            
+
             # Eliminate observation disturbances
             if self._check_consistency(instance['translation'][pointer], instance['translation'][pointer-1]):
                 instance['translation'][pointer] = instance['translation'][pointer-1]
                 instance['rotation'][pointer] = instance['rotation'][pointer-1]
                 instance['attribute_label'][pointer] = instance['attribute_label'][pointer-1]
             pointer += 1
-        
+
         return instance
 
     def _prepare_data_info_single(self, index, occ_load_flag=None, aug_param=None):
@@ -432,7 +435,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
             return None
         if aug_param is not None:
             input_dict['aug_param'] = copy.deepcopy(aug_param)
-        
+
         # only load current frame
         if occ_load_flag is not None:
             input_dict['occ_load_flag'] = occ_load_flag
@@ -485,7 +488,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         self.pre_pipeline(input_dict)
         example = self.pipeline(input_dict)
         return example
-        
+
     def _prepare_data_info(self, index, rand_interval=None):
         """
         Modified from BEVFormer:CustomNuScenesDataset,
@@ -548,7 +551,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         Evaluate by IOU and VPQ metrics for model evaluation
         '''
         eval_results = {}
-        
+
         ''' calculate IOU of current and future frames'''
         if 'hist_for_iou' in results.keys():
             IoU_results_current_future = {}
@@ -561,7 +564,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 logger.info('IOU Evaluation of current and future frames:')
                 logger.info(res_table)        
             eval_results.update(IoU_of_Current_Future=IoU_results_current_future)
-        
+
         ''' calculate IOU of current frame'''
         if 'hist_for_iou_current' in results.keys():
             IoU_results_current = {}
@@ -574,7 +577,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 logger.info('IOU Evaluation of current frame:')
                 logger.info(res_table)        
             eval_results.update(IoU_of_Current=IoU_results_current)
-        
+
         ''' calculate IOU of future frame'''
         if 'hist_for_iou_future' in results.keys():
             IoU_results_future = {}
@@ -587,7 +590,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 logger.info('IOU Evaluation of future frames:')
                 logger.info(res_table)        
             eval_results.update(IoU_of_Future=IoU_results_future)
-        
+
         ''' calculate IOU of future frame with time_weighting'''
         if 'hist_for_iou_future_time_weighting' in results.keys():
             IoU_results_future_time_weighting = {}
@@ -616,7 +619,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
             eval_results.update(avg_obj_box_col_single=(eval_results['plan_obj_box_col_1s_single']+eval_results['plan_obj_box_col_2s_single']+eval_results['plan_obj_box_col_3s_single'])/3)
             eval_results.update(avg_obj_col_single=(eval_results['plan_obj_col_1s_single']+eval_results['plan_obj_col_2s_single']+eval_results['plan_obj_col_3s_single'])/3)
             eval_results.update(avg_l2_single=(eval_results['plan_L2_1s_single']+eval_results['plan_L2_2s_single']+eval_results['plan_L2_3s_single'])/3)
-        
+
         if 'planning_results_computed' in results.keys():
             planning_results_computed = results['planning_results_computed']
             num_frames = len(planning_results_computed['L2'])
