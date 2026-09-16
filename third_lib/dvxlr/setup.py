@@ -13,11 +13,11 @@ if CUDA_HOME is None:
 ext_modules = [
     CUDAExtension(
         name="dvxlr",
-        sources=["dvxlr.cpp", "dvxlr.cu"],
+        sources=["dvxlr.cpp", "dvxlr_cuda.cu"],
     ),
     CUDAExtension(
         name="dvxlr_v2",
-        sources=["dvxlr_v2.cpp", "dvxlr_v2.cu"],
+        sources=["dvxlr_v2.cpp", "dvxlr_v2_cuda.cu"],
     ),
 ]
 
