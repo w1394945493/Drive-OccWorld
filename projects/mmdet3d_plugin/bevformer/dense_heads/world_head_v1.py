@@ -108,18 +108,18 @@ class WorldHeadV1(WorldHeadBase):
         next_bev_preds = []
         for lvl in range(next_bev_feats.shape[1]):
             next_bev_preds.append(self.bev_pred_head[lvl](next_bev_feats[:, lvl]))
-        
+
         if self.soft_weight:
             bev_soft_weights = self.bev_soft_weights(next_bev_preds[-1])
             bev_soft_weights = torch.softmax(bev_soft_weights, dim=1)
         else:
             bev_soft_weights = torch.ones([next_bev_preds[-1].shape[0], next_bev_preds[-1].shape[1], 1, self.num_points_sampling_feat], ).to(next_bev_preds[0].device) / self.num_points_sampling_feat
-        
+
         # soft_weight
         out_bev_feats = 0
         for feat, weights in zip(next_bev_preds, torch.unbind(bev_soft_weights, dim=-1)):
             out_bev_feats += feat * weights.unsqueeze(-1)
-        
+
         # out pred
         out_occ = self.occ_pred_conv(out_bev_feats) # Lout,B,hw,c -> Lout,B,hw,d*cls*pred_frame
 
@@ -134,8 +134,8 @@ class WorldHeadV1(WorldHeadBase):
 
         out_occ = out_occ.permute(0, 5, 1, 2, 3, 4).contiguous().unsqueeze(1)
 
-        return out_occ  
-    
+        return out_occ
+
     def forward_head_layers(self, next_bev_feats):
         """Get freespace estimation from multi-frame BEV feature maps.
 
@@ -146,25 +146,43 @@ class WorldHeadV1(WorldHeadBase):
         """
         #* 对应论文 3.2 中 "prediction heads utilizing channel-to-height operation"：
         #* 将 W_D 输出的 future BEV embeddings 映射为 semantic occupancy logits S_{1:f}。
-        next_bev_preds = []
-        for lvl in range(next_bev_feats.shape[1]):
-            #  ===> Lout, bs, h*w, d, num_frame
-            next_bev_pred = self.bev_pred_head[lvl](next_bev_feats[:, lvl]) # C -> d * num_cls * num_frame 
-            next_bev_pred = next_bev_pred.view(
-                *next_bev_pred.shape[:-1], self.num_pred_height, self.num_classes, self.pred_frame_num)
+        # next_bev_feats: [Lout, inter_num, B, HW, C]
+        #   Lout: 当前帧 + 被监督/预测的未来帧数量；
+        #   inter_num: WorldDecoder 的中间层数量，用于 auxiliary loss；
+        #   HW: bev_h * bev_w，每个 token 对应一个 BEV 网格柱。
+        next_bev_preds = []  # 收集每个 decoder 中间层输出的 occupancy logits。
+        for lvl in range(next_bev_feats.shape[1]):  # 遍历 WorldDecoder 的每个中间层输出。
+            # 取第 lvl 层 BEV feature: [Lout, B, HW, C]。
+            # 线性预测头做 channel-to-height:
+            #   每个 BEV token 的 C 维特征 -> height * class * pred_frame_num。
+            next_bev_pred = self.bev_pred_head[lvl](next_bev_feats[:, lvl]) # [Lout, B, HW, D*num_cls*pred_frame_num]
+            # 显式拆出高度维 D、类别维 num_classes、以及相对帧维 pred_frame_num。
+            # next_bev_pred: [Lout, B, HW, D, num_classes, pred_frame_num]
+            next_bev_pred = next_bev_pred.view(*next_bev_pred.shape[:-1], self.num_pred_height, self.num_classes, self.pred_frame_num)
 
+            # base_bev_pred 取当前帧对应的 occupancy logits。
+            # pred_history_frame_num=0 时，它就是当前帧；若配置预测历史/未来 residual，则作为 base。
+            # base_bev_pred: [Lout, B, HW, D, num_classes, 1]
             base_bev_pred = next_bev_pred[..., self.pred_history_frame_num][..., None]
+            # 将历史/未来帧的预测当作相对当前帧的 residual，再加回 base。
+            # 当前配置 pred_history_frame_num=0、pred_future_frame_num=0，
+            # pred_frame_num=1，因此这里实际只保留 base_bev_pred。
             next_bev_pred = torch.cat([
                 next_bev_pred[..., :self.pred_history_frame_num] + base_bev_pred,
                 base_bev_pred,
                 next_bev_pred[..., self.pred_history_frame_num + 1:] + base_bev_pred
             ], -1)
 
+            # 调整维度顺序，把 pred_frame_num 放到前面，便于后续按帧计算 loss。
+            # [Lout, B, HW, D, num_classes, pred_frame_num]
+            #   -> [Lout, pred_frame_num, B, HW, D, num_classes]
             next_bev_pred = next_bev_pred.permute(0, 5, 1, 2, 3, 4).contiguous()   # Lout, history+1+future, bs, h*w, d, num_cls
-            next_bev_preds.append(next_bev_pred)
+            next_bev_preds.append(next_bev_pred)  # list 中每个元素对应一个 decoder layer 的 occupancy logits。
+        # 堆叠所有 decoder layer 输出：
+        # next_bev_preds: [Lout, inter_num, pred_frame_num, B, HW, D, num_classes]
         next_bev_preds = torch.stack(next_bev_preds, 1)
-        return next_bev_preds
-    
+        return next_bev_preds  # 后续 compute_occ_loss 会再 permute 成 [inter, frame*B, cls, H, W, D]。
+
     def forward_head(self, next_bev_feats):
         #* 论文中的 occupancy prediction head 入口：
         #* 输入未来 BEV embeddings，输出 [decoder层, 预测帧, B, HW, height, class] 风格的 occupancy logits。
@@ -210,7 +228,7 @@ class WorldHeadV1(WorldHeadBase):
                 loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=empty_idx)
 
         return loss_dict
-    
+
     def loss_occ(self, output_voxels=None, target_voxels=None, **kwargs):
         """
             output_voxels = inter_num, select_frame*bs, cls, h,w,d
@@ -219,9 +237,9 @@ class WorldHeadV1(WorldHeadBase):
         loss_dict = {}
         for index, output_voxel in enumerate(output_voxels):
             loss_dict.update(self.loss_voxel(output_voxel, target_voxels,  tag='inter_{}'.format(index)))
-            
+
         return loss_dict
-    
+
     def loss_sem_norm(self, output_voxels=None, target_voxels=None, **kwargs):
         """
             output_voxels = inter_num, select_frame*bs, cls, h,w,d
@@ -235,7 +253,7 @@ class WorldHeadV1(WorldHeadBase):
         if pH != H:
             output_voxels = F.interpolate(output_voxels.flatten(0,1), size=(H, W, D), mode='trilinear', align_corners=False)
             output_voxels = output_voxels.view(inter, B,C,H,W,D)
-        
+
         # target_voxel align to H,W,D
         ratio = tH // H
         if ratio != 1:
@@ -249,11 +267,11 @@ class WorldHeadV1(WorldHeadBase):
             target_voxels = torch.mode(target_voxels, dim=-1)[0]
             target_voxels[target_voxels<0] = 255
             target_voxels = target_voxels.long()
-        
+
         assert torch.isnan(output_voxels).sum().item() == 0
         assert torch.isnan(target_voxels).sum().item() == 0
 
-        
+
         loss_dict = {}
         for index, output_voxel in enumerate(output_voxels):
             inter_loss = CE_ssc_loss(output_voxel, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=255)
@@ -268,7 +286,7 @@ class WorldHeadV1(WorldHeadBase):
         """
         inter, B, C, H, W, D = output_voxels.shape
         tB, tC, tH, tW, tD = target_voxels.shape
-        
+
         assert torch.isnan(output_voxels).sum().item() == 0
 
         # output_voxel align to target_voxel
@@ -285,13 +303,13 @@ class WorldHeadV1(WorldHeadBase):
             loss_dict['loss_obj_motion_norm_{}'.format(index)] = inter_loss
 
         return loss_dict
-    
-    def loss_voxel_flow(self, output_voxels, target_voxels, tag):                    
+
+    def loss_voxel_flow(self, output_voxels, target_voxels, tag):
         #* 对应论文 flow 分支的 L1 loss，用于监督 3D backward centripetal flow。
         #* 当前配置 turn_on_flow=False，默认不会调用该分支。
         B, C, H, W, D = output_voxels.shape
         tB, tC, tH, tW, tD = target_voxels.shape
-        
+
         assert torch.isnan(output_voxels).sum().item() == 0
 
         # output_voxel align to target_voxel
@@ -306,7 +324,7 @@ class WorldHeadV1(WorldHeadBase):
         loss_dict['loss_flow_l1_{}'.format(tag)] = (0.5) * Smooth_L1_loss(output_voxels, target_voxels, ignore_index=255)
 
         return loss_dict
-    
+
     def loss_flow(self, output_voxels=None, target_voxels=None, **kwargs):
         """
             output_voxels = inter_num, select_frame*bs, 3, h,w,d
@@ -315,13 +333,13 @@ class WorldHeadV1(WorldHeadBase):
         loss_dict = {}
         for index, output_voxel in enumerate(output_voxels):
             loss_dict.update(self.loss_voxel_flow(output_voxel, target_voxels,  tag='inter_{}'.format(index)))
-            
+
         return loss_dict
 
     def loss_bev_occ(self, output_voxels, target_voxels):
         B, pH, pW, pD = output_voxels.shape
         tB, tH, tW, tD = target_voxels.shape
-        
+
         output_voxels = output_voxels.unsqueeze(1)
         target_voxels = target_voxels.unsqueeze(1)
 
@@ -342,14 +360,14 @@ class WorldHeadV1(WorldHeadBase):
             target_voxels = torch.mode(target_voxels, dim=-1)[0]
             target_voxels[target_voxels<0] = 0
             target_voxels = target_voxels.long()
-        
+
         loss_bev_occ = BCE_loss(output_voxels, target_voxels)
         return loss_bev_occ
-    
+
     def loss_bev_sem(self, output_voxels, target_voxels):
         B, pC, pH, pW = output_voxels.shape
         tB, tH, tW = target_voxels.shape
-        
+
         output_voxels = F.interpolate(output_voxels, size=(tH, tW), mode='bilinear', align_corners=False)
 
         loss_bev_sem = CE_ssc_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels))

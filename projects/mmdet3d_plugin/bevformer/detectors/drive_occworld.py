@@ -387,6 +387,10 @@ class Drive_OccWorld(BEVFormer):
             else:
                 plan_traj = next_pose_preds
             action_condition_dict['plan_traj'] = plan_traj
+            #* can_bus/action condition 关键链路：
+            #* future_frame_index 会作为 target_frame_index 传入 WorldHeadBase，
+            #* 之后按这个时间步读取 img_meta['future_can_bus'][future_frame_index]，
+            #* 把 can_bus 当作 action condition，用来控制该未来帧的 occupancy 预测。
 
             # 1. obtain the coordinates of future BEV query to previous frames.
             tgt_grids, aligned_prev_grids, ref2future, future2history = self._align_bev_coordnates(
@@ -397,6 +401,8 @@ class Drive_OccWorld(BEVFormer):
             # 2. transform for generating freespace of future frame.
             # pred_feat: inter_num, bs, bev_h * bev_w, c
             if future_frame_index in valid_frames:  # compute loss if it is a valid frame.
+                #* 这里进入 WorldHeadV1/WorldHeadBase._get_next_bev_features：
+                #* prev_bev_input 提供 memory_queue，action_condition_dict 提供 can_bus/command/velocity 等控制条件。
                 pred_feat, bev_sem_pred = future_pred_head(
                     prev_bev_input, img_metas, future_frame_index, action_condition_dict, cond_norm_dict,
                     tgt_points=tgt_grids, bev_h=self.bev_h, bev_w=self.bev_w, ref_points=aligned_prev_grids)

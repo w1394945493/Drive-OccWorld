@@ -313,14 +313,18 @@ class WorldHeadTemplate(BaseModule):
         plan_traj = action_condition_dict['plan_traj']
         command, vel_steering = action_condition_dict['command'][:, target_frame_index], action_condition_dict['vel_steering'][:, target_frame_index]
         if self.use_can_bus:
+            #* 当前配置 use_can_bus=True：这里是 can_bus 进入模型作为 action condition 的核心位置。
+            #* 注意它不是只用于 BEV 对齐；这里会直接影响 WorldDecoder 对未来 occupancy 的生成。
             #   * Can-bus information.
+            # future_can_bus 由 dataset 的 union2one() 整理，按 future frame 存储未来 ego-motion 信息。
             cur_can_bus = [img_meta['future_can_bus'][target_frame_index] for img_meta in img_metas]
+            # can_bus_dims=(0,1,2,17)：默认取 delta_x、delta_y、delta_z、delta_yaw。
             cur_can_bus = np.array(cur_can_bus)[:, self.can_bus_dims]  # bs, 18
             cur_can_bus = torch.from_numpy(cur_can_bus).to(dtype).to(bev_pos.device)    # bs,4  (delta_x, delta_y, delta_z, delta_yaw)
             # fourier embed
             if self.use_fourier:
                 cur_can_bus = self.fourier_embed_canbus(cur_can_bus)
-            action_condition = cur_can_bus
+            action_condition = cur_can_bus  #* can_bus 成为 action_condition 的第一部分。
 
         elif self.use_plan_traj:
             #  * Plan Traj
@@ -331,6 +335,7 @@ class WorldHeadTemplate(BaseModule):
             action_condition = cur_can_bus
 
         if self.use_command:
+            #* command 会和 can_bus 拼接，形成更完整的 action condition。
             command = command.unsqueeze(0)  # bs,1 (command)
             # fourier embed
             if self.use_fourier:
@@ -351,6 +356,7 @@ class WorldHeadTemplate(BaseModule):
                 action_condition = torch.cat([action_condition, vel_steering], dim=-1)
 
         if self.use_vel:
+            #* 当前配置 use_vel=True：从 vel_steering 中取 vx/vy，与 can_bus/command 拼接控制未来 occupancy。
             # vel_steering: bs,4  (vx, vy, v_yaw, steering)
             vel = vel_steering[:, :self.vel_dims]
             # fourier embed
@@ -373,6 +379,9 @@ class WorldHeadTemplate(BaseModule):
                 action_condition = torch.cat([action_condition, steering], dim=-1)
 
         if action_condition is not None:
+            #* can_bus/command/velocity 拼接后经 fusion_mlp 投影到 embed_dims。
+            #* 这个 action_condition 会送入 WorldDecoder 的 cross_attn_action，
+            #* 作为 key/value 控制未来 BEV query，进而控制未来 occupancy logits。
             # fusion_mlp 将不同来源的动作条件投影到 transformer embed_dims，
             # 后续作为 cross_attn_action 的 key/value 或直接加到 BEV query 上。
             action_condition = self.fusion_mlp(action_condition.float())

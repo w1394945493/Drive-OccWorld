@@ -273,6 +273,8 @@ class PredictionTransformerLayer(MyCustomBaseTransformerLayer):
 
             #* 论文 WD step 3: conditional cross-attention with action conditions。
             # action_condition 来自 can_bus/command/velocity/plan_traj 等条件编码。
+            #* 当前配置下 action_condition 包含 future_can_bus + command + velocity；
+            #* 这里把它作为 cross-attention 的 key/value，让未来 BEV query 按动作条件生成 occupancy。
             # cross-attention with action condition
             elif layer == 'cross_attn_action':
                 action_condition = kwargs['action_condition'].unsqueeze(1)
