@@ -32,10 +32,9 @@ import argparse
 import os
 import os.path as osp
 import pickle
-import sys
-import time
 
 import numpy as np
+from tqdm import tqdm
 
 
 DEFAULT_DATA_ROOT = '/c20250502/wangyushen/Datasets/kitti/semantickitti/dataset'
@@ -253,6 +252,21 @@ def build_pseudo_command(fut_trajs, cmd_thresh):
     return 2
 
 
+def build_pseudo_command_sequence(fut_trajs, cmd_thresh, command_steps=5):
+    """Build Drive-OccWorld-style command sequence, shape (command_steps,).
+
+    nuScenes v2 pkl 中 command 通常是 ``ndarray shape=(5,)``，用于多步
+    planning/action condition。SemanticKITTI 第一阶段暂不使用 action condition，
+    但这里仍按相同形式保存，便于后续 Dataset 适配。
+
+    简化策略：
+        根据当前帧未来累计轨迹得到一个 left/right/forward 伪指令，
+        然后复制到 command_steps 个未来 step。
+    """
+    command = build_pseudo_command(fut_trajs, cmd_thresh)
+    return np.full((command_steps,), command, dtype=np.int64)
+
+
 def build_cam_front_info(sequence_dir, token, calib):
     """Build monocular CAM_FRONT meta from SemanticKITTI image_2 and calib."""
     image_path = osp.join(sequence_dir, 'image_2', f'{token}.png')
@@ -266,12 +280,13 @@ def build_cam_front_info(sequence_dir, token, calib):
     lidar_to_cam0 = calib['Tr'].astype(np.float64)
     lidar2img = p2 @ lidar_to_cam0
 
-    cam_intrinsic = np.eye(4, dtype=np.float64)
-    cam_intrinsic[:3, :3] = p2[:3, :3]
+    # 和 nuScenes pkl 对齐：cam_intrinsic 使用 3x3，而不是 4x4。
+    cam_intrinsic = p2[:3, :3].astype(np.float64)
 
     # sensor2lidar means camera -> LiDAR.  It is useful for later dataset
     # compatibility even if the first-stage loader only consumes lidar2img.
     sensor2lidar = np.linalg.inv(lidar_to_cam0)
+    sensor2lidar_quat = rotation_matrix_to_quaternion_wxyz(sensor2lidar[:3, :3])
 
     return {
         'data_path': image_path,
@@ -281,7 +296,9 @@ def build_cam_front_info(sequence_dir, token, calib):
         'sensor2lidar_rotation': sensor2lidar[:3, :3].tolist(),
         'sensor2lidar_translation': sensor2lidar[:3, 3].tolist(),
         # Keep these aliases for easier adaptation to nuScenes-style loaders.
-        'sensor2ego_rotation': sensor2lidar[:3, :3].tolist(),
+        # 和 nuScenes pkl 对齐：sensor2ego_rotation 使用 wxyz 四元数 len=4。
+        # 第一阶段中 LiDAR frame 被当作 ego frame，因此 camera->ego 等同 camera->LiDAR。
+        'sensor2ego_rotation': sensor2lidar_quat,
         'sensor2ego_translation': sensor2lidar[:3, 3].tolist(),
     }
 
@@ -325,11 +342,17 @@ def build_frame_info_from_cache(
 
     gt_ego_his_trajs = build_history_trajs(
         poses_lidar, token_pose_indices, frame_idx, his_ts)
+    #* 和 nuScenes v2 pkl 对齐的自车未来轨迹/指令字段：
+    # - gt_ego_fut_trajs: nuScenes 中常见 shape=(6, 2)，这里固定构造 6 步；
+    # - command: nuScenes Drive-OccWorld v2 中常见 shape=(5,)，这里固定构造 5 步。
+    # 第一阶段关闭 action condition 和 planning，这些字段暂不作为模型输入，
+    # 但保持形状一致可降低后续 Dataset 适配成本。
     gt_ego_fut_trajs, gt_ego_fut_masks = build_future_trajs(
-        poses_lidar, token_pose_indices, frame_idx, fut_ts)
-    command = build_pseudo_command(gt_ego_fut_trajs, cmd_thresh)
+        poses_lidar, token_pose_indices, frame_idx, fut_ts=6)
+    command = build_pseudo_command_sequence(
+        gt_ego_fut_trajs, cmd_thresh, command_steps=5)
     command_onehot = np.zeros(3, dtype=np.float32)
-    command_onehot[command] = 1.0
+    command_onehot[int(command[0])] = 1.0
 
     # 第一阶段不使用 action condition，但保留一个轻量 can_bus 占位：
     # 后续若复用 BEVFormer 旧代码中读取 can_bus 的接口，可以先避免 KeyError。
@@ -339,12 +362,10 @@ def build_frame_info_from_cache(
     return {
         #* ================== 1. 基础时序字段 ==================
         'token': token,
-        'sample_idx': token,
         'scene_token': scene_name,
         'scene_name': scene_name,
         'location': 'semantickitti',
         'frame_idx': int(frame_idx),
-        'pose_idx': int(pose_idx),
         'timestamp': int(pose_idx),
         'prev': prev_token,
         'next': next_token,
@@ -372,12 +393,11 @@ def build_frame_info_from_cache(
         'gt_ego_fut_trajs': gt_ego_fut_trajs,
         'gt_ego_fut_masks': gt_ego_fut_masks,
         'gt_ego_fut_cmd': command_onehot,
-        'command': int(command),
+        'command': command,
         'fut_valid_flag': bool(frame_idx + fut_ts < len(tokens)),
 
         #* ================== 6. 占位字段：后续 dataset 可按需忽略 ==================
         'sweeps': [],
-        'ann_infos': [],
         'gt_boxes': np.zeros((0, 7), dtype=np.float32),
         'gt_names': np.asarray([], dtype=object),
     }
@@ -397,7 +417,8 @@ def print_summary(infos):
     print(f"  cam_intrinsic shape: {np.asarray(info['cams']['CAM_FRONT']['cam_intrinsic']).shape}")
     print(f"  ego2global_translation: {info['ego2global_translation']}")
     print(f"  gt_ego_fut_trajs shape: {info['gt_ego_fut_trajs'].shape}")
-    print(f"  command: {info['command']}  # 0=Right, 1=Left, 2=Forward")
+    print(f"  command shape: {np.asarray(info['command']).shape}, "
+          f"value={np.asarray(info['command']).tolist()}  # 0=Right, 1=Left, 2=Forward")
 
 
 def main():
@@ -432,8 +453,10 @@ def main():
     print(f'Build small window: token-list index [{start}, {end}).')
 
     infos = []
-    t_start = time.time()
-    for offset, frame_idx in enumerate(range(start, end), 1):
+    for frame_idx in tqdm(
+            range(start, end),
+            total=end - start,
+            desc=f'Build sequence-{sequence} infos'):
         infos.append(build_frame_info_from_cache(
             data_root=data_root,
             ann_file=ann_file,
@@ -447,12 +470,6 @@ def main():
             fut_ts=args.fut_ts,
             cmd_thresh=args.cmd_thresh,
             check_files=args.check_files))
-        if offset == 1 or offset == args.num_frames or offset % 50 == 0:
-            elapsed = time.time() - t_start
-            fps = offset / max(elapsed, 1e-6)
-            print(f'\rBuilding infos: {offset}/{args.num_frames} '
-                  f'({fps:.1f} frame/s)', end='', file=sys.stderr, flush=True)
-    print('', file=sys.stderr)
 
     data = {
         'infos': infos,
