@@ -19,6 +19,9 @@ from prettytable import PrettyTable
 @DATASETS.register_module()
 class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
     r"""World dataset for visual point cloud forecasting.
+
+    注释约定：普通 ``#`` 表示当前在数据集初始化或取样阶段执行的预处理；
+    ``#!`` 表示该结果可在离线数据转换阶段写入 PKL，训练时直接读取。
     """
 
     def __init__(self,
@@ -51,18 +54,20 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         self.use_fine_occ = use_fine_occ
         self.turn_on_flow = turn_on_flow
 
-        # ==================================================================================#
-        # load origin nusc dataset for instance annotation
+        # 训练前预处理：加载 nuScenes 主数据库和 CAN bus 数据，供实例、轨迹及规划标签查询。
+        #! 可在生成 PKL 时完成下述查询；若所需字段均已写入 PKL，训练阶段无需初始化这两个 SDK。
         self.nusc = NuScenes(version='v1.0-trainval', dataroot=self.data_root, verbose=False)
         self.nusc_can = NuScenesCanBus(dataroot=can_bus_root)
 
-        # scene2map
+        # 初始化预处理：建立 scene_name -> location 映射，用于判断新加坡左侧通行场景。
+        #! location 可按帧或按场景写入 PKL，避免每次创建 Dataset 时遍历 scene/log 表。
         self.scene2map = {}
         for sce in self.nusc.scene:
             log = self.nusc.get('log', sce['log_token'])
             self.scene2map[sce['name']] = log['location']
 
-        # traj_api
+        # 训练时预处理接口：根据 nuScenes 主表计算自车未来轨迹、有效掩码和驾驶命令。
+        #! sdc_planning、sdc_planning_mask、command 可逐帧预计算并写入 PKL。
         self.traj_api = NuScenesTraj(self.nusc,
                                      self.CLASSES,
                                      self.box_mode_3d,
@@ -86,6 +91,8 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         self.load_frame_interval = load_frame_interval  # 8
         self.rand_frame_interval = rand_frame_interval  # (-1, 1)
 
+        # 初始化预处理：过滤历史帧或未来帧数量不足、以及跨越场景边界的样本。
+        #! usable_index 或等价的 valid 标志可随固定 queue/future 配置写入 PKL；若配置会变化则应在线重算。
         # Remove data_infos without enough history & future.
         # if test, assert all history frames are available
         #  Align with the setting of 4D-occ: https://github.com/tarashakhurana/4d-occ-forecasting
@@ -119,6 +126,8 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
             self._set_group_flag()
 
     def reframe_boxes(self, boxes, t_init, t_curr):
+        # 取样预处理：把未来帧中的 3D 框统一变换到参考帧坐标系。
+        #! 对固定参考帧和 future_length，可离线保存变换后的 gt_future_boxes 或其数值数组。
         l2e_r_mat_curr = t_curr['l2e_r']
         l2e_t_curr = t_curr['l2e_t']
         e2g_r_mat_curr = t_curr['e2g_r']
@@ -150,6 +159,8 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         return boxes
 
     def get_future_bboxes(self, index):
+        # 取样预处理：收集未来 3D 框，并将框底面栅格化为规划碰撞评估所需的 BEV mask。
+        #! gt_future_boxes 与 segmentation_bev 可逐参考帧预计算进 PKL，避免训练时反复做坐标变换和栅格化。
         cur_info = self.data_infos[index]
 
         # ref pose
@@ -228,6 +239,8 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         return gt_future_boxes, segmentations
 
     def get_trajectory_sampling(self, rec, future_length, SAMPLE_INTERVAL=0.5):
+        # 取样预处理：按当前帧时间戳对齐 CAN bus 的速度和转向角，再生成候选自车轨迹。
+        #! 对固定 future_length、采样间隔和轨迹采样参数，可把 sample_traj 直接写入逐帧 PKL。
         try:
             ref_scene = self.nusc.get("scene", rec['scene_token'])
 
@@ -279,6 +292,8 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
 
     def get_data_info(self, index):
         """Also return lidar2ego transformations."""
+        # 轻量组装：基础相机/标定信息由父类从 PKL 读取，这里补充本项目需要的字段。
+        #! lidar2ego、lidar_token、vel_steering 当前本就来自 PKL，不依赖训练时 SDK 查询。
         input_dict = super().get_data_info(index)
 
         info = self.data_infos[index]
@@ -296,6 +311,8 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         '''
         Get global poses for following bbox transforming
         '''
+        # 取样预处理：由 PKL 内 ego2global 位姿计算 global -> ego/LiDAR 变换。
+        #! 变换后的 translation、rotation 可离线保存，但保留原始位姿通常更灵活且占用更小。
         ego2global_translation = rec['ego2global_translation']
         ego2global_rotation = rec['ego2global_rotation']
         trans = -np.array(ego2global_translation)
@@ -307,6 +324,8 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         '''
         Get LiDAR poses in ego system
         '''
+        # 取样预处理：由 PKL 内 lidar2ego 标定计算其逆变换。
+        #! ego2lidar 也可预计算进 PKL；若下游仍需原始标定，建议同时保留 lidar2ego。
         lidar2ego_translation = rec['lidar2ego_translation']
         lidar2ego_rotation = rec['lidar2ego_rotation']
         trans = -np.array(lidar2ego_translation)
@@ -317,6 +336,9 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         """
         Record information about each visible instance in the sequence and assign a unique ID to it
         """
+        # 取样预处理：查询当前帧的 sample_annotation，筛选目标类别并建立跨帧实例 ID。
+        #! 每帧 annotation 的 token、类别、位姿、尺寸和可见度可先写入 PKL；进一步还可按时序窗口
+        #! 预生成 instance_dict/instance_map，但后者会依赖 queue_length、future_length 和类别配置。
         rec = self.data_infos[idx]
         self.scene_token.append(rec['scene_token'])
         self.lidar_token.append(rec['lidar_token'])
@@ -409,6 +431,8 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         """
         Fix the missing frames and disturbances of ground truth caused by noise
         """
+        # 取样预处理：补齐实例缺失帧，并抑制相邻帧标注位置的异常跳变。
+        #! 若时序窗口配置固定，可将修正后的 instance_dict 离线写入 PKL 或独立标注文件。
         pointer = 1
         for i in range(instance['timestep'][0] + 1, self.queue_length+1+self.future_length):
             # Fill in the missing frames
@@ -430,6 +454,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         return instance
 
     def _prepare_data_info_single(self, index, occ_load_flag=None, aug_param=None):
+        # 单帧预处理入口：组装基础字段，并仅在参考帧上生成规划和实例相关监督。
         input_dict = self.get_data_info(index)
         if input_dict is None:
             return None
@@ -439,14 +464,16 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         # only load current frame
         if occ_load_flag is not None:
             input_dict['occ_load_flag'] = occ_load_flag
-        # gt_future_boxes for planning loss and metric
+        # 训练时预处理：生成规划损失和碰撞指标使用的未来框及 BEV 占用 mask。
+        #! 可改为从 info['gt_future_boxes']、info['segmentation_bev'] 直接读取。
         if occ_load_flag:   # only load current frame
             gt_future_boxes, segmentation_bev = self.get_future_bboxes(index)
             input_dict.update(
                 gt_future_boxes=gt_future_boxes,
                 segmentation_bev=segmentation_bev,
             )
-        # sdc_planning for planning loss and metric
+        # 训练时预处理：在线生成自车规划标签、驾驶命令与候选轨迹。
+        #! 可改为从 PKL 的 sdc_planning、sdc_planning_mask、command、sample_traj 字段直接读取。
         if occ_load_flag:
             # sdc_plan
             info = self.data_infos[index]
@@ -458,7 +485,8 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 command=command,
                 sample_traj=sample_traj,
             )
-        # prepare instance dict
+        # 训练时预处理：聚合历史到未来窗口内的实例，并修补实例时序。
+        #! inflated occupancy/flow 可直接读取离线 instance_dict；fine-grained 且不使用实例监督时可跳过此段。
         if occ_load_flag:    # only load current frame
             cur_index_list = list(range(index-self.queue_length, index + (self.future_length + 1)))
             self.scene_token = []
@@ -495,6 +523,8 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
             BEVFormer logits: randomly select (queue_length-1) previous images.
             Modified logits: directly select (queue_length) previous images.
         """
+        # 在线时序采样：随机选择帧间隔并组装历史/未来队列；这是数据增强的一部分。
+        #! 通常不应固化成单一 PKL 结果，否则会丢失 rand_frame_interval 带来的随机时序增强。
         rand_interval = (
             rand_interval if rand_interval is not None else
             np.random.choice(self.rand_frame_interval, 1)[0]
