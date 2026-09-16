@@ -1,6 +1,4 @@
 import copy
-from nuscenes import NuScenes
-from nuscenes.can_bus.can_bus_api import NuScenesCanBus
 from .nuscenes_dataset import CustomNuScenesDataset
 import mmcv
 from mmdet.datasets import DATASETS
@@ -9,22 +7,20 @@ import cv2
 import torch
 from pyquaternion import Quaternion
 from projects.mmdet3d_plugin.datasets.formating import cm_to_ious, format_iou_results
-from projects.mmdet3d_plugin.datasets.trajectory_api import NuScenesTraj
-from projects.mmdet3d_plugin.datasets.samplers import sampler as trajectory_sampler
 from projects.mmdet3d_plugin.bevformer.dense_heads.plan_head import calculate_birds_eye_view_parameters
 from mmdet3d.core.bbox import LiDARInstance3DBoxes
 from prettytable import PrettyTable
 
 
 @DATASETS.register_module()
-class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
-    r"""World dataset for visual point cloud forecasting.
+class NuScenesWorldDatasetTemplateOffline(CustomNuScenesDataset):
+    r"""Offline-PKL version of world dataset for visual point cloud forecasting.
 
     整体数据链路：
     1. 父类从 ann_file 指向的 ``nuscenes_infos_temporal_*.pkl`` 读取 data_infos，
        其中包含 sample token、相机路径、标定、ego/lidar 位姿、3D 框、速度等基础信息。
-    2. 本类初始化 nuScenes SDK、CanBus SDK 和轨迹工具，用于补充 PKL 中尚未离线保存的
-       scene/location、规划标签、候选轨迹、实例时序等监督信息。
+    2. 本离线版要求 ann_file 已由 ``tools/gen_new_data.py`` 增强，逐帧写入
+       scene/location、规划标签、候选轨迹和 sample_annotations。
     3. ``_prepare_data_info`` 按 queue_length/future_length 取历史帧、当前帧和未来帧；
        其中当前帧作为参考帧，负责触发 occupancy、规划、未来框和实例监督的准备。
     4. ``_prepare_data_info_single`` 先用 ``get_data_info`` 组装单帧基础字段，再调用
@@ -34,7 +30,13 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
        当前参考帧坐标系下的 occupancy 序列、future can_bus、规划标签和 action condition。
 
     注释约定：普通 ``#`` 表示当前在数据集初始化或取样阶段执行的预处理；
-    ``#!`` 表示该结果可在离线数据转换阶段写入 PKL，训练时直接读取。
+    ``#!`` 表示该结果已经在离线数据转换阶段写入 PKL，训练时直接读取。
+
+    与 ``NuScenesWorldDatasetTemplate`` 的关键区别：
+    - 不初始化 NuScenes；
+    - 不初始化 NuScenesCanBus；
+    - 不初始化 NuScenesTraj；
+    - 规划标签、候选轨迹、逐帧 annotation 均直接从 PKL 读取。
     """
 
     def __init__(self,
@@ -66,32 +68,20 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         self.use_fine_occ = use_fine_occ
         self.turn_on_flow = turn_on_flow
 
-        #* ================== 1. Dataset 初始化 ==================
-        # 这里的 ann_file/pkl 已由父类加载成 self.data_infos；本类再补充在线查询接口。
-        # self.nusc: 查 nuScenes 原始 meta，如 sample、sample_annotation、scene、log。
-        # self.nusc_can: 查 CAN bus，如 pose、steering，用于候选轨迹/action condition。
-        # self.traj_api: 生成自车未来规划标签 sdc_planning、mask 和 command。
-        # usable_index: 过滤掉历史帧或未来帧不够、或者跨 scene 的参考帧。
-        # 训练前预处理：加载 nuScenes 主数据库和 CAN bus 数据，供实例、轨迹及规划标签查询。
-        # SDK = Software Development Kit，这里指 nuScenes 官方 Python 查询工具包；
-        # 它不是模型，而是帮代码读取 json meta、CAN bus 消息，并根据 token 查关联记录。
-        #! 可在生成 PKL 时完成下述查询；若所需字段均已写入 PKL，训练阶段无需初始化这两个 SDK。
-        self.nusc = NuScenes(version='v1.0-trainval', dataroot=self.data_root, verbose=False)
-        self.nusc_can = NuScenesCanBus(dataroot=can_bus_root)
-
-        # 初始化预处理：建立 scene_name -> location 映射，用于判断新加坡左侧通行场景。
-        #! location 可按帧或按场景写入 PKL，避免每次创建 Dataset 时遍历 scene/log 表。
-        self.scene2map = {}
-        for sce in self.nusc.scene:
-            log = self.nusc.get('log', sce['log_token'])
-            self.scene2map[sce['name']] = log['location']
-
-        # 训练时预处理接口：根据 nuScenes 主表计算自车未来轨迹、有效掩码和驾驶命令。
-        #! sdc_planning、sdc_planning_mask、command 可逐帧预计算并写入 PKL。
-        self.traj_api = NuScenesTraj(self.nusc,
-                                     self.CLASSES,
-                                     self.box_mode_3d,
-                                     planning_steps=future_length+1)
+        # todo ================== Offline 关键区别 1：不再初始化 3 个 nuScenes SDK 对象 ==================
+        # 旧版 NuScenesWorldDatasetTemplate 会在这里实例化：
+        #   self.nusc = NuScenes(...)
+        #   self.nusc_can = NuScenesCanBus(...)
+        #   self.traj_api = NuScenesTraj(...)
+        # 离线版要求这些信息已由 tools/gen_new_data.py 写入 PKL，因此训练阶段不再依赖：
+        #   - NuScenes：原来用于查 scene/log/sample/sample_annotation；
+        #   - NuScenesCanBus：原来用于查 CAN bus pose/steering 并采样 sample_traj；
+        #   - NuScenesTraj：原来用于在线生成 sdc_planning / mask / command。
+        self.required_offline_keys = (
+            'scene_name', 'location',
+            'sdc_planning', 'sdc_planning_mask', 'command',
+            'sample_traj', 'sample_annotations')
+        self._check_offline_pkl_fields()
 
         # ignore_label_name
         self.ignore_bbox_label_name = ['barrier', 'traffic_cone', 'animal', 'noise',
@@ -144,6 +134,20 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
 
         if not self.test_mode:
             self._set_group_flag()
+
+    def _check_offline_pkl_fields(self):
+        """检查增强版 PKL 是否包含离线 Dataset 需要的字段。"""
+        if len(self.data_infos) == 0:
+            return
+        missing_keys = [
+            key for key in self.required_offline_keys
+            if key not in self.data_infos[0]
+        ]
+        if missing_keys:
+            raise KeyError(
+                'NuScenesWorldDatasetTemplateOffline requires an augmented PKL '
+                'generated by tools/gen_new_data.py. '
+                f'Missing keys in the first info: {missing_keys}')
 
     def reframe_boxes(self, boxes, t_init, t_curr):
         # 取样预处理：把未来帧中的 3D 框统一变换到参考帧坐标系。
@@ -259,99 +263,10 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         return gt_future_boxes, segmentations
 
     def get_trajectory_sampling(self, rec, future_length, SAMPLE_INTERVAL=0.5):
-        #* ================== 候选自车轨迹采样 sample_traj ==================
-        # 取样预处理：按当前帧时间戳对齐 CAN bus 的速度和转向角，再生成候选自车轨迹。
-        # 这部分和 tools/gen_new_data.py 中的离线版 get_trajectory_sampling 对应：
-        # - 在线 Dataset 版本：每次 __getitem__ 时临时查 nuScenes / CAN bus 并采样；
-        # - 离线脚本版本：提前把结果写入 PKL，训练时直接从 info['sample_traj'] 读取。
-        #
-        # 注意：这里生成的 sample_traj 不是 nuScenes 已经发生的未来 GT 轨迹，
-        # 而是从“当前自车速度 + 当前方向盘转角/曲率”出发构造的一批候选动作轨迹。
-        # 后续 planner 会结合预测未来 occupancy，对这些候选轨迹计算 cost，再选更优轨迹。
-        #
-        # 输出 shape 约为 [1800, future_length, 3]：
-        # - 1800: 候选轨迹条数；
-        # - future_length: 未来相邻位移 step 数；
-        # - 3: 每个 step 的位移/朝向增量，通常可理解为 dx/dy/dyaw。
-        #! 对固定 future_length、采样间隔和轨迹采样参数，可把 sample_traj 直接写入逐帧 PKL。
-        try:
-            # 当前帧所属 scene。CAN bus 消息是按 scene name 组织的，所以先由 scene_token 找到 scene。
-            ref_scene = self.nusc.get("scene", rec['scene_token'])
-
-            # vm_msgs = self.nusc_can.get_messages(ref_scene['name'], 'vehicle_monitor')
-            # vm_uts = [msg['utime'] for msg in vm_msgs]
-            # pose 消息：包含当前帧附近的自车状态，这里主要使用 vel[0] 作为纵向速度。
-            pose_msgs = self.nusc_can.get_messages(ref_scene['name'],'pose')    # 167
-            pose_uts = [msg['utime'] for msg in pose_msgs]
-            # steeranglefeedback 消息：方向盘转角反馈，这里用于近似当前曲率 Kappa。
-            steer_msgs = self.nusc_can.get_messages(ref_scene['name'], 'steeranglefeedback')
-            steer_uts = [msg['utime'] for msg in steer_msgs]
-
-            ref_utime = rec['timestamp']
-            # vm_index = locate_message(vm_uts, ref_utime)
-            # vm_data = vm_msgs[vm_index]
-            # CAN bus 频率和 nuScenes keyframe 频率不完全一样：
-            # locate_message 会找距离当前 sample timestamp 最近的 CAN bus 消息，
-            # 因此这里使用的是“当前帧附近/最近”的速度和转角，不是历史序列，也不是未来 GT。
-            pose_index = trajectory_sampler.locate_message(pose_uts, ref_utime)
-            pose_data = pose_msgs[pose_index]
-            steer_index = trajectory_sampler.locate_message(steer_uts, ref_utime)
-            steer_data = steer_msgs[steer_index]
-
-            # 当前初速度 v0，单位 m/s。
-            # v0 = vm_data["vehicle_speed"] / 3.6  # km/h to m/s
-            v0 = pose_data["vel"][0]  # [0] means longitudinal velocity  m/s
-
-            # 当前方向盘转角 steering，用于估计曲率 Kappa。
-            # Kappa > 0 通常表示向左转；Kappa < 0 通常表示向右转。
-            # steering = np.deg2rad(vm_data["steering"])
-            steering = steer_data["value"]
-
-            location = self.scene2map[ref_scene['name']]
-            # 新加坡是左侧通行，原代码会翻转 steering 符号，以统一左右转方向定义。
-            flip_flag = True if location.startswith('singapore') else False
-            if flip_flag:
-                steering *= -1
-            # 用方向盘转角近似曲率，2.588 可理解为车辆轴距相关常数；保持和原实现一致。
-            Kappa = 2 * steering / 2.588
-        except: # self.nusc_can.can_blacklist: some scenes does not have vehicle monitor data
-            # 某些 scene 没有 CAN bus 数据，原实现使用固定速度 + 直行曲率作为 fallback。
-            v0 = 6.6
-            Kappa = 0
-
-        # 初始局部坐标方向：
-        # - T0: tangent/front，车辆前向；这里 y 轴表示前方；
-        # - N0: normal/side，车辆侧向；根据曲率符号选择左右侧法向。
-        T0 = np.array([0.0, 1.0])  # define front
-        N0 = np.array([1.0, 0.0]) if Kappa <= 0 else np.array([-1.0, 0.0])  # define side
-
-        # 构造细粒度时间轴。
-        # 例如 future_length=5、SAMPLE_INTERVAL=0.5 时：
-        # - t_end = 5 * 0.5 = 2.5s；
-        # - t_interval = 0.5 / 10 = 0.05s；
-        # - tt = [0.00, 0.05, ..., 2.50]，共 51 个细粒度时间点。
-        t_start = 0  # second
-        t_end = future_length * SAMPLE_INTERVAL  # second
-        t_interval = SAMPLE_INTERVAL / 10
-        tt = np.arange(t_start, t_end + t_interval, t_interval)
-
-        #* 根据当前速度/曲率采样 1800 条候选轨迹。
-        # trajectory_sampler.sample 内部会混合直线、圆弧、clothoid 曲线等运动形态，
-        # 并随机采样加速度/目标速度，使候选轨迹覆盖不同速度和转向可能性。
-        # M=1800 表示候选轨迹总数；按默认比例可理解为：
-        # [720, 360, 720] = Left / Straight / Right。
-        sampled_trajectories_fine = trajectory_sampler.sample(v0, Kappa, T0, N0, tt, 1800)  # [720, 360, 720] Left,Straight,Right
-
-        # sampled_trajectories_fine 的时间分辨率是 0.05s，shape 约为 [1800, 51, 3]。
-        # 每 10 个点取一次，相当于恢复到 nuScenes keyframe 的 0.5s 间隔：
-        # 默认取到 [0, 0.5, 1.0, 1.5, 2.0, 2.5]，即 future_length+1 个位置点。
-        sampled_trajectories = sampled_trajectories_fine[:, ::10]   # sample_num, start+future, 3
-
-        #* 将“累计位置点”转成“相邻 step 位移”。
-        # 因为包含起点 t=0，所以 future_length+1 个位置点做差后得到 future_length 段位移。
-        # 例如 6 个位置点 -> 5 段位移，最终默认 shape 为 [1800, 5, 3]。
-        sampled_trajectories = sampled_trajectories[:, 1:] - sampled_trajectories[:, :-1]  # sample_num, future, 3
-        return sampled_trajectories
+        raise RuntimeError(
+            'NuScenesWorldDatasetTemplateOffline does not sample trajectories '
+            'online. Please generate an augmented PKL with tools/gen_new_data.py '
+            "and read candidate trajectories from info['sample_traj'].")
 
     def get_data_info(self, index):
         """Also return lidar2ego transformations."""
@@ -428,14 +343,14 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
             收集范围由外层 ``cur_index_list`` 决定：
                 [index - queue_length, ..., index, ..., index + future_length]
 
-            这意味着当前实现会在训练取样时在线查 annotation 并动态构造
-            instance_dict；并不是每个未来帧已经提前有完整 instance_dict。
-            如果后续在 PKL 中预存每帧 sample_annotations，这里可以改为直接从
-            rec['sample_annotations'] 读取，从而去掉对 self.nusc.get(...) 的依赖。
+            离线版不会在线查 nuScenes SDK，而是直接读取每帧 PKL 中已经保存的
+            rec['sample_annotations']。滑窗聚合仍然在线进行：
+                当前参考帧 index
+                    -> 收集历史/当前/未来帧各自的 sample_annotations
+                    -> 动态构造当前样本的 instance_dict / instance_map
         """
-        # 取样预处理：查询当前帧的 sample_annotation，筛选目标类别并建立跨帧实例 ID。
-        #! 每帧 annotation 的 token、类别、位姿、尺寸和可见度可先写入 PKL；进一步还可按时序窗口
-        #! 预生成 instance_dict/instance_map，但后者会依赖 queue_length、future_length 和类别配置。
+        # 离线取样：从当前帧 PKL 的 sample_annotations 读取 3D annotation，
+        # 筛选目标类别并建立跨帧实例 ID。
         rec = self.data_infos[idx]
         # 记录窗口中这一帧的 scene/lidar token；LoadOccupancy 后续会用这些 token
         # 定位不同时间戳的 occupancy 文件或相关标注。
@@ -448,12 +363,15 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         ego2lidar_translation, ego2lidar_rotation = self.get_ego2lidar_pose(rec)
         self.ego2lidar_list.append([ego2lidar_translation, ego2lidar_rotation])
 
-        # 在线查询这一帧的 sample，再遍历该 sample 下所有 3D annotation。
-        #! 若 gen_new_data.py 已把每帧 annotation 写入 PKL，可用 rec['sample_annotations']
-        #! 替代下面 self.nusc.get('sample') / self.nusc.get('sample_annotation')。
-        current_sample = self.nusc.get('sample', rec['token'])
-        for annotation_token in current_sample['anns']:
-            annotation = self.nusc.get('sample_annotation', annotation_token)
+        # todo ================== Offline 关键区别 2：逐帧 annotation 直接从 PKL 读取 ==================
+        # 旧版这里会在线调用：
+        #   current_sample = self.nusc.get('sample', rec['token'])
+        #   annotation = self.nusc.get('sample_annotation', annotation_token)
+        # 离线版中 gen_new_data.py 已把当前帧自己的 nuScenes 3D annotation 写入 PKL，
+        # 所以这里直接遍历 rec['sample_annotations']。
+        # 滑窗逻辑仍然保留：Dataset 仍会按当前参考帧收集历史/当前/未来多帧，
+        # 只是每一帧的目标信息不再在线查 SDK，而是从 PKL 取。
+        for annotation in rec['sample_annotations']:
             # Instance extraction for Cam4DOcc-V1
             # Filter out all non vehicle instances
             # if 'vehicle' not in annotation['category_name']:
@@ -599,18 +517,20 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 gt_future_boxes=gt_future_boxes,
                 segmentation_bev=segmentation_bev,
             )
-        # 训练时预处理：在线生成自车规划标签、驾驶命令与候选轨迹。
-        #! 可改为从 PKL 的 sdc_planning、sdc_planning_mask、command、sample_traj 字段直接读取。
+        # todo ================== Offline 关键区别 3：规划标签和候选轨迹直接从 PKL 读取 ==================
+        # 旧版这里会在线调用：
+        #   self.traj_api.get_sdc_planning_label(info['token'])
+        #   self.get_trajectory_sampling(info, self.future_length + 1)
+        # 离线版直接读取 tools/gen_new_data.py 写入 PKL 的字段：
+        # - sdc_planning / sdc_planning_mask / command 来自 NuScenesTraj 离线预计算；
+        # - sample_traj 来自 CAN bus pose/steering 离线采样。
         if occ_load_flag:
-            # sdc_plan
             info = self.data_infos[index]
-            sdc_planning, sdc_planning_mask, command = self.traj_api.get_sdc_planning_label(info['token'])
-            sample_traj = self.get_trajectory_sampling(info, self.future_length+1)
             input_dict.update(
-                sdc_planning=sdc_planning,
-                sdc_planning_mask=sdc_planning_mask,
-                command=command,
-                sample_traj=sample_traj,
+                sdc_planning=info['sdc_planning'],
+                sdc_planning_mask=info['sdc_planning_mask'],
+                command=info['command'],
+                sample_traj=info['sample_traj'],
             )
         # 训练时预处理：聚合历史到未来窗口内的实例，并修补实例时序。
         #! inflated occupancy/flow 可直接读取离线 instance_dict；fine-grained 且不使用实例监督时可跳过此段。

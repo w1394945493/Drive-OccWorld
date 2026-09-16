@@ -5,6 +5,7 @@ from .nuscenes_dataset import CustomNuScenesDataset
 # from .nuscenes_dataset_v2 import CustomNuScenesDatasetV2
 
 from .nuscenes_world_dataset_v1 import NuScenesWorldDatasetV1
+from .nuscenes_world_dataset_v1_offline import NuScenesWorldDatasetV1Offline
 
 from .formating import cm_to_ious, format_results
 from .builder import custom_build_dataset
@@ -14,4 +15,5 @@ __all__ = [
     # 注释原因：对应的 CustomNuScenesDatasetV2 导入已停用，避免导出未定义名称。
     # 'CustomNuScenesDatasetV2',
     'NuScenesWorldDatasetV1',
+    'NuScenesWorldDatasetV1Offline',
 ]
