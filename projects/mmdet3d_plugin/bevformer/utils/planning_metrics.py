@@ -8,7 +8,12 @@ import torch
 import torch.nn as nn
 import numpy as np
 from skimage.draw import polygon
+
+# 旧版写法（项目原始环境为 pytorch-lightning==1.2.5）：Metric 曾内置在
+# PyTorch Lightning 中，并支持通过 compute_on_step 控制是否在每个 step 立即计算指标。
+# 新版 PyTorch Lightning 已将指标模块拆分到独立的 torchmetrics 包，原导入路径不再存在。
 # from pytorch_lightning.metrics.metric import Metric
+# 新版兼容写法：Metric 的状态注册、分布式归约、update 和 compute 等核心能力保持不变。
 from torchmetrics import Metric
 
 
@@ -18,7 +23,10 @@ class PlanningMetric_v2(Metric):
         n_future=6,
         compute_on_step=False,
     ):
+        # 旧版 Lightning Metric 接受 compute_on_step 参数；新版 torchmetrics.Metric
+        # 不再接受该参数，因此不能沿用下面的父类初始化方式。
         # super().__init__(compute_on_step=compute_on_step)
+        # compute_on_step 暂时保留在本类参数中，仅用于兼容可能存在的旧调用；当前不产生实际作用。
         super().__init__()
         dx, bx, _ = self.gen_dx_bx([-50.0, 50.0, 0.5], [-50.0, 50.0, 0.5], [-10.0, 10.0, 20.0])
         dx, bx = dx[:2], bx[:2]
@@ -146,7 +154,7 @@ class PlanningMetric_v2(Metric):
         trajs: torch.Tensor (B, n_future, 3)
         gt_trajs: torch.Tensor (B, n_future, 3)
         '''
-        return torch.sqrt((((trajs[:, :, :2] - gt_trajs[:, :, :2]) ** 2) * gt_trajs_mask).sum(dim=-1)) 
+        return torch.sqrt((((trajs[:, :, :2] - gt_trajs[:, :, :2]) ** 2) * gt_trajs_mask).sum(dim=-1))
 
     def update(self, trajs, gt_trajs, gt_trajs_mask, segmentation):
         '''
