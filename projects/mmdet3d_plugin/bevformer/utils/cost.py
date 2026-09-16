@@ -99,6 +99,8 @@ class Cost_Function(nn.Module):
             cost_fo: torch.Tensor, shape 通常为 (B, N)。
                 每条候选轨迹的总代价。值越小表示轨迹越优。
         """
+        # * 总体代价 = safe cost + headway cost + costvolume + rule cost
+        # * 1. safety cost: 是否压倒障碍物，把自车矩形 footprint 放到候选轨迹位置上，然后在 instance_occupancy 上采样。如果候选轨迹对应的自车车身区域覆盖到了动态障碍物，占用越多，代价越高。
         #* Safety cost：惩罚候选轨迹与动态障碍物 occupancy 重叠。
         # clamp 到 [0, 100] 是为了避免某一项代价数值过大，压制其他代价项。
         safetycost = torch.clamp(self.safetycost(trajs, instance_occupancy), 0, 100)                 # penalize overlap with instance_occupancy
@@ -130,33 +132,63 @@ class Cost_Function(nn.Module):
 
 
 class BaseCost(nn.Module):
+    """所有 cost 子项共享的 BEV 几何工具类。
+
+    这里主要做两件事：
+    1. 根据 plan_grid_conf 建立真实坐标 <-> BEV 栅格坐标的映射；
+    2. 根据自车尺寸构造 ego footprint，并把它平移到候选轨迹位置上，
+       之后在 occupancy / drivable_area / cost_volume 上采样得到代价。
+    """
+
     def __init__(self, grid_conf):
         super(BaseCost, self).__init__()
         self.grid_conf = grid_conf
 
         dx, bx, _ = gen_dx_bx(grid_conf['xbound'], grid_conf['ybound'], grid_conf['zbound'])
         dx, bx = dx[:2], bx[:2]
+        # dx: BEV 栅格分辨率，例如 [0.5, 0.5] m/grid。
+        # bx: BEV 第一个栅格中心对应的真实坐标。
+        # 注册为不可学习 Parameter 是原实现写法，本质上是几何常量。
         self.dx = nn.Parameter(dx,requires_grad=False)
         self.bx = nn.Parameter(bx,requires_grad=False)
 
+        # bev_dimension: BEV 网格尺寸，例如 [200, 200, 1]。
         _,_, self.bev_dimension = calculate_birds_eye_view_parameters(
             grid_conf['xbound'], grid_conf['ybound'], grid_conf['zbound']
         )
 
+        # 自车矩形 footprint 尺寸，单位 m。
+        # W: 自车宽度；H: 自车长度。
+        # 后续 get_origin_points() 会用它构造自车在 BEV 上占据的矩形区域。
         self.W = 1.85
         self.H = 4.084
 
     def get_origin_points(self, lambda_=0):
+        """构造位于原点附近的自车矩形 footprint，并转成 BEV 像素集合。
+
+        Args:
+            lambda_: 额外膨胀量。lambda_ 越大，自车 footprint 越保守，
+                会覆盖更大的 BEV 区域。
+
+        Returns:
+            rc: Tensor, shape [M, 2]。
+                自车 footprint 内部所有 BEV 像素坐标，格式近似为 [row, col]。
+        """
         W = self.W
         H = self.H
+        # 四个角点定义的是自车矩形轮廓。
+        # 这里的 0.5 是原 ST-P3/UniAD 风格实现中的纵向偏置，
+        # 可理解为让矩形 footprint 与自车参考点/车体中心对齐。
         pts = np.array([
             [-H / 2. + 0.5 - lambda_, W / 2. + lambda_],
             [H / 2. + 0.5 + lambda_, W / 2. + lambda_],
             [H / 2. + 0.5 + lambda_, -W / 2. - lambda_],
             [-H / 2. + 0.5 - lambda_, -W / 2. - lambda_],
         ])  # [lidar_y, lidar_x]
+        # 真实坐标 -> BEV 连续坐标。
         pts = (pts - self.bx.cpu().numpy()) / (self.dx.cpu().numpy())   # [bev_w, bev_h]
         # pts[:, [0, 1]] = pts[:, [1, 0]] # [bev_h, bev_w]
+        # polygon 将矩形四边形内部填充成 BEV 像素点集合。
         rr , cc = polygon(pts[:,1], pts[:,0])   # [bev_h, bev_w]
         rc = np.concatenate([rr[:,None], cc[:,None]], axis=-1)  # [bev_h, bev_w]
         return torch.from_numpy(rc).to(device=self.bx.device) # (27,2)
@@ -167,13 +199,19 @@ class BaseCost(nn.Module):
         return:
         List[ torch.Tensor<int> (B, N), torch.Tensor<int> (B, N)]
         '''
+        # rc 是自车矩形 footprint 在原点处覆盖的 BEV 像素集合，shape [M, 2]。
         rc = self.get_origin_points(lambda_)    # [bev_h, bev_w]
         B, N, _ = trajs.shape         # delta_[lidar_x, lidar_y]
 
+        # 将候选轨迹真实位移 [m] 转为 BEV 栅格位移 [grid]，
+        # 再把原点处自车 footprint 平移到每条候选轨迹的位置。
+        # 最终 trajs shape 约为 [B, N, M, 2]，
+        # 表示每条候选轨迹对应的自车矩形 footprint 覆盖哪些 BEV 像素。
         trajs = trajs.view(B, N, 1, 2) / self.dx  # delta_[bev_h, bev_w]
         # trajs[:,:,:,:,[0,1]] = trajs[:,:,:,:,[1,0]]
         trajs = trajs + rc  # [bev_h, bev_w]
 
+        # 将连续坐标转为整数 BEV index，并 clamp 到有效边界内。
         rr = trajs[:,:,:,0].long()
         rr = torch.clamp(rr, 0, self.bev_dimension[0] - 1)
 
@@ -188,16 +226,28 @@ class BaseCost(nn.Module):
         trajs: torch.Tensor<float> (B, N, 2)
         ego_velocity: torch.Tensor<float> (B, N)
         '''
+        # _lambda 以米为单位传入，这里换算成 BEV grid 数。
+        # 例如 _lambda=1m, dx=0.5m/grid，则 footprint 向外膨胀约 2 个 grid。
         _lambda = int(_lambda / self.dx[0])
+
+        # rr/cc: 每条候选轨迹处，自车 footprint 覆盖的 BEV 像素集合。
+        # shape 约为 [B, N, M]。
         rr, cc = self.get_points(trajs, _lambda)    # [bev_h, bev_w]
         B, N, _ = trajs.shape
 
         if ego_velocity is None:
             ego_velocity = torch.ones((B,N), device=trajs.device)
 
-        ii = torch.arange(B)
+        # ii 用于 batch 维索引；必须和 trajs/occupancy 同设备。
+        ii = torch.arange(B, device=trajs.device)
 
+        # 在 occupancy / dangerous_area 上采样自车 footprint 覆盖的所有像素，
+        # 并对 footprint 内像素求和：
+        # - 若输入是 instance_occupancy，则表示车身压到多少动态障碍物像素；
+        # - 若输入是 dangerous_area，则表示车身压到多少不可行驶区域像素。
         subcost = instance_occupancy[ii[:, None, None], rr, cc].sum(dim=-1)
+
+        # 可选速度权重：速度越大，在相同碰撞/占用面积下代价越高。
         subcost = subcost * ego_velocity
 
         return subcost
@@ -210,7 +260,9 @@ class BaseCost(nn.Module):
 
         xx, yy = trajs[:,:,0], trajs[:,:,1] # delta_[lidar_x, lidar_y]
 
-        # discretize
+        # 将候选轨迹点从真实坐标离散为 BEV index。
+        # 注意：这只取候选轨迹中心点，不考虑自车矩形 footprint。
+        # Cost_Volume 使用这个函数在 learned cost map 上采样中心点代价。
         xi = ((xx - self.bx[0]) / self.dx[0]).long()
         xi = torch.clamp(xi, 0, self.bev_dimension[0]-1)    # bev_h
 
@@ -226,10 +278,13 @@ class BaseCost(nn.Module):
         '''
         B, N, _ = trajs.shape
 
-        ii = torch.arange(B)
+        # ii 用于 batch 维索引；必须和 trajs/C 同设备。
+        ii = torch.arange(B, device=trajs.device)
 
+        # Syi/Sxi 是每条候选轨迹中心点对应的 BEV index。
         Syi, Sxi = self.discretize(trajs)
 
+        # 在代价图 C 上采样候选轨迹中心点处的代价。
         CS = C[ii, Syi, Sxi]
         return CS
 
@@ -245,8 +300,11 @@ class Cost_Volume(BaseCost):
         trajs: torch.Tensor<float> (B, N, 2)   N: sample number
         '''
 
+        # cost_volume 是网络从 BEV feature 预测出的可学习代价图。
+        # 先限制数值范围，再沿候选轨迹中心点采样。
         cost_volume = torch.clamp(cost_volume, 0, 1000)
 
+        # factor=100 放大 learned cost 的量级，使其能和 rule/safety/headway cost 相加。
         return self.evaluate(trajs, cost_volume) * self.factor
 
 class Rule(BaseCost):
@@ -262,12 +320,15 @@ class Rule(BaseCost):
         '''
         B, _,  _ = trajs.shape
 
+        # drivable_area=1 表示可行驶。
+        # dangerous_area=1 表示不可行驶区域。
         dangerous_area = torch.logical_not(drivable_area).float()
         # breakpoint()
         # import matplotlib.pyplot as plt
         # plt.imshow(dangerous_area[0].detach().cpu().numpy())
         # plt.show()
         # breakpoint()
+        # 计算自车 footprint 压到不可行驶区域的面积，面积越大 rule cost 越高。
         subcost = self.compute_area(dangerous_area, trajs)
 
         return subcost * self.factor
@@ -286,14 +347,23 @@ class SafetyCost(BaseCost):
         trajs: torch.Tensor<float> (B, N, 2)   N: sample number
         instance_occupancy: torch.Tensor<float> (B, 200, 200)
         '''
+        # * SafetyCost：是否压到动态障碍物：它会把自车矩形 footprint 放到候选轨迹位置上，然后在 instance_occupancy 上采样。
+        # * 如果候选轨迹对应的自车车身区域覆盖到了动态障碍物，占用越多，代价越高。
         B, N, _ = trajs.shape
+        # 根据候选位移近似速度，nuScenes keyframe 间隔为 0.5s。
+        # 速度用于让高速状态下的潜在碰撞更重。
         ego_velocity = torch.sqrt((trajs ** 2).sum(axis=-1)) / 0.5  # B,N
 
-        # o_c(tau, t, 0)
+        # subcost1: 原始自车 footprint 与动态障碍物 occupancy 的重叠面积。
+        # 对应 o_c(tau, t, 0)。
         subcost1 = self.compute_area(instance_occupancy, trajs)
-        # o_c(tau, t, lambda) x v(tau, t)
+
+        # subcost2: 膨胀后的自车 footprint 与动态障碍物 occupancy 的重叠面积，
+        # 并乘以 ego_velocity。_lambda=1m 会扩大安全边界，更保守。
+        # 对应 o_c(tau, t, lambda) x v(tau, t)。
         subcost2 = self.compute_area(instance_occupancy, trajs, ego_velocity, self._lambda)
 
+        # 两个安全项等权相加，再乘 factor 缩放量级。
         subcost = subcost1 * self.w[0] + subcost2 * self.w[1]
 
         return subcost * self.factor
@@ -312,6 +382,8 @@ class HeadwayCost(BaseCost):
         drivable_area: torch.Tensor<float> (B, 200, 200)
         '''
         B, N, _ = trajs.shape
+        # 只关注可行驶区域上的动态障碍物。
+        # 例如道路上的车辆会保留，非可行驶区域上的物体对 headway 影响较小。
         instance_occupancy_ = instance_occupancy * drivable_area  # B,H,W
         # breakpoint()
         # import matplotlib.pyplot as plt
@@ -319,8 +391,11 @@ class HeadwayCost(BaseCost):
         # plt.show()
         # breakpoint()
         tmp_trajs = trajs.clone()
+        # 将候选轨迹点沿前向 y 方向平移 10m，
+        # 用于检查“候选位置前方 10m”是否有动态障碍物。
         tmp_trajs[:,:,1] = tmp_trajs[:,:,1]+self.L
 
+        # 如果前方 10m 的自车 footprint 覆盖到障碍物，则 headway cost 增大。
         subcost = self.compute_area(instance_occupancy_, tmp_trajs)
 
         return subcost * self.factor

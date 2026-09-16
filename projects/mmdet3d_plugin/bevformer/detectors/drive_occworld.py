@@ -339,6 +339,9 @@ class Drive_OccWorld(BEVFormer):
                 ref_sem_occupancy = self.future_pred_head.forward_head(ref_bev.unsqueeze(0).unsqueeze(0))[-1, -1, 0].argmax(-1).detach() # (1 40000 16)
                 bs, hw, d = ref_sem_occupancy.shape
                 ref_sem_occupancy = ref_sem_occupancy.view(bs, self.bev_w, self.bev_h, d).transpose(1,2) # (1 200 200 16)
+
+            # *================================================#
+            #* 规划Head
             ref_pose_pred, ref_pose_loss = self.plan_head(ref_bev, ref_sample_traj, ref_sem_occupancy, ref_command, ref_real_traj)
         elif 'v2' in self.plan_head_type:
             ref_pose_pred = self.plan_head(ref_bev, ref_command)
@@ -349,6 +352,21 @@ class Drive_OccWorld(BEVFormer):
 
     def future_pred(self, prev_bev_input, action_condition_dict, cond_norm_dict, plan_dict,
                     valid_frames, img_metas, prev_img_metas, num_frames, occ_flow='occ'):
+        #* ================== 自回归未来预测总入口 ==================
+        # 这个函数同时负责两条自回归链路：
+        # 1. BEV/Occupancy 链路：
+        #    当前 memory_queue -> 预测 future_frame_index 的 BEV -> 放回 memory_queue，
+        #    再继续预测更远未来。
+        # 2. Planning 链路（仅 turn_on_plan=True 且 occ_flow='occ'）：
+        #    single_test()/forward_train 中已经先用 sample_traj[:, :, 0] 预测了
+        #    ref -> t+1 的第一步 ref_pose_pred；
+        #    这里从 future_frame_index=1 开始，继续用 sample_traj[:, :, i]
+        #    逐步预测 t+i -> t+i+1 的后续一步轨迹，并 cat 到 next_pose_preds。
+        #
+        # 因此 next_pose_preds 的构建方式是：
+        #   初始: [ref_pose_pred]，对应 sample_traj[:, :, 0]
+        #   循环: append pose_pred_i，对应 sample_traj[:, :, i], i=1..future_frame_num
+        # 最终得到多步自车轨迹预测。
         if occ_flow == 'occ':
             future_pred_head = self.future_pred_head
         elif occ_flow == 'flow':
@@ -363,6 +381,10 @@ class Drive_OccWorld(BEVFormer):
                 len(self.future_pred_head.bev_pred_head), 1, 1, 1).contiguous()
 
         next_bev_feats, next_bev_sem, next_pose_loss = [ref_bev], [], []
+        # next_pose_preds 初始就是参考帧规划出的第一步轨迹：
+        # ref_pose_pred: ref/current -> t+1，对应 sample_traj[:, :, 0]。
+        # 后续 for future_frame_index in range(1, ...) 会继续 append t+1->t+2,
+        # t+2->t+3, ... 的逐步规划结果。
         next_pose_preds = plan_dict['ref_pose_pred'] # B,Lout,2
 
 
@@ -374,14 +396,23 @@ class Drive_OccWorld(BEVFormer):
             prev_bev_input, prev_bev_input.shape[1], prev_img_metas, ref_img_metas)
 
 
-        #* ================== 4.3 自回归预测未来 BEV feature ==================
+        #* ================== 4.3 自回归预测未来 BEV feature / future pose ==================
         # 每一步预测一个 future frame，并把该预测 BEV 放回 memory_queue，继续预测更远未来。
+        # 如果开启 planner，则每一步还会基于该未来 BEV/Occupancy 预测下一段自车位移。
         if self.training:
             future_frame_num = self.future_pred_frame_num
         else:
             future_frame_num = self.test_future_frame_num
 
         for future_frame_index in range(1, future_frame_num + 1):
+            #* future_frame_index 的含义：
+            # - 在 single_test()/forward_train 外层，已经用 sample_traj[:, :, 0]
+            #   预测了 ref/current -> t+1 的 ref_pose_pred；
+            # - 这里从 1 开始循环：
+            #     future_frame_index=1 使用 sample_traj[:, :, 1]，预测 t+1 -> t+2；
+            #     future_frame_index=2 使用 sample_traj[:, :, 2]，预测 t+2 -> t+3；
+            #     ...
+            # 同时 WorldHead 也用相同的 future_frame_index 预测对应未来时刻的 BEV/Occ。
             if (not self.turn_on_plan) or (self.turn_on_plan and self.training and self.training_epoch < 12):   # use GT planning during training
                 plan_traj = plan_dict['gt_traj'][:, :future_frame_index, :2]
             else:
@@ -418,13 +449,44 @@ class Drive_OccWorld(BEVFormer):
 
             # 3. Planning based on semantic occupancy.
             if self.turn_on_plan and occ_flow == 'occ':
-                # sample_traj  gt_traj
+                #* ================== 4.4 当前未来步的 planning ==================
+                # 当前 future_frame_index 的轨迹预测遵循同一套“候选轨迹 -> cost 选择 -> transformer refine”流程：
+                #
+                #   sample_traj[:, :, future_frame_index]       # 当前未来步的候选一步轨迹
+                #       ↓
+                #   sem_occupancy_i / pred_feat[-1]             # 当前未来步的占用预测和 BEV 特征
+                #       ↓
+                #   PlanHead_v1 根据 command_i 筛选 left/forward/right 候选组
+                #       ↓
+                #   Cost_Function 计算候选轨迹代价：
+                #       safety + headway + rule + learned_costvolume
+                #       ↓
+                #   select() 选代价最小候选轨迹
+                #       ↓
+                #   PlanTransformer 融合 BEV feature / command / selected trajectory
+                #       ↓
+                #   reg_branch 输出当前未来步 refined pose_pred
+                #
+                # 多个 future_frame_index 的 pose_pred 会被 cat 到 next_pose_preds，
+                # 从而形成多步未来自车轨迹。
+                # sample_traj_i: 当前 future_frame_index 对应的一步候选轨迹，
+                #   shape [B, sample_num, 3]。
+                # gt_traj_i: 同一个未来步的一步 GT 位移，用于训练 loss。
+                # 例：sample_traj shape 为 [B, 1800, 5, 3] 时：
+                #   sample_traj[:, :, 0] 已在外层预测 ref -> t+1；
+                #   sample_traj[:, :, 1] 在这里预测 t+1 -> t+2；
+                #   sample_traj[:, :, 2] 在这里预测 t+2 -> t+3；
+                #   ...
                 sample_traj_i,  gt_traj_i = plan_dict['sample_traj'][:,:,future_frame_index], plan_dict['gt_traj'][:,future_frame_index]
-                # command
+                # command_i: 当前未来步的高层驾驶指令，控制 left/right/forward 候选组选择。
                 command_i = action_condition_dict['command'][:,future_frame_index]
-                # forward plan_head
+
+                # forward plan_head：基于当前预测的未来 BEV/Occupancy，
+                # 对 sample_traj_i 中的候选轨迹打分、选最优候选，并 refine 出 pose_pred。
                 if 'v1' in self.plan_head_type:    # used for fine-grained_MMO when sem_occupancy distinguish categories in MMO
-                    # sem_occupancy
+                    # sem_occupancy_i:
+                    # - 测试/推理时从当前 future BEV 的 occupancy head 预测得到；
+                    # - 训练前期可使用 GT occupancy 稳定 planner。
                     if plan_dict['sem_occupancy'] is None:   # use_pred
                         sem_occupancy_i = future_pred_head.forward_head(pred_feat.unsqueeze(0))[-1, -1, 0].argmax(-1).detach()
                         bs, hw, d = sem_occupancy_i.shape
@@ -432,7 +494,9 @@ class Drive_OccWorld(BEVFormer):
                     else:   # use_gt  traning_epoch < 12
                         sem_occupancy_i = plan_dict['sem_occupancy'][:,future_frame_index]
                     pose_pred, pose_loss = self.plan_head(pred_feat[-1], sample_traj_i, sem_occupancy_i, command_i, gt_traj_i)
-                    # update prev_pose and store pred
+                    # update prev_pose and store pred:
+                    # 将当前一步 pose_pred 追加到 next_pose_preds，
+                    # 后续更远未来的 BEV 对齐/规划会使用已经预测出的多步 plan_traj。
                     next_pose_preds = torch.cat([next_pose_preds, pose_pred], dim=1)
                     next_pose_loss.append(pose_loss)
                 elif 'v2' in self.plan_head_type:   # used for inflated_GMO when sem_occupancy does not distinguish categories in GMO
@@ -749,9 +813,9 @@ class Drive_OccWorld(BEVFormer):
             #* W_D 根据 WM 中历史特征和动作条件，逐帧生成 future BEV embeddings。
             # next_bev_preds: occupancy logits，后续 compute_occ_loss 会 reshape 成 [inter, frame*B, cls, H, W, D]。 当前输出shape: (5 3 1 1 40000 16 17)
             # next_bev_sem: 中间 BEV semantic rendering 分支输出，用于 sem_norm loss。 list:4:(1 17 200 200 16)
-            # next_pose_preds/next_pose_loss: 仅 turn_on_plan=True 时有实际意义；当前配置基本为 None/空。 
+            # next_pose_preds/next_pose_loss: 仅 turn_on_plan=True 时有实际意义；当前配置基本为 None/空。
             next_bev_preds, next_bev_sem, next_pose_preds, next_pose_loss = self.future_pred(prev_bev_list, action_condition_dict, cond_norm_dict, plan_dict,
-                                                                            valid_frames, img_metas, prev_img_metas, num_frames, occ_flow='occ') 
+                                                                            valid_frames, img_metas, prev_img_metas, num_frames, occ_flow='occ')
 
 
             # D6. predict future flow in auto-regressive manner
@@ -833,7 +897,18 @@ class Drive_OccWorld(BEVFormer):
         img = img[:, -1, ...]
         img_metas = [each[num_frames-1] for each in img_metas]
         if self.turn_on_plan:
-            ref_sample_traj = sample_traj[:, :, 0] # (1 1800 5 3) -> (1  1800 3)
+            #* ref_sample_traj 是规划自回归链路的“第 0 步”候选轨迹：
+            # sample_traj: [B, sample_num, future_step, 3]，例如 [1, 1800, 5, 3]。
+            # sample_traj[:, :, 0] 表示 ref/current -> t+1 的 1800 条候选一步位移。
+            # obtain_ref_bev_with_plan() 会：
+            #   1. 先从当前帧图像提取 ref_bev；
+            #   2. 用 ref_bev 预测当前参考帧 occupancy；
+            #   3. 用该 occupancy 对 ref_sample_traj 计算 cost；
+            #   4. 选/细化得到 ref_pose_pred，即第一步规划结果。
+            #
+            # 后续 t+1->t+2、t+2->t+3 ... 不在这里完成，
+            # 而是在下面 self.future_pred() 内部的 for future_frame_index 循环中完成。
+            ref_sample_traj = sample_traj[:, :, 0] # (1 1800 5 3) -> (1  1800 3) # 从一整段未来候选轨迹序列中，选取下一帧 的 1800 条候选一步位移
             ref_command = command[:, 0] # (1,)
             ref_sem_occupancy = None
             ref_bev, ref_pose_pred, _ = self.obtain_ref_bev_with_plan(img, img_metas, prev_bev, ref_sample_traj, ref_sem_occupancy, ref_command)
@@ -852,9 +927,20 @@ class Drive_OccWorld(BEVFormer):
         # D3. prepare action condition dict
         action_condition_dict = {'command':command, 'vel_steering': vel_steering}
         # D4. prepare planning dict
+        # ref_pose_pred 是第 0 步规划结果 ref/current -> t+1。
+        # sample_traj 仍保留完整未来候选序列 [B, sample_num, future_step, 3]，
+        # future_pred() 会从 future_frame_index=1 开始逐步取 sample_traj[:, :, i]，
+        # 继续预测 t+i -> t+i+1，并把结果追加到 next_pose_preds。
         plan_dict = {'sem_occupancy': None, 'sample_traj': sample_traj, 'gt_traj': sdc_planning, 'ref_pose_pred': ref_pose_pred}
 
         # D5. predict future occ in auto-regressive manner
+        #* 注意：future_pred() 不只预测未来 occupancy。
+        # 当 turn_on_plan=True 且 occ_flow='occ' 时，它还会在内部循环中继续逐步预测未来轨迹：
+        #   初始化 next_pose_preds = ref_pose_pred       # ref -> t+1
+        #   future_frame_index=1 追加 pose_pred          # t+1 -> t+2
+        #   future_frame_index=2 追加 pose_pred          # t+2 -> t+3
+        #   ...
+        # 因此这里返回的 next_pose_preds 是多步规划结果。
         next_bev_preds, _, next_pose_preds, _ = self.future_pred(prev_bev_list, action_condition_dict, cond_norm_dict, plan_dict,
                                                                 valid_frames, img_metas, prev_img_metas, num_frames, occ_flow='occ')
 

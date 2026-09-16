@@ -99,7 +99,7 @@ class PoseEncoder(BaseModule):
         self.num_modes = num_modes
         self.num_fut_ts = num_fut_ts
         assert num_fut_ts == 1
-        
+
         pose_encoder = []
 
         for _ in range(num_layers - 1):
@@ -109,7 +109,7 @@ class PoseEncoder(BaseModule):
             in_channels = out_channels
         pose_encoder.append(nn.Linear(out_channels, out_channels))
         self.pose_enc = nn.Sequential(*pose_encoder)
-    
+
     def forward(self,x):
         # x: N*2,
         pose_feat = self.pose_enc(x)
@@ -120,7 +120,7 @@ class PoseEncoder(BaseModule):
 class PoseDecoder(BaseModule):
 
     def __init__(
-            self, 
+            self,
             in_channels,
             num_layers=2,
             num_modes=3,
@@ -344,7 +344,7 @@ class PlanHead_v1(BaseModule):
             xavier_init(self.mlp_fuser, distribution='uniform', bias=0.)
         except:
             pass
-    
+
     def loss(self, outs_planning, sdc_planning, sdc_planning_mask, future_gt_bbox=None):
         """
             outs_planning:      B,Lout,mode=1,2
@@ -355,7 +355,7 @@ class PlanHead_v1(BaseModule):
         loss_dict = dict()
         for i in range(len(self.loss_collision)):
             loss_collision = self.loss_collision[i](outs_planning, sdc_planning[..., :3], torch.any(sdc_planning_mask, dim=-1), future_gt_bbox)
-            loss_dict[f'loss_collision_{i}'] = loss_collision          
+            loss_dict[f'loss_collision_{i}'] = loss_collision
         loss_ade = self.loss_planning(outs_planning, sdc_planning, torch.any(sdc_planning_mask, dim=-1))
         loss_dict.update(dict(loss_ade=loss_ade))
         return loss_dict
@@ -391,14 +391,36 @@ class PlanHead_v1(BaseModule):
         CS = sm_cost_fo
         CC, KK = torch.topk(CS, k, dim=-1, largest=False)   # B,N_sample
 
-        ii = torch.arange(len(trajs))
+        # trajs 可能在 GPU；torch.arange 默认在 CPU，索引 CUDA tensor 会报设备不一致。
+        ii = torch.arange(len(trajs), device=trajs.device)
         select_traj = trajs[ii[:,None], KK].squeeze(1) # (B, 3)
 
         return select_traj
 
     @auto_fp16(apply_to=('bev_feats'))
     def forward(self, bev_feats, trajs, sem_occupancy, command, gt_trajs=None):
-        """ Forward function for each frame.
+        """Forward function for each frame.
+
+        注意：PlanHead_v1 每次只处理“某一个时间步”的一步规划。
+        外层 Drive_OccWorld.future_pred() 会对不同 future_frame_index 多次调用本函数：
+        - sample_traj[:, :, 0] 在参考帧处预测 ref -> t+1；
+        - sample_traj[:, :, 1] 预测 t+1 -> t+2；
+        - sample_traj[:, :, 2] 预测 t+2 -> t+3；
+        - ...
+        多次输出的 pose_pred 再拼成完整未来轨迹。
+
+        因此本函数内部的核心是“单步候选轨迹规划”：
+        当前时间步的候选轨迹 -> cost 选择最优候选 -> transformer refine -> 输出一步 pose_pred。
+
+        整体流程：
+        1. 根据高层 command 从候选轨迹中筛选 left / forward / right 对应候选；
+        2. 将当前 BEV 特征转换到 planning grid，并预测 cost volume；
+        3. 从 semantic occupancy 中提取动态障碍物区域和可行驶区域；
+        4. 用 occupancy cost + learned cost volume 给候选轨迹打分；
+        5. 选择总代价最低的候选轨迹作为 coarse plan；
+        6. 将 coarse plan 编码成 pose feature，与 plan query / command / BEV 特征一起送入
+           PlanTransformer，进一步 refine；
+        7. reg_branch 输出下一步自车位移 next_pose。
 
         Args:
             bev_feats: bev feats of current frame, with shape of (bs, bev_h * bev_w, embed_dim)
@@ -408,6 +430,18 @@ class PlanHead_v1(BaseModule):
             command: bs                    0:Right  1:Left  2:Forward
             gt_trajs: bs, 3                 current -> next frame, under ref_liar
         """
+        # *===============================================================
+        # * 先选取候选轨迹，再基于候选轨迹预测/refine下一步轨迹
+        #* ================== 1. 按 command 筛选候选轨迹 ==================
+        # Dataset 生成的 trajs 按三组排列：
+        #   [0:self.num]                 -> Left
+        #   [self.num:self.num * 2]      -> Forward
+        #   [self.num * 2:self.sample_num] -> Right
+        # command: 0=Right, 1=Left, 2=Forward。
+        #
+        # 这里不是让网络预测候选轨迹，而是先根据 command 取对应方向的候选集合。
+        # repeat(3, 1) 是为了把单方向的 self.num 条候选扩回 sample_num 条，
+        # 保持后续 cost/select 代码输入 shape 仍为 [B, sample_num, 3]。
         cur_trajs = []
         for i in range(len(command)):
             command_i = command[i]
@@ -422,62 +456,116 @@ class PlanHead_v1(BaseModule):
                 cur_trajs.append(traj)
         cur_trajs = torch.stack(cur_trajs)  # B,N_sample,3
 
-        # bev_feat
-        # grid sample
+        #* ================== 2. 当前 BEV 特征 -> planning grid BEV 特征 ==================
+        # 输入 bev_feats 来自 world model / BEV encoder，shape 为 [B, H*W, C]。
+        # 先 reshape 成 [B, C, H, W]，再用 bev_sampler 映射到 plan_grid_conf 指定的
+        # planning grid 上，方便 cost volume 和轨迹采样在同一 BEV 坐标系中计算。
         bev_feats = rearrange(bev_feats, 'b (w h) c -> b c h w', h=self.bev_h, w=self.bev_w)
         bev_feats = self.bev_sampler(bev_feats)
-        # plugin adapter
+
+        # 可选 BEV adapter：轻量残差模块，让 BEV 特征进一步适配 planning/cost 任务。
         if self.with_adapter:
             bev_feats = bev_feats + self.bev_adapter(bev_feats)  # residual connection
 
-        # cost_volume
+        #* ================== 3. 从 BEV 特征预测可学习 cost volume ==================
+        # costvolume: [B, H_plan, W_plan]。
+        #
+        # 这里的 costvolume 是“学习型代价”，不是直接由语义 occupancy 规则计算出来的。
+        # 它的作用是补充 sem_occupancy 难以显式表达的软约束/隐式驾驶偏好，例如：
+        # - 两条候选轨迹都不碰撞，但其中一条离障碍物太近；
+        # - 都在可行驶区域内，但其中一条更符合道路结构或更自然；
+        # - occupancy 是离散类别图，可能丢失 BEV latent feature 中的细粒度上下文；
+        # - 网络可以从数据中学习“哪些区域虽然可通行，但代价更高”。
+        #
+        # 后续 Cost_Volume 会沿每条候选轨迹在该 cost map 上采样，
+        # 得到每条候选轨迹的 learned trajectory cost。
+        # 若只想做纯 occupancy-based planner，可以在 Cost_Function 中去掉这一项。
         costvolume = self.costvolume_head(bev_feats).squeeze(1) # b,h,w
-        # instance_occupancy
-        instance_occupancy = torch.isin(sem_occupancy, self.instance_cls.to(sem_occupancy)).float()
-        instance_occupancy = instance_occupancy.max(-1)[0].detach()  # b,h,w
-        # drivable_area
+
+        #* ================== 4. 从 semantic occupancy 提取手工规则需要的 BEV mask ==================
+        # sem_occupancy: [B, H, W, D]，包含每个 BEV 网格在高度维度上的语义类别。
+        #
+        # 与上面的 costvolume 不同，这里从 sem_occupancy 得到的是“显式规则代价”的输入：
+        # - instance_occupancy 用于 safety/headway cost，判断候选轨迹是否碰撞动态目标、
+        #   或者前方安全距离内是否存在障碍物；
+        # - drivable_area 用于 rule cost，判断候选轨迹是否驶出可行驶区域。
+        #
+        # 因此 PlanHead_v1 的总代价是：
+        #   occupancy/map 规则代价  +  BEV learned cost
+        # 前者提供明确的安全/规则约束，后者补充数据驱动的隐式偏好。
+        # instance_occupancy: 将动态障碍物类别压到 BEV 平面，得到 [B, H, W]。
+        # 只作为 cost 计算的输入，不需要梯度，因此 detach。
+        #=================================================================
+        instance_occupancy = torch.isin(sem_occupancy, self.instance_cls.to(sem_occupancy)).float() # 判断每个voxel语义类别是否是动态障碍物类别
+        instance_occupancy = instance_occupancy.max(-1)[0].detach()  # b,h,w # 某个bev网格柱子上的任意高度存在动态目标，即认为该BEV网格被动态障碍物占据
+
+
+        #=================================================================
+        # 只要某个 BEV 网格柱子中任意高度 voxel 被标成 driveable_surface，这个 BEV 网格就认为是可行驶区域。
+        # drivable_area: 将可行驶区域类别压到 BEV 平面，得到 [B, H, W]。
+        # Rule cost 会用它惩罚驶出可行驶区域的候选轨迹。
         drivable_area = torch.isin(sem_occupancy, self.drivable_area_cls.to(sem_occupancy)).float()
         drivable_area = drivable_area.max(-1)[0].detach()   # b,h,w
 
+        #* ================== 5. 训练时计算候选轨迹 cost ranking loss ==================
+        # loss_cost 的核心思想：GT 轨迹的 cost 应该小于候选轨迹的 cost。
+        # 推理时不计算 loss，只使用 cost 来选择最优候选。
         if self.training:
             loss = self.loss_cost(cur_trajs, gt_trajs, costvolume, instance_occupancy, drivable_area)
         else:
             loss = None
 
-        # select_traj
+        #* ================== 6. 选择总代价最小的候选轨迹 ==================
+        # select() 内部会调用 Cost_Function：
+        #   total_cost = safety + headway + rule + learned_costvolume
+        # 然后 topk(largest=False) 取 cost 最小的一条。
         select_traj = self.select(cur_trajs, costvolume, instance_occupancy, drivable_area)  # B,3
-        # select_traj -> encoder
+
+        # 将选中的 coarse trajectory 编码成 pose feature，作为 transformer 的 prev_pose 条件。
         select_traj = self.pose_encoder(select_traj.float()).unsqueeze(1)   # B,1,C
 
-        # bev refine
+        #* ================== 7. 准备 PlanTransformer 输入 ==================
+        # bev_feats 从 [B, C, H, W] 拉平成 [B, H*W, C]，作为 cross-attention 的 key/value。
         bs = bev_feats.shape[0]
         dtype = bev_feats.dtype
         bev_feats = rearrange(bev_feats, 'b c h w -> b (w h) c')
 
-        # # 1. plan_query
+        # plan_query: 可学习的规划 query，表示“下一步自车规划”的查询 token。
         plan_query = self.plan_embedding.weight.to(dtype)
-        plan_query = plan_query[None]   
-        # navi_embed
+        plan_query = plan_query[None]
+
+        # navi_embed: command 对应的高层导航指令 embedding。
+        # command=0/1/2 分别对应 Right/Left/Forward。
         navi_embed = self.navi_embedding.weight[command]
         navi_embed = navi_embed[None]
-        # mlp_fuser
+
+        # 将 plan query 和导航指令融合，得到带 command 条件的 planning query。
         plan_query = torch.cat([plan_query, navi_embed], dim=-1)
         plan_query = self.mlp_fuser(plan_query)
 
-        # 3. bev_feats
+        # BEV 位置编码，提供 planning grid 上的空间位置信息。
         bev_mask = torch.zeros((bs, self.bev_h, self.bev_w),
                                device=plan_query.device).to(dtype)
         bev_pos = self.positional_encoding(bev_mask).to(dtype)  # bs, bev_dims, bev_h, bev_w
 
-        # 5. do transformer layers to get pose features.
+        #* ================== 8. Transformer refine ==================
+        # PlanTransformer 使用：
+        # - plan_query: 带 command 的规划查询；
+        # - bev_feats: 当前 BEV 场景上下文；
+        # - prev_pose: cost 最小候选轨迹编码；
+        # - bev_pos: BEV 位置编码。
+        # 输出 refined plan feature。
         plan_query = self.transformer(
             plan_query,
             bev_feats,
             prev_pose=select_traj,
             bev_pos=bev_pos,
         )
-        
-        # 6. plan regression
+
+        #* ================== 9. 回归下一步自车位移 ==================
+        # 当前 planning_steps=1，因此输出 shape 为 [B, 1, 2]，
+        # 表示 current -> next frame 的自车位移 [dx, dy]。
+        # 多步未来规划由外层 future_pred() 自回归多次调用该 plan_head 实现。
         next_pose = self.reg_branch(plan_query).view((-1, self.planning_steps, 2))   # B,mode=1,2
         return next_pose, loss
 
@@ -578,7 +666,7 @@ class PlanHead_v2(BaseModule):
             xavier_init(self.mlp_fuser, distribution='uniform', bias=0.)
         except:
             pass
-    
+
     def loss(self, outs_planning, sdc_planning, sdc_planning_mask, future_gt_bbox=None):
         """
             outs_planning:      B,Lout,mode=1,2
@@ -589,7 +677,7 @@ class PlanHead_v2(BaseModule):
         loss_dict = dict()
         for i in range(len(self.loss_collision)):
             loss_collision = self.loss_collision[i](outs_planning, sdc_planning[..., :3], torch.any(sdc_planning_mask, dim=-1), future_gt_bbox)
-            loss_dict[f'loss_collision_{i}'] = loss_collision          
+            loss_dict[f'loss_collision_{i}'] = loss_collision
         loss_ade = self.loss_planning(outs_planning, sdc_planning, torch.any(sdc_planning_mask, dim=-1))
         loss_dict.update(dict(loss_ade=loss_ade))
         return loss_dict
@@ -637,7 +725,7 @@ class PlanHead_v2(BaseModule):
             bev_feats,
             bev_pos=bev_pos,
         )
-        
+
         # 6. plan regression
         next_pose = self.reg_branch(plan_query).view((-1, self.planning_steps, 2))   # B,mode=1,2
         return next_pose
