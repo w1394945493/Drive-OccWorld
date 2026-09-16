@@ -22,6 +22,11 @@ class WorldDecoder(TransformerLayerSequence):
     """
     Decoder of End-to-End prediction transformer.
     Attention with both self and cross.
+
+    对应论文 3.2 的 World Decoder W_D：
+    learnable BEV queries 依次经过 deformable self-attention、
+    temporal cross-attention、action conditional cross-attention 和 FFN，
+    输出未来帧 BEV embeddings。
     """
 
     def __init__(self, *args,
@@ -34,6 +39,8 @@ class WorldDecoder(TransformerLayerSequence):
 
         self.keep_idx = keep_idx
         # remove latent rendering in previous layers.
+        #* 论文 Future Forecasting with World Decoder：
+        #* 多层 decoder 逐层更新 future BEV query，return_intermediate=True 时返回每层结果做辅助监督。
         for lid, layer in enumerate(self.layers):
             if lid not in self.keep_idx:
                 # if this is not the last layer, and remove operations in previous layers.
@@ -197,6 +204,7 @@ class PredictionTransformerLayer(MyCustomBaseTransformerLayer):
                                                      f'to the number of attention in ' \
                 f'operation_order {self.num_attn}'
 
+        #* 对应论文 WD 中 deformable attention 需要的采样坐标准备。
         # Pre-process some parameters:
         #   * change ref_points from [bs, bev_h * bev_w, 2] to
         #     [bs, bev_h * bev_w, 1, 2] where 1 stands for num_level.
@@ -219,6 +227,8 @@ class PredictionTransformerLayer(MyCustomBaseTransformerLayer):
         prev_feats = prev_feats.view(bs, num_frames * prev_token_num, prev_dims)
 
         for layer in self.operation_order:
+            #* 论文 WD step 1: deformable self-attention。
+            # 在目标 future frame 的 BEV query 内部建模空间关系。
             # temporal self attention
             if layer == 'self_attn':
                 query = self.attentions[attn_index](
@@ -241,6 +251,8 @@ class PredictionTransformerLayer(MyCustomBaseTransformerLayer):
                 query = self.norms[norm_index](query)
                 norm_index += 1
 
+            #* 论文 WD step 2: temporal cross-attention with historical embeddings。
+            # query 在 ref_points 指定的位置读取 W_M 中历史/当前 BEV memory。
             # Temporal cross-attention for query features from history memory bank.
             elif layer == 'cross_attn':
                 query = self.attentions[attn_index](
@@ -259,6 +271,8 @@ class PredictionTransformerLayer(MyCustomBaseTransformerLayer):
                 attn_index += 1
                 identity = query
 
+            #* 论文 WD step 3: conditional cross-attention with action conditions。
+            # action_condition 来自 can_bus/command/velocity/plan_traj 等条件编码。
             # cross-attention with action condition
             elif layer == 'cross_attn_action':
                 action_condition = kwargs['action_condition'].unsqueeze(1)
@@ -278,6 +292,7 @@ class PredictionTransformerLayer(MyCustomBaseTransformerLayer):
                 query = query.view(bs, token_num, embed_dim)
 
             elif layer == 'ffn':
+                #* 论文 WD step 4: feedforward network，完成每层 transformer 的特征更新。
                 query = self.ffns[ffn_index](
                     query, identity if self.pre_norm else None)
                 ffn_index += 1

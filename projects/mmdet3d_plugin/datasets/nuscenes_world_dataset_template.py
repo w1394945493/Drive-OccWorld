@@ -20,6 +20,19 @@ from prettytable import PrettyTable
 class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
     r"""World dataset for visual point cloud forecasting.
 
+    整体数据链路：
+    1. 父类从 ann_file 指向的 ``nuscenes_infos_temporal_*.pkl`` 读取 data_infos，
+       其中包含 sample token、相机路径、标定、ego/lidar 位姿、3D 框、速度等基础信息。
+    2. 本类初始化 nuScenes SDK、CanBus SDK 和轨迹工具，用于补充 PKL 中尚未离线保存的
+       scene/location、规划标签、候选轨迹、实例时序等监督信息。
+    3. ``_prepare_data_info`` 按 queue_length/future_length 取历史帧、当前帧和未来帧；
+       其中当前帧作为参考帧，负责触发 occupancy、规划、未来框和实例监督的准备。
+    4. ``_prepare_data_info_single`` 先用 ``get_data_info`` 组装单帧基础字段，再调用
+       config 中的 pipeline 读取图像、做图像增强/归一化/pad，并通过 ``LoadOccupancy``
+       从 occ_path 读取 fine-grained occupancy 标签。
+    5. 子类 ``NuScenesWorldDatasetV1.union2one`` 把多帧结果合并成模型输入：历史+当前图像、
+       当前参考帧坐标系下的 occupancy 序列、future can_bus、规划标签和 action condition。
+
     注释约定：普通 ``#`` 表示当前在数据集初始化或取样阶段执行的预处理；
     ``#!`` 表示该结果可在离线数据转换阶段写入 PKL，训练时直接读取。
     """
@@ -35,7 +48,6 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                  rand_frame_interval=(1,),
                  plan_grid_conf=None,
                  can_bus_root='',
-
                  *args,
                  **kwargs):
         """
@@ -54,6 +66,12 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         self.use_fine_occ = use_fine_occ
         self.turn_on_flow = turn_on_flow
 
+        #* ================== 1. Dataset 初始化 ==================
+        # 这里的 ann_file/pkl 已由父类加载成 self.data_infos；本类再补充在线查询接口。
+        # self.nusc: 查 nuScenes 原始 meta，如 sample、sample_annotation、scene、log。
+        # self.nusc_can: 查 CAN bus，如 pose、steering，用于候选轨迹/action condition。
+        # self.traj_api: 生成自车未来规划标签 sdc_planning、mask 和 command。
+        # usable_index: 过滤掉历史帧或未来帧不够、或者跨 scene 的参考帧。
         # 训练前预处理：加载 nuScenes 主数据库和 CAN bus 数据，供实例、轨迹及规划标签查询。
         #! 可在生成 PKL 时完成下述查询；若所需字段均已写入 PKL，训练阶段无需初始化这两个 SDK。
         self.nusc = NuScenes(version='v1.0-trainval', dataroot=self.data_root, verbose=False)
@@ -89,7 +107,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         self.future_length = future_length  # 2
         self.ego_mask = ego_mask            # (-0.8, -1.5, 0.8, 2.5)
         self.load_frame_interval = load_frame_interval  # 8
-        self.rand_frame_interval = rand_frame_interval  # (-1, 1)
+        self.rand_frame_interval = rand_frame_interval  # (-1, 1) # * 默认是(1,) 即为连续帧
 
         # 初始化预处理：过滤历史帧或未来帧数量不足、以及跨越场景边界的样本。
         #! usable_index 或等价的 valid 标志可随固定 queue/future 配置写入 PKL；若配置会变化则应在线重算。
@@ -454,7 +472,11 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         return instance
 
     def _prepare_data_info_single(self, index, occ_load_flag=None, aug_param=None):
-        # 单帧预处理入口：组装基础字段，并仅在参考帧上生成规划和实例相关监督。
+        #* ================== 3. 单帧组装 + pipeline ==================
+        # 单帧预处理入口：
+        # 1) get_data_info 从 pkl 中取相机路径、lidar2img、pose、can_bus、3D 框等基础字段；
+        # 2) occ_load_flag=True 只出现在当前参考帧，用来额外准备未来框、规划、实例和 occupancy 所需索引；
+        # 3) pre_pipeline/pipeline 执行 config 中的数据增强、图像归一化、LoadOccupancy 和 Collect。
         input_dict = self.get_data_info(index)
         if input_dict is None:
             return None
@@ -464,6 +486,9 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         # only load current frame
         if occ_load_flag is not None:
             input_dict['occ_load_flag'] = occ_load_flag
+        # 当前参考帧才会走下面这些重监督构造；历史/未来帧通常只需要图像和 meta。
+        # LoadOccupancy 虽然在 pipeline 里执行，但它依赖这里写入的 scene_token_list、
+        # lidar_token_list、egopose_list、ego2lidar_list 来读取并对齐整段 fine occupancy。
         # 训练时预处理：生成规划损失和碰撞指标使用的未来框及 BEV 占用 mask。
         #! 可改为从 info['gt_future_boxes']、info['segmentation_bev'] 直接读取。
         if occ_load_flag:   # only load current frame
@@ -488,6 +513,9 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         # 训练时预处理：聚合历史到未来窗口内的实例，并修补实例时序。
         #! inflated occupancy/flow 可直接读取离线 instance_dict；fine-grained 且不使用实例监督时可跳过此段。
         if occ_load_flag:    # only load current frame
+            # 这里收集的窗口长度是 history + current + future：
+            # [index - queue_length, ..., index, ..., index + future_length]
+            # 这些 token/pose 会被 LoadOccupancy 用来把各时刻 occupancy 统一变换到当前参考帧。
             cur_index_list = list(range(index-self.queue_length, index + (self.future_length + 1)))
             self.scene_token = []
             self.lidar_token = []
@@ -514,6 +542,12 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
             )
 
         self.pre_pipeline(input_dict)
+        # config pipeline 在这里真正执行：
+        # - LoadMultiViewImageFromFiles 读取 6 路图像；
+        # - 训练阶段 PhotoMetric/CropResizeFlip 做图像增强，并把同一 aug_param 传给历史帧；
+        # - Normalize/Pad 规范图像张量尺寸；
+        # - LoadOccupancy 在当前参考帧读取并对齐 occupancy 序列；
+        # - Format/Collect 把模型需要的 key 和 img_metas 打包成 DataContainer。
         example = self.pipeline(input_dict)
         return example
 
@@ -530,6 +564,11 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
             np.random.choice(self.rand_frame_interval, 1)[0]
         )
 
+        #* ================== 2. 取一个训练/测试样本 ==================
+        # 根据配置取 history/current/future：
+        # - previous_queue = queue_length 帧历史 + 当前帧，用于图像输入和 BEV temporal memory；
+        # - future_queue = 当前帧 + future_length 帧未来，用于 occupancy 监督和 action condition；
+        # - 当前配置中 queue_length=2、future_length=4，即 2 帧历史 + 当前帧 + 4 帧未来。
         # 1. get previous camera information.
         previous_queue = [] # history_len*['img', 'points', 'aug_param']
         previous_index_list = list(range(
@@ -537,7 +576,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
         previous_index_list = sorted(previous_index_list)
         if rand_interval < 0:  # the inverse chain.
             previous_index_list = previous_index_list[::-1]
-        previous_index_list.append(index) 
+        previous_index_list.append(index)
         aug_param = None
         for i, idx in enumerate(previous_index_list):
             idx = min(max(0, idx), len(self.data_infos) - 1)
@@ -592,7 +631,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 IoU_results_current_future['IOU_{}'.format(key)] = val
             if logger is not None:
                 logger.info('IOU Evaluation of current and future frames:')
-                logger.info(res_table)        
+                logger.info(res_table)
             eval_results.update(IoU_of_Current_Future=IoU_results_current_future)
 
         ''' calculate IOU of current frame'''
@@ -605,7 +644,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 IoU_results_current['IOU_{}'.format(key)] = val
             if logger is not None:
                 logger.info('IOU Evaluation of current frame:')
-                logger.info(res_table)        
+                logger.info(res_table)
             eval_results.update(IoU_of_Current=IoU_results_current)
 
         ''' calculate IOU of future frame'''
@@ -618,7 +657,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 IoU_results_future['IOU_{}'.format(key)] = val
             if logger is not None:
                 logger.info('IOU Evaluation of future frames:')
-                logger.info(res_table)        
+                logger.info(res_table)
             eval_results.update(IoU_of_Future=IoU_results_future)
 
         ''' calculate IOU of future frame with time_weighting'''
@@ -631,7 +670,7 @@ class NuScenesWorldDatasetTemplate(CustomNuScenesDataset):
                 IoU_results_future_time_weighting['IOU_{}'.format(key)] = val
             if logger is not None:
                 logger.info('IOU Evaluation of future frames with time weighting:')
-                logger.info(res_table)        
+                logger.info(res_table)
             eval_results.update(IoU_of_Future_with_Time_Weighting=IoU_results_future_time_weighting)
 
         ''' calculate VPQ '''

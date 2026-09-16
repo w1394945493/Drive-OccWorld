@@ -291,7 +291,10 @@ class WorldHeadTemplate(BaseModule):
             tgt_points (Tensor): query point coordinates in target frame coordinates.
             ref_points (Tensor): query point coordinates in previous frame coordinates.
         """
+        #* ================== 论文 3.2: World Decoder W_D 输入查询 ==================
         # 1. BEV query
+        # 对应论文中 "WD takes learnable BEV queries as input"：
+        # bev_embedding 是未来帧 BEV query，后续通过 self/cross/action attention 生成 future BEV。
         bs, num_frames, _, emebd_dim = prev_features.shape
         dtype = prev_features.dtype
         #  * BEV queries.
@@ -302,7 +305,10 @@ class WorldHeadTemplate(BaseModule):
         bev_pos = self.positional_encoding(bev_mask).to(dtype)  # bs, bev_dims, bev_h, bev_w
 
 
+        #* ================== 论文 3.2: action condition a_{+t} ==================
         # 2. action condition
+        # 对应论文 "Flexible action conditions can be injected into WD"：
+        # 根据配置把 can_bus / plan_traj / command / velocity / steering 拼成 action embedding。
         action_condition = None
         plan_traj = action_condition_dict['plan_traj']
         command, vel_steering = action_condition_dict['command'][:, target_frame_index], action_condition_dict['vel_steering'][:, target_frame_index]
@@ -367,6 +373,8 @@ class WorldHeadTemplate(BaseModule):
                 action_condition = torch.cat([action_condition, steering], dim=-1)
 
         if action_condition is not None:
+            # fusion_mlp 将不同来源的动作条件投影到 transformer embed_dims，
+            # 后续作为 cross_attn_action 的 key/value 或直接加到 BEV query 上。
             action_condition = self.fusion_mlp(action_condition.float())
 
         #  * sum different query embedding together.
@@ -377,7 +385,10 @@ class WorldHeadTemplate(BaseModule):
             bev_queries_input = bev_queries
 
 
+        #* ================== 论文 3.2: Memory Queue W_M + ConditionalNorm ==================
         # 3. obtain prev embeddings (bs, num_frames, bev_h * bev_w, dims).
+        # prev_features 是 WM 中的历史/当前 BEV embeddings；
+        # prev_render_neck=ConditionalNorm，对应论文 Eq.5 的 semantic/motion 条件归一化。
         if self.prev_render_neck:
             render_dict = self.prev_render_neck(prev_features.view(bs, num_frames, bev_w, bev_h, emebd_dim).transpose(2,3), cond_norm_dict)
             prev_features = render_dict['bev_embed']
@@ -390,7 +401,10 @@ class WorldHeadTemplate(BaseModule):
         prev_features_input = (prev_features +
                                frame_embedding[None, :, None, :])
 
+        #* ================== 论文 3.2: World Decoder W_D ==================
         # 4. do transformer layers to get BEV features.
+        # transformer=PredictionTransformer/WorldDecoder：
+        # self-attn 建模未来 query，cross-attn 读取 WM 历史特征，cross_attn_action 注入动作条件。
         next_bev_feat = self.transformer(
             prev_features_input,
             bev_queries_input,

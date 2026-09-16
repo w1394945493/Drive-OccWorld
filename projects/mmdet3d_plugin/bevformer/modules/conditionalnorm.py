@@ -92,7 +92,13 @@ class Fourier_Embed(nn.Module):
     
 @HEADS.register_module()
 class ConditionalNorm(BaseModule):
-    """Ray marching adaptor for fine-tuning weights pre-trained by DriveGPT."""
+    """Ray marching adaptor for fine-tuning weights pre-trained by DriveGPT.
+
+    对应论文 3.2 的 Semantic- and Motion-Conditional Normalization。
+    核心形式对应 Eq.5:
+        F_tilde_bev = gamma * LayerNorm(F_bev) + beta
+    其中 gamma/beta 可由 semantic labels、ego-motion transform 或 object flow 生成。
+    """
 
     def __init__(self,
                  occ_flow='occ',
@@ -125,6 +131,8 @@ class ConditionalNorm(BaseModule):
         self.act = act
 
         if self.sem_norm and self.occ_flow=='occ':
+            #* 论文 semantic-conditional normalization：
+            #* 先预测 voxel-wise semantic label S，再 one-hot + 3D conv 得到 gamma_s/beta_s。
             # build up prob layer.
             sem_raymarching_branch = []
             for _ in range(self.num_pred_fcs+1):
@@ -154,6 +162,8 @@ class ConditionalNorm(BaseModule):
             nn.init.zeros_(self.sem_mlp_beta.bias)
         
         if self.ego_motion_ln:
+            #* 论文 motion-conditional normalization 的 ego-motion 分支：
+            #* 将 future->history 的 ego-pose transform 展平编码，生成 gamma_e/beta_e。
             self.ego_param_free_norm = nn.LayerNorm(self.embed_dims, elementwise_affine=False)
 
             nhidden = 256
@@ -170,6 +180,8 @@ class ConditionalNorm(BaseModule):
             nn.init.zeros_(self.ego_mlp_beta.bias)
         
         if self.obj_motion_ln and self.occ_flow=='flow':
+            #* 论文 motion-conditional normalization 的 object-motion 分支：
+            #* 使用 backward centripetal flow 生成 gamma_f/beta_f；当前配置 turn_on_flow=False 默认不走。
             self.fourier_embed = Fourier_Embed(32)
             
             self.param_free_norm = nn.LayerNorm(self.embed_dims, elementwise_affine=False)
@@ -202,6 +214,7 @@ class ConditionalNorm(BaseModule):
                 `(bs, bev_h, bev_w, embed_dims)`
         """
 
+        #* 对应论文 Fig.3 semantic labels -> affine parameters 的实现。
         # 1. obtain unsupervised occupancy prediction.
         sem_pred = self.sem_raymarching_branch(embed)
         sem_pred = sem_pred.view(
@@ -212,16 +225,18 @@ class ConditionalNorm(BaseModule):
         sem_code = F.one_hot(sem_label.long(), num_classes=self.num_cls).float().permute(0,4,1,2,3).contiguous()
 
         # 2. generate parameter-free normalized activations
+        # 对应 Eq.5 中的 LayerNorm(F_bev)，这里关闭 affine，由后面的 gamma/beta 控制。
         embed = self.sem_param_free_norm(embed)
         embed = self.channel2height(embed).view(*embed.shape[:-1], self.pred_height, -1)
         embed = embed.permute(0,4,1,2,3)
 
         # 3. produce scaling and bias conditioned on semantic map
+        # sem_code -> Conv3D -> gamma_s/beta_s。
         actv = self.sem_mlp_shared(sem_code)
         gamma = self.sem_mlp_gamma(actv)
         beta = self.sem_mlp_beta(actv)
 
-        # apply scale and bias
+        # apply scale and bias: F_tilde = gamma_s * LN(F) + beta_s。
         embed = (gamma * embed + beta).permute(0,2,3,4,1).flatten(3,4).contiguous()
         return embed, sem_pred.permute(0,4,1,2,3)
 
@@ -235,6 +250,7 @@ class ConditionalNorm(BaseModule):
                 `(bs, bev_h, bev_w, embed_dims)`
             future2history: bs, 4, 4
         """
+        #* 对应论文中的 ego-pose transformation matrix E_{+t}^{-t}。
         # 1. memory_ego_motion
         memory_ego_motion = future2history[:, :3, :].flatten(-2).float()
         memory_ego_motion = nerf_positional_encoding(memory_ego_motion)
@@ -242,12 +258,13 @@ class ConditionalNorm(BaseModule):
         # 2. generate parameter-free normalized activations
         embed = self.ego_param_free_norm(embed)
 
-        # 3. produce scaling and bias conditioned on semantic map
+        # 3. produce scaling and bias conditioned on ego-motion transform
+        # future2history -> MLP -> gamma_e/beta_e。
         actv = self.ego_mlp_shared(memory_ego_motion)
         gamma = self.ego_mlp_gamma(actv)
         beta = self.ego_mlp_beta(actv)
 
-        # apply scale and bias
+        # apply scale and bias: F_tilde = gamma_e * LN(F) + beta_e。
         embed = gamma * embed + beta
         return embed
 
@@ -263,6 +280,7 @@ class ConditionalNorm(BaseModule):
             flow_3D: bs, 3, H, W, D
             occ_3D: bs, H, W, D
         """
+        #* 对应论文中的 voxel-wise 3D backward centripetal flow F。
         # 1. rearrange
         flow_3D = flow_3D.permute(0,2,3,4,1)
         b, h, w, d, dims = flow_3D.shape
@@ -281,7 +299,7 @@ class ConditionalNorm(BaseModule):
         gamma = self.mlp_gamma(actv)
         beta = self.mlp_beta(actv)
 
-        # apply scale and bias
+        # apply scale and bias: F_tilde = gamma_f * LN(F) + beta_f。
         embed = gamma * embed.view(b, h, w, d, -1) + beta
         embed = embed.view(b, h, w, -1)
         return embed
@@ -293,6 +311,8 @@ class ConditionalNorm(BaseModule):
             embeds (Tensor): BEV feature embeddings.
                 `(bs, F, bev_h, bev_w, embed_dims)`
         """
+        #* 论文 W_M 中的 ConditionalNorm 总入口：
+        #* 对 memory queue 内每一帧 BEV embedding 做 semantic/ego/object motion 条件调制。
         bs, num_frames, bev_h, bev_w, embed_dim = embeds.shape
         occ_gts, future2history = cond_norm_dict['occ_gts'], cond_norm_dict['future2history']
 

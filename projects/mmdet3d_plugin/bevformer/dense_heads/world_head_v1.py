@@ -144,6 +144,8 @@ class WorldHeadV1(WorldHeadBase):
                 [Lout, inter_num, bs, bev_h * bev_w, dims]    Lout = cur + future_select
                 self.pred_frame_num: history frames + current frame + future frames.
         """
+        #* 对应论文 3.2 中 "prediction heads utilizing channel-to-height operation"：
+        #* 将 W_D 输出的 future BEV embeddings 映射为 semantic occupancy logits S_{1:f}。
         next_bev_preds = []
         for lvl in range(next_bev_feats.shape[1]):
             #  ===> Lout, bs, h*w, d, num_frame
@@ -164,12 +166,15 @@ class WorldHeadV1(WorldHeadBase):
         return next_bev_preds
     
     def forward_head(self, next_bev_feats):
+        #* 论文中的 occupancy prediction head 入口：
+        #* 输入未来 BEV embeddings，输出 [decoder层, 预测帧, B, HW, height, class] 风格的 occupancy logits。
         if self.soft_weight:
             return self.forward_head_soft(next_bev_feats)   # multi-decoder_layers soft_weight_sum
         else:
             return self.forward_head_layers(next_bev_feats) # multi-decoder_layers
 
     def loss_voxel(self, output_voxels, target_voxels, tag):
+        #* 对应论文训练损失：CE + semantic/geometric scaling + Lovasz 约束 occupancy semantics/geometries。
         B, C, pH, pW, pD = output_voxels.shape
         tB, tH, tW, tD = target_voxels.shape
 
@@ -282,6 +287,8 @@ class WorldHeadV1(WorldHeadBase):
         return loss_dict
     
     def loss_voxel_flow(self, output_voxels, target_voxels, tag):                    
+        #* 对应论文 flow 分支的 L1 loss，用于监督 3D backward centripetal flow。
+        #* 当前配置 turn_on_flow=False，默认不会调用该分支。
         B, C, H, W, D = output_voxels.shape
         tB, tC, tH, tW, tD = target_voxels.shape
         

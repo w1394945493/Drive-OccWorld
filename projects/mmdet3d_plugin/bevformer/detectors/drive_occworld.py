@@ -89,7 +89,7 @@ class Drive_OccWorld(BEVFormer):
                 self.vehicles_id = [2,3,4,5,6,7,9,10]
             self.gmo_id = 1 # sem_clsses -> GMO
             self.iou_thresh_for_vpq = 0.2
-        
+
         # plan head
         self.turn_on_plan = turn_on_plan
         if turn_on_plan:
@@ -97,7 +97,7 @@ class Drive_OccWorld(BEVFormer):
             self.plan_head_type = plan_head.type
             self.planning_metric = None
             self.planning_metric_v2 = PlanningMetric_v2(n_future=future_pred_frame_num+1)
-        
+
         # memory queue
         self.memory_queue_len = memory_queue_len
 
@@ -308,7 +308,7 @@ class Drive_OccWorld(BEVFormer):
         # 5. get target bev_grids at target future frame.
         tgt_grids = bev_grids[:, -1].contiguous()
         return tgt_grids, aligned_bev_grids, ref2future, future_to_history_list.transpose(-1, -2)
-    
+
 
     def obtain_ref_bev(self, img, img_metas, prev_bev):
         # Extract current BEV features.
@@ -321,7 +321,7 @@ class Drive_OccWorld(BEVFormer):
         # ref_bev: bs, bev_h * bev_w, c
         ref_bev = self.pts_bbox_head(img_feats, img_metas, prev_bev, only_bev=True)
         return ref_bev
-    
+
     def obtain_ref_bev_with_plan(self, img, img_metas, prev_bev, ref_sample_traj, ref_sem_occupancy, ref_command, ref_real_traj=None):
         # Extract current BEV features.
         # C1. Forward.
@@ -333,7 +333,7 @@ class Drive_OccWorld(BEVFormer):
         # ref_bev: bs, bev_h * bev_w, c
         ref_bev = self.pts_bbox_head(img_feats, img_metas, prev_bev, only_bev=True)
 
-        # C3. PlanHead 
+        # C3. PlanHead
         if 'v1' in self.plan_head_type:
             if ref_sem_occupancy is None:   # use pred_occupancy to calculate sample_traj cost during inference, GT_occupancy during training
                 ref_sem_occupancy = self.future_pred_head.forward_head(ref_bev.unsqueeze(0).unsqueeze(0))[-1, -1, 0].argmax(-1).detach()
@@ -346,8 +346,8 @@ class Drive_OccWorld(BEVFormer):
 
         return ref_bev, ref_pose_pred, ref_pose_loss
 
-    
-    def future_pred(self, prev_bev_input, action_condition_dict, cond_norm_dict, plan_dict, 
+
+    def future_pred(self, prev_bev_input, action_condition_dict, cond_norm_dict, plan_dict,
                     valid_frames, img_metas, prev_img_metas, num_frames, occ_flow='occ'):
         if occ_flow == 'occ':
             future_pred_head = self.future_pred_head
@@ -355,8 +355,9 @@ class Drive_OccWorld(BEVFormer):
             future_pred_head = self.future_pred_head_flow
         else:
             AssertionError('Not Implemented')
-        
-        # D1. preparations.
+
+        #* ================== 4.1 准备未来预测输入 ==================
+        # prev_bev_input 是 memory_queue，最后一帧是当前参考 BEV；后续会被逐帧预测结果滚动更新。
         # prev_bev_input: B,memory_queue_len,HW,C
         ref_bev = prev_bev_input[:, -1].unsqueeze(0).repeat(
                 len(self.future_pred_head.bev_pred_head), 1, 1, 1).contiguous()
@@ -365,14 +366,16 @@ class Drive_OccWorld(BEVFormer):
         next_pose_preds = plan_dict['ref_pose_pred'] # B,Lout,2
 
 
-        # D2. Align previous frames to the reference coordinates.
+        #* ================== 4.2 建立历史帧到参考帧的坐标变换 ==================
+        # 后续每个 future query 都要根据 future pose/action condition 对齐到历史 BEV memory。
         ref_img_metas = [[each[num_frames-1]] for each in prev_img_metas]
         prev_img_metas = [[each[i] for i in range(num_frames-1)] for each in prev_img_metas]
         ref_to_history_list = self._get_history_ref_to_previous_transform(
             prev_bev_input, prev_bev_input.shape[1], prev_img_metas, ref_img_metas)
 
 
-        # D3. future decoder forward.
+        #* ================== 4.3 自回归预测未来 BEV feature ==================
+        # 每一步预测一个 future frame，并把该预测 BEV 放回 memory_queue，继续预测更远未来。
         if self.training:
             future_frame_num = self.future_pred_frame_num
         else:
@@ -413,7 +416,7 @@ class Drive_OccWorld(BEVFormer):
                 sample_traj_i,  gt_traj_i = plan_dict['sample_traj'][:,:,future_frame_index], plan_dict['gt_traj'][:,future_frame_index]
                 # command
                 command_i = action_condition_dict['command'][:,future_frame_index]
-                # forward plan_head 
+                # forward plan_head
                 if 'v1' in self.plan_head_type:    # used for fine-grained_MMO when sem_occupancy distinguish categories in MMO
                     # sem_occupancy
                     if plan_dict['sem_occupancy'] is None:   # use_pred
@@ -442,7 +445,8 @@ class Drive_OccWorld(BEVFormer):
                 cond_norm_dict['occ_gts'] = cond_norm_dict['occ_gts'][:, 1:, ...].contiguous()
 
 
-        # D4. forward head.
+        #* ================== 4.4 BEV feature -> occupancy logits ==================
+        # WorldHeadV1.forward_head 将当前+未来 BEV feature 投影成 occupancy 分类 logits。
         next_bev_feats = torch.stack(next_bev_feats, 0)
         # forward head
         next_bev_preds = future_pred_head.forward_head(next_bev_feats)
@@ -458,11 +462,11 @@ class Drive_OccWorld(BEVFormer):
         # gts
         occ_gts = occ_gts[0][self.future_pred_head.history_queue_length:]
         occ_gts = occ_gts.view(select_frames*bs, *occ_gts.shape[-3:])
-        
+
         # occ loss
         losses_occupancy = self.future_pred_head.loss_occ(occ_preds, occ_gts)
         return losses_occupancy
-    
+
     def compute_sem_norm_loss(self, bev_sem_preds, occ_gts):
         # gts
         occ_gts = occ_gts[0][self.future_pred_head.history_queue_length:-1]
@@ -504,7 +508,7 @@ class Drive_OccWorld(BEVFormer):
         ones = ones.transpose(2, 3)
         ones = ones.transpose(1, 2)
         return ones
-    
+
     def compute_flow_loss(self, flow_preds, flow_gts):
         # preds
         flow_preds = flow_preds.permute(1, 0, 3, 2, 6, 4, 5).squeeze(3)
@@ -516,7 +520,7 @@ class Drive_OccWorld(BEVFormer):
         # flow loss
         losses_flow = self.future_pred_head_flow.loss_flow(flow_preds, flow_gts)
         return losses_flow
-    
+
     def compute_plan_loss(self, outs_planning, sdc_planning, sdc_planning_mask, gt_future_boxes):
         ## outs_planning, sdc_planning: under ref_lidar coord
         pred_under_ref = torch.cumsum(outs_planning, dim=1)
@@ -524,7 +528,7 @@ class Drive_OccWorld(BEVFormer):
 
         losses_plan = self.plan_head.loss(pred_under_ref, gt_under_ref, sdc_planning_mask, gt_future_boxes)
         return losses_plan
-    
+
     def evaluate_occ(self, occ_preds, occ_gts, img_metas):
         # preds
         occ_preds = occ_preds.permute(1, 0, 3, 2, 6, 4, 5).squeeze(3)
@@ -573,7 +577,7 @@ class Drive_OccWorld(BEVFormer):
 
         if self._viz_pcd_flag:
             save_data = np.load(os.path.join(self._viz_pcd_path, img_metas[0]["scene_token"]+'_'+img_metas[0]["lidar_token"]+'.npz'), allow_pickle=True)
-            np.savez(os.path.join(self._viz_pcd_path, img_metas[0]["scene_token"]+'_'+img_metas[0]["lidar_token"]), 
+            np.savez(os.path.join(self._viz_pcd_path, img_metas[0]["scene_token"]+'_'+img_metas[0]["lidar_token"]),
                                 occ_pred=save_data['occ_pred'], pose_pred=pred_under_ref[0].detach().cpu().numpy())
 
         self.planning_metric_v2(pred_under_ref, gt_under_ref, sdc_planning_mask, segmentation_bev)
@@ -585,7 +589,7 @@ class Drive_OccWorld(BEVFormer):
                       img=None,
                       # occ_flow
                       segmentation=None,
-                      instance=None, 
+                      instance=None,
                       flow=None,
                       # sdc-plan
                       sdc_planning=None,
@@ -615,7 +619,8 @@ class Drive_OccWorld(BEVFormer):
             return {"pseudo_loss": torch.tensor(0.0, device=img.device, requires_grad=True)}
 
 
-        # Augmentations.
+        #* ================== 1. 输入增强/随机丢帧 ==================
+        # 对当前帧或历史帧做随机 drop，用于增强模型对时序缺失的鲁棒性。
         # A1. Randomly drop cur image input.
         if np.random.rand() < self.random_drop_image_rate:
             img[:, -1:, ...] = torch.zeros_like(img[:, -1:, ...])
@@ -631,14 +636,27 @@ class Drive_OccWorld(BEVFormer):
             drop_prev_index = -1
 
 
-        # Extract history BEV features.
+        #* ================== 2. 历史帧图像 -> 历史 BEV ==================
+        #* 对应论文 3.2 的 History Encoder W_E：
+        #* 使用 BEVFormer visual BEV encoder，把历史多相机图像编码为历史 BEV embeddings。
+        # 将 queue 中当前帧之前的多相机图像送入 backbone/FPN/BEVFormer encoder，
+        # 得到 prev_bev 和 prev_bev_list，作为当前 BEV 与未来预测的 temporal memory。
+        #* 默认分支：当前配置 queue_length=2，因此 prev_img 包含 2 帧历史图像；
+        #* obtain_history_bev 继承自 BEVFormer，历史帧只用于构造 temporal BEV，不是本文主要创新点。
         # B1. Forward previous frames.
+        # prev_img: [B, queue_length, num_cam, C, H, W]，例如 B=1、queue_length=2、num_cam=6。
         prev_img = img[:, :-1, ...]
         prev_img_metas = copy.deepcopy(img_metas)
         # B2. Randomly grid-mask prev_bev.
         prev_bev, prev_bev_list = self.obtain_history_bev(prev_img, prev_img_metas, drop_prev_index=drop_prev_index)
+        # prev_bev: 最后一帧历史图像编码出的 BEV feature，shape=[B, bev_h*bev_w, C]，默认 [B, 40000, 256]。
+        # prev_bev_list: 保留给未来预测 memory_queue 的历史 BEV 列表，每个元素 shape 同 prev_bev。
+        #* 注意：父类会把 prev_bev_list 裁剪到 memory_queue_len-1；若 memory_queue_len=1，
+        #* 这里理论上会得到空列表，后面 torch.stack(prev_bev_list) 需要实际配置/运行时留意。
         # B2. Randomly grid-mask prev_bev.
         if self.grid_mask_prev and prev_bev is not None:
+            # 默认配置 grid_mask_prev=False，因此通常不走这个分支。
+            # 若打开，则只对最后一帧历史 BEV 做 GridMask，不改变输出 shape。
             b, n, c = prev_bev.shape
             assert n == self.bev_h * self.bev_w
             prev_bev = prev_bev.view(b, self.bev_h, self.bev_w, c)
@@ -647,10 +665,19 @@ class Drive_OccWorld(BEVFormer):
             prev_bev = prev_bev.view(b, c, n).permute(0, 2, 1).contiguous()
 
 
-        # C. Extract current BEV features.
+        #* ================== 3. 当前帧图像 -> 当前参考 BEV ==================
+        #* 仍属于论文 3.2 History Encoder W_E 的当前帧编码部分：
+        #* 当前 BEV ref_bev 会作为 WM 的最新 memory，并作为未来世界模型的起点。
+        # 当前帧作为 reference frame；pts_bbox_head 在这里只保留 BEVFormer encoder，
+        # 不再走检测 decoder/box head。
+        #* 默认分支：当前配置 turn_on_plan=False，因此跳过 obtain_ref_bev_with_plan，
+        #* 直接调用 obtain_ref_bev，输出当前参考帧 BEV feature。
+        # img: [B, num_cam, C, H, W]，取 queue 中最后一帧作为当前参考帧。
         img = img[:, -1, ...]
         img_metas = [each[num_frames-1] for each in img_metas]
         if self.turn_on_plan:
+            # 仅当 turn_on_plan=True 时启用：先根据当前 occupancy/command 预测参考帧规划结果，
+            # ref_pose_pred/ref_pose_loss 会继续参与未来预测和 planning loss。
             ref_sample_traj = sample_traj[:, :, 0]
             ref_real_traj = sdc_planning[:, 0]
             ref_command = command[:, 0]
@@ -659,45 +686,76 @@ class Drive_OccWorld(BEVFormer):
             ref_sem_occupancy = sem_occupancy[:, 0]
             ref_bev, ref_pose_pred, ref_pose_loss = self.obtain_ref_bev_with_plan(img, img_metas, prev_bev, ref_sample_traj, ref_sem_occupancy, ref_command, ref_real_traj)
         else:
+            # 默认路径：BEVFormer encoder 将当前多视角图像 + prev_bev 融合为参考帧 BEV。
+            # ref_bev: 当前参考帧 BEV feature，shape=[B, bev_h*bev_w, C]，默认 [B, 40000, 256]。
+            # sem_occupancy/ref_pose_pred/ref_pose_loss 置空，表示本配置不训练 planning 分支。
             ref_bev = self.obtain_ref_bev(img, img_metas, prev_bev)
             sem_occupancy, ref_pose_pred, ref_pose_loss = None, None, None
 
 
-        # D. Extract future BEV features.
-        valid_frames = [0]
-        if not self.only_train_cur_frame:
-            if self.supervise_all_future:
-                valid_frames.extend(list(range(1, self.future_pred_frame_num + 1)))
+        #* ================== 4. 当前/历史 BEV -> 自回归未来 BEV/Occupancy ==================
+        #* 对应论文 3.2 的 Memory Queue W_M + World Decoder W_D：
+        #* 先把历史/当前 BEV 组成 WM，再由 W_D 自回归预测未来 BEV 和 semantic occupancy。
+        # 用 memory_queue、future pose/action condition 和 WorldHeadV1 逐帧预测未来 BEV。
+        #* 自回归：future_pred() 内部会先预测 t+1，再把 t+1 的预测 BEV 放回 memory_queue，
+        #* 继续预测 t+2/t+3/...，所以更远未来会依赖更近未来的预测结果。
+        valid_frames = [0]  # 参与 loss 的预测帧编号；0 表示当前参考帧 occupancy。
+        if not self.only_train_cur_frame:  # 默认 False，说明不仅训练当前帧，还训练未来帧预测。
+            if self.supervise_all_future:  # 默认 True，对所有未来帧都计算 occupancy loss。
+                valid_frames.extend(list(range(1, self.future_pred_frame_num + 1)))  # 加入 1..future_pred_frame_num，默认 1..4。
             else:  # randomly select one future frame for computing loss to save memory cost.
-                train_frame = np.random.choice(np.arange(1, self.future_pred_frame_num + 1), 1)[0]
-                valid_frames.append(train_frame)
-            # D1. prepare memory_queue
+                train_frame = np.random.choice(np.arange(1, self.future_pred_frame_num + 1), 1)[0]  # 随机抽一个未来帧省显存。
+                valid_frames.append(train_frame)  # 只监督当前帧 + 抽中的未来帧。
+            # D1. prepare memory_queue.
+            #* 对应论文 3.2 Memory Queue W_M：保存最近 memory_queue_len 帧 BEV embeddings。
+            # prev_bev_list: list([B, HW, C])，来自历史帧；stack 后变为 [B, num_hist_mem, HW, C]。
+            #* 注意：父类会保留 memory_queue_len-1 个历史 BEV；当前配置 memory_queue_len=1 时这里可能为空列表。
             prev_bev_list = torch.stack(prev_bev_list, dim=1)
+            # ref_bev.unsqueeze(1): [B, 1, HW, C]，把当前参考 BEV 拼到历史 BEV 后面。
+            # 末尾切片只保留最近 memory_queue_len 帧，作为 WorldHeadV1 的输入 memory。
+            # prev_bev_list 最终 shape: [B, memory_queue_len, bev_h*bev_w, C]。
             prev_bev_list = torch.cat([prev_bev_list, ref_bev.unsqueeze(1)], dim=1)[:, -self.memory_queue_len:, ...]
-            # D2. prepare conditional-normalization dict
+            # D2. prepare conditional-normalization dict.
+            #* 对应论文 Semantic-/Motion-Conditional Normalization 的条件输入。
+            #* occ_gts/future2history 会在 ConditionalNorm 中生成 gamma/beta，调制 BEV memory。
+            # ConditionalNorm 可选择用 GT occupancy 辅助渲染/归一化 BEV feature。
             if self.future_pred_head.prev_render_neck.sem_norm and self.future_pred_head.prev_render_neck.sem_gt_train and self.training_epoch < 12:
-                occ_gts = segmentation[0][self.future_pred_head.history_queue_length+1-self.memory_queue_len:-1]
-                occ_gts = F.interpolate(occ_gts.unsqueeze(1), size=(self.bev_h, self.bev_w, self.future_pred_head.prev_render_neck.pred_height), mode='nearest').transpose(0,1)
+                # 仅 sem_gt_train=True 且早期 epoch 时走这里；当前配置 sem_gt_train=False，默认不走。
+                occ_gts = segmentation[0][self.future_pred_head.history_queue_length+1-self.memory_queue_len:-1]  # 取与 memory_queue 对齐的 GT occ。
+                occ_gts = F.interpolate(occ_gts.unsqueeze(1), size=(self.bev_h, self.bev_w, self.future_pred_head.prev_render_neck.pred_height), mode='nearest').transpose(0,1)  # resize 到 BEV/head 使用的空间尺寸。
             else:
-                occ_gts = None
-            cond_norm_dict = {'occ_gts': occ_gts}
-            # D3. prepare action condition dict
+                occ_gts = None  # 默认路径：ConditionalNorm 不使用 GT occupancy，只使用预测/特征自身。
+            cond_norm_dict = {'occ_gts': occ_gts}  # 传给 future_pred_head.prev_render_neck 使用。
+            # D3. prepare action condition dict.
+            #* 对应论文 "Flexible action conditions can be injected into W_D"：
+            #* command/velocity/can_bus 等动作条件会在 WorldHeadBase 中融合成 action embedding。
+            # command: 高层驾驶命令；vel_steering: 自车速度/角速度/转向等动作条件。
+            # 当前配置 future_pred_head 使用 command 和 vel，不使用 steering；vel_steering 仍整体传入，由 head 内部按配置取字段。
             action_condition_dict = {'command':command, 'vel_steering': vel_steering}
-            # D4. prepare planning dict
+            # D4. prepare planning dict.
+            #* 对应论文中的 occupancy-based planner P 和 expected action condition a_{+t} 相关接口。
+            #* 当前配置 turn_on_plan=False，不训练 planner，但仍使用 GT sdc_planning 做未来对齐/条件。
+            # turn_on_plan=False 时 sem_occupancy/ref_pose_pred 为 None；future_pred() 默认使用 GT sdc_planning 作为未来位姿条件。
             plan_dict = {'sem_occupancy': sem_occupancy, 'sample_traj': sample_traj, 'gt_traj': sdc_planning, 'ref_pose_pred': ref_pose_pred}
 
             # D5. predict future occ in auto-regressive manner
-            next_bev_preds, next_bev_sem, next_pose_preds, next_pose_loss = self.future_pred(prev_bev_list, action_condition_dict, cond_norm_dict, plan_dict, 
+            #* 对应论文 Future Forecasting with World Decoder：
+            #* W_D 根据 WM 中历史特征和动作条件，逐帧生成 future BEV embeddings。
+            # next_bev_preds: occupancy logits，后续 compute_occ_loss 会 reshape 成 [inter, frame*B, cls, H, W, D]。
+            # next_bev_sem: 中间 BEV semantic rendering 分支输出，用于 sem_norm loss。
+            # next_pose_preds/next_pose_loss: 仅 turn_on_plan=True 时有实际意义；当前配置基本为 None/空。
+            next_bev_preds, next_bev_sem, next_pose_preds, next_pose_loss = self.future_pred(prev_bev_list, action_condition_dict, cond_norm_dict, plan_dict,
                                                                             valid_frames, img_metas, prev_img_metas, num_frames, occ_flow='occ')
 
 
             # D6. predict future flow in auto-regressive manner
-            if self.turn_on_flow:
-                next_bev_preds_flow, _, _, _ = self.future_pred(prev_bev_list, action_condition_dict, cond_norm_dict, plan_dict, 
+            if self.turn_on_flow:  # 当前配置 False，默认不预测 flow，也不计算 VPQ/flow loss。
+                next_bev_preds_flow, _, _, _ = self.future_pred(prev_bev_list, action_condition_dict, cond_norm_dict, plan_dict,
                                                                 valid_frames, img_metas, prev_img_metas, num_frames, occ_flow='flow')
 
 
-        # E. Compute Loss
+        #* ================== 5. 计算训练损失 ==================
+        # 当前配置主要使用 occupancy loss；turn_on_flow/turn_on_plan 打开时才会额外计算 flow/plan loss。
         losses = dict()
         # E1. Compute loss for occ predictions.
         losses_occupancy = self.compute_occ_loss(next_bev_preds, segmentation)
@@ -732,13 +790,13 @@ class Drive_OccWorld(BEVFormer):
 
 
 
-    def forward_test(self, 
-                     img_metas, 
+    def forward_test(self,
+                     img_metas,
                      img=None,
                      # occ_flow
-                     segmentation=None, 
-                     instance=None, 
-                     flow=None, 
+                     segmentation=None,
+                     instance=None,
+                     flow=None,
                      # sdc-plan
                      sdc_planning=None,
                      sdc_planning_mask=None,
@@ -757,7 +815,7 @@ class Drive_OccWorld(BEVFormer):
 
 
         self.eval()
-        # Extract history BEV features.
+        #* ================== 1. 测试：历史帧图像 -> 历史 BEV ==================
         # B. Forward previous frames.
         num_frames = img.size(1)
         prev_img = img[:, :-1, ...]
@@ -765,7 +823,7 @@ class Drive_OccWorld(BEVFormer):
         prev_bev, prev_bev_list = self.obtain_history_bev(prev_img, prev_img_metas)
 
 
-        # C. Extract current BEV features.
+        #* ================== 2. 测试：当前帧图像 -> 当前参考 BEV ==================
         img = img[:, -1, ...]
         img_metas = [each[num_frames-1] for each in img_metas]
         if self.turn_on_plan:
@@ -778,7 +836,7 @@ class Drive_OccWorld(BEVFormer):
             ref_pose_pred = None
 
 
-        # D. Predict future BEV.
+        #* ================== 3. 测试：自回归预测未来 BEV/Occupancy ==================
         valid_frames = [] # no frame have grad
         # D1. prepare memory_queue
         prev_bev_list = torch.stack(prev_bev_list, dim=1)
@@ -800,11 +858,11 @@ class Drive_OccWorld(BEVFormer):
                                                             valid_frames, img_metas, prev_img_metas, num_frames, occ_flow='flow')
 
 
-        # E. Evaluate
+        #* ================== 4. 测试：评估 occupancy / flow / planning ==================
         test_output = {}
         # evaluate occ
         occ_iou, occ_iou_current, occ_iou_future, occ_iou_future_time_weighting = self.evaluate_occ(next_bev_preds, segmentation, img_metas)
-        test_output.update(hist_for_iou=occ_iou, hist_for_iou_current=occ_iou_current, 
+        test_output.update(hist_for_iou=occ_iou, hist_for_iou_current=occ_iou_current,
                            hist_for_iou_future=occ_iou_future, hist_for_iou_future_time_weighting=occ_iou_future_time_weighting)
         # evaluate flow(instance)
         if self.turn_on_flow:
@@ -882,7 +940,7 @@ class Drive_OccWorld(BEVFormer):
         segmentation_bev
     ):
         """Compute planner metric for one sample same as stp3
-            pred_ego_fut_trajs: B,Lout,2      
+            pred_ego_fut_trajs: B,Lout,2
             gt_ego_fut_trajs: B,Lout,2
             sdc_planning_mask: B,Lout
             segmentation_bev: B,Lout,h,w
@@ -906,7 +964,7 @@ class Drive_OccWorld(BEVFormer):
             'plan_obj_box_col_1s_single':0,
             'plan_obj_box_col_2s_single':0,
             'plan_obj_box_col_3s_single':0,
-            
+
         }
         future_second = 1
         assert pred_ego_fut_trajs.shape[0] == 1, 'only support bs=1'
@@ -1087,12 +1145,12 @@ class Drive_OccWorld(BEVFormer):
 
         if len(centers) > max_n_instance_centers:
             centers = centers[:max_n_instance_centers].clone()
-        
-        instance_ids = self.group_pixels(centers, offset_predictions * foreground_mask.float()) 
+
+        instance_ids = self.group_pixels(centers, offset_predictions * foreground_mask.float())
         instance_seg = (instance_ids * foreground_mask.float()).long()
 
         # Make the indices of instance_seg consecutive
-        instance_seg = self.make_instance_seg_consecutive(instance_seg) 
+        instance_seg = self.make_instance_seg_consecutive(instance_seg)
 
         return instance_seg.long()  # 1,H,W,D
 
@@ -1116,7 +1174,7 @@ class Drive_OccWorld(BEVFormer):
             pred_flow = flow[:, k]  # B T 3 dx dy dz -> B 3 dx dy dz
             # Normalize along the width and height direction
             normalize_pred_flow = torch.stack(
-                (2.0 * pred_flow[:, 0] / (grid_dx_cells - 1),  
+                (2.0 * pred_flow[:, 0] / (grid_dx_cells - 1),
                 2.0 * pred_flow[:, 1] / (grid_dy_cells - 1),
                 2.0 * pred_flow[:, 2] / (grid_dz_cells - 1),),
                 dim=1,
@@ -1152,9 +1210,9 @@ class Drive_OccWorld(BEVFormer):
             init_warped_instance_seg = self.flow_warp(consistent_instance_seg[-1].unsqueeze(0).float(), backward_flow[t:t+1].unsqueeze(0)).int()
 
             warped_instance_seg = init_warped_instance_seg * preds[t:t+1, 0]
-        
+
             consistent_instance_seg.append(warped_instance_seg)
-        
+
         consistent_instance_seg = torch.cat(consistent_instance_seg, dim=1)
         return consistent_instance_seg
 
@@ -1170,11 +1228,11 @@ class Drive_OccWorld(BEVFormer):
 
         pred_inst_batch = self.get_instance_segmentation_and_centers(
             torch.softmax(pred_seg, dim=1)[0:1, self.vehicles_id].detach(),
-            pred_flow[1:2].detach(), 
+            pred_flow[1:2].detach(),
             foreground_masks[1:2].detach(),
             nms_kernel_size=7,
-        )  
-        
+        )
+
         pred_seg_sm = torch.tensor(pred_seg_sm.detach() > 0, dtype=torch.int)   # sem_classes -> GMO
         consistent_instance_seg = self.make_instance_id_temporally_consecutive(
                 pred_inst_batch,
@@ -1236,25 +1294,25 @@ class Drive_OccWorld(BEVFormer):
         pred_instance = pred_instance.long().detach().cpu()
         gt_segmentation = gt_segmentation.long().detach().cpu()
         gt_instance = gt_instance.long().detach().cpu()
-        
+
         prediction, pred_to_cls = self.combine_mask(pred_segmentation, pred_instance, n_classes, n_all_things)
         target, target_to_cls = self.combine_mask(gt_segmentation, gt_instance, n_classes, n_all_things)
 
         # Compute ious between all stuff and things
         # hack for bincounting 2 arrays together
-        x = prediction + n_things_and_void * target  
-        bincount_2d = torch.bincount(x.long(), minlength=n_things_and_void ** 2) 
+        x = prediction + n_things_and_void * target
+        bincount_2d = torch.bincount(x.long(), minlength=n_things_and_void ** 2)
         if bincount_2d.shape[0] != n_things_and_void ** 2:
             raise ValueError('Incorrect bincount size.')
         conf = bincount_2d.reshape((n_things_and_void, n_things_and_void))
         # Drop void class
-        conf = conf[1:, 1:]  
+        conf = conf[1:, 1:]
         # Confusion matrix contains intersections between all combinations of classes
         union = conf.sum(0).unsqueeze(0) + conf.sum(1).unsqueeze(1) - conf
         iou = torch.where(union > 0, (conf.float() + 1e-9) / (union.float() + 1e-9), torch.zeros_like(union).float())
 
         mapping = (iou > self.iou_thresh_for_vpq).nonzero(as_tuple=False)
- 
+
         # Check that classes match.
         is_matching = pred_to_cls[mapping[:, 1]] == target_to_cls[mapping[:, 0]]
         mapping = mapping[is_matching.detach().cpu().numpy()]
@@ -1319,6 +1377,6 @@ class Drive_OccWorld(BEVFormer):
 def fast_hist(pred, label, max_label=18):
     pred = copy.deepcopy(pred.flatten())
     label = copy.deepcopy(label.flatten())
-    bin_count = np.bincount(max_label * label.astype(int) + pred, minlength=max_label ** 2) 
+    bin_count = np.bincount(max_label * label.astype(int) + pred, minlength=max_label ** 2)
     iou_per_pred = (bin_count[-1]/(bin_count[-1]+bin_count[1]+bin_count[2]))
     return bin_count[:max_label ** 2].reshape(max_label, max_label),iou_per_pred
