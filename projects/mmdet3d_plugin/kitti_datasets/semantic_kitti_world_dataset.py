@@ -235,6 +235,17 @@ class SemanticKITTIWorldDataset(Dataset):
                      for cam in cam_infos]
         cam_intrinsic = [np.asarray(cam['cam_intrinsic'], dtype=np.float64)
                          for cam in cam_infos]
+        #! 修复原因：
+        #! BEVFormer PerceptionTransformer 在 rotate_prev_bev=True 时会调用
+        #! torchvision.transforms.functional.rotate，并传入
+        #! img_meta['can_bus'][-1] 作为旋转角。torchvision 对 angle 类型
+        #! 检查较严格，只接受 Python int/float，不接受 np.float32/np.float64。
+        #! SemanticKITTI 第一阶段 can_bus 是 dummy 占位，因此这里统一转成
+        #! Python float list，既保持原 18 维协议，又避免 rotate 类型报错。
+        can_bus = np.asarray(
+            info.get('can_bus', np.zeros(18, dtype=np.float32)),
+            dtype=np.float32)
+        can_bus = [float(x) for x in can_bus]
 
         input_dict = dict(
             sample_idx=info['token'],
@@ -252,7 +263,7 @@ class SemanticKITTIWorldDataset(Dataset):
             timestamp=info.get('timestamp', 0),
             prev_idx=info.get('prev', ''),
             next_idx=info.get('next', ''),
-            can_bus=info.get('can_bus', np.zeros(18, dtype=np.float32)),
+            can_bus=can_bus,
             ego2global_translation=info['ego2global_translation'],
             ego2global_rotation=info['ego2global_rotation'],
             lidar2ego_translation=info['lidar2ego_translation'],

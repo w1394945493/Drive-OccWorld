@@ -245,6 +245,10 @@ def main():
                 '  当前帧 lidar2global_rotation shape: '
                 f"{np.asarray(img_metas[-1].get('lidar2global_rotation')).shape}")
             print(
+                '  当前帧 can_bus[-1] 类型/值: '
+                f"{type(img_metas[-1].get('can_bus')[-1]).__name__}/"
+                f"{img_metas[-1].get('can_bus')[-1]}")
+            print(
                 '  当前帧 ref_lidar_to_cur_lidar shape: '
                 f"{np.asarray(img_metas[-1].get('ref_lidar_to_cur_lidar')).shape}")
 
