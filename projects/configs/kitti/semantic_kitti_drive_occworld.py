@@ -439,19 +439,20 @@ data = dict(
 )
 
 #* ================== 正式 train.py 运行配置 ==================
-# 当前仍是 SemanticKITTI 第一阶段 debug/default 配置：
+# 当前仍是 SemanticKITTI 第一阶段 default 配置：
 # - 单卡 samples_per_gpu=1；
 # - 内部 BEV 分辨率 128x128x16；
-# - 不加载预训练权重；
-# - 先用较短 iter 验证 runner / checkpoint / log 链路。
+# - 默认按 epoch 训练和评估，更接近常规训练流程。
 #
 # 推荐首次运行：
 #   python tools/train.py projects/configs/kitti/semantic_kitti_drive_occworld.py \
 #       --work-dir work_dirs/semantic_kitti_drive_occworld_debug \
-#       --no-validate
+#       --cfg-options data.val.max_samples=20
 #
-# 若要延长训练，优先通过命令行覆盖：
-#   --cfg-options runner.max_iters=5000 checkpoint_config.interval=1000
+# 若只想快速 iter 调试，也可临时覆盖回 IterBasedRunner：
+#   --cfg-options runner.type=IterBasedRunner runner.max_iters=20 \
+#       evaluation.interval=10 checkpoint_config.interval=10 \
+#       checkpoint_config.by_epoch=False lr_config.by_epoch=False
 optimizer = dict(
     type='AdamW',
     lr=1e-4,
@@ -471,11 +472,12 @@ lr_config = dict(
     warmup_iters=100,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
-    by_epoch=False)
+    by_epoch=True)
 
-runner = dict(type='IterBasedRunner', max_iters=1000)
+total_epochs = 12
+runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 
-checkpoint_config = dict(interval=500, by_epoch=False, max_keep_ckpts=2)
+checkpoint_config = dict(interval=1, by_epoch=True, max_keep_ckpts=2)
 log_config = dict(
     interval=10,
     hooks=[
@@ -483,9 +485,9 @@ log_config = dict(
         dict(type='TensorboardLoggerHook'),
     ])
 
-# validation 目前仍建议首次用 --no-validate 跳过。
-# 后续如果需要正式评估，需要继续实现 SemanticKITTI occupancy metric/evaluate。
-evaluation = dict(interval=1000)
+# 每个 epoch 结束后评估一次。
+# 调试时建议用 --cfg-options data.val.max_samples=20 缩短评估时间。
+evaluation = dict(interval=1)
 
 workflow = [('train', 1)]
 find_unused_parameters = False

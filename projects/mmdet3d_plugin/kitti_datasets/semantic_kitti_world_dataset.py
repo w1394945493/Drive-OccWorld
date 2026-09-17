@@ -951,7 +951,7 @@ class SemanticKITTIWorldDataset(Dataset):
           - 1/2/3/... 表示第几个未来预测 step；
           - mIoU 是非 empty 语义 mIoU；
           - IoU 是二值 occupied IoU，即所有非 empty 类合并后的占据 IoU；
-          - Avg. 按论文常见写法，只平均未来步，不包含当前 0-step。
+          - Avg. 是当前帧 + 所有未来步的平均值，包含 0-step。
         """
         table = PrettyTable()
         step_names = [str(i) for i in range(len(per_frame_hists))]
@@ -966,10 +966,12 @@ class SemanticKITTIWorldDataset(Dataset):
             for hist in per_frame_hists
         ]
 
-        future_mious = [v for v in miou_values[1:] if np.isfinite(v)]
-        future_occ_ious = [v for v in occ_iou_values[1:] if np.isfinite(v)]
-        avg_miou = float(np.mean(future_mious)) if future_mious else np.nan
-        avg_occ_iou = float(np.mean(future_occ_ious)) if future_occ_ious else np.nan
+        #* Avg. 计算当前 + 未来所有 step 的平均值。
+        # 也就是 step_0, step_1, ..., step_N 全部参与平均。
+        valid_mious = [v for v in miou_values if np.isfinite(v)]
+        valid_occ_ious = [v for v in occ_iou_values if np.isfinite(v)]
+        avg_miou = float(np.mean(valid_mious)) if valid_mious else np.nan
+        avg_occ_iou = float(np.mean(valid_occ_ious)) if valid_occ_ious else np.nan
 
         table.add_row(
             ['mIoU(%)'] + [self._pct(v) for v in miou_values] +
@@ -980,11 +982,11 @@ class SemanticKITTIWorldDataset(Dataset):
 
         metric_dict = {}
         for frame_idx, value in enumerate(miou_values):
-            metric_dict[f'forecast/step_{frame_idx}_mIoU'] = value
+            metric_dict[f'step_{frame_idx}_mIoU'] = value
         for frame_idx, value in enumerate(occ_iou_values):
-            metric_dict[f'forecast/step_{frame_idx}_occupied_IoU'] = value
-        metric_dict['forecast/future_avg_mIoU'] = avg_miou
-        metric_dict['forecast/future_avg_occupied_IoU'] = avg_occ_iou
+            metric_dict[f'step_{frame_idx}_IoU'] = value
+        metric_dict['avg_mIoU'] = avg_miou
+        metric_dict['avg_IoU'] = avg_occ_iou
         return table, metric_dict
 
     def evaluate(self, results, logger=None, **kwargs):
@@ -1013,7 +1015,7 @@ class SemanticKITTIWorldDataset(Dataset):
 
         #* ================== 精简 forecast 表格 ==================
         # 如果模型返回逐时间步 hist，则优先打印类似论文中的 compact table：
-        #   0/current, 1-step, 2-step, ... future Avg.
+        #   0/current, 1-step, 2-step, ... Avg.
         # 这样日志不会被每类 IoU 长表刷屏，更适合训练中快速观察。
         per_frame_hists = self._collect_per_frame_histograms(results)
         if per_frame_hists:
@@ -1023,12 +1025,12 @@ class SemanticKITTIWorldDataset(Dataset):
             if logger is not None:
                 logger.info(
                     'SemanticKITTI compact forecasting metrics '
-                    '(0=current, 1..N=future, Avg.=future average):')
+                    '(0=current, 1..N=future, Avg.=current+future average):')
                 logger.info('\n' + compact_table.get_string())
             else:
                 print(
                     '\nSemanticKITTI compact forecasting metrics '
-                    '(0=current, 1..N=future, Avg.=future average):')
+                    '(0=current, 1..N=future, Avg.=current+future average):')
                 print(compact_table)
 
         eval_items = [
@@ -1047,7 +1049,6 @@ class SemanticKITTIWorldDataset(Dataset):
 
             ious = self._hist_to_ious(hist_sum)
             table, metric_dict = self._format_iou_table(ious, metric_prefix)
-            eval_results.update(metric_dict)
 
             #* 额外计算二值占据 IoU：empty vs occupied。
             # 这回答的是“哪里被占据”是否预测正确，不关心 occupied
@@ -1056,7 +1057,16 @@ class SemanticKITTIWorldDataset(Dataset):
             binary_ious = self._hist_to_ious(binary_hist)
             binary_table, binary_metric_dict = self._format_binary_iou_table(
                 binary_ious, metric_prefix)
-            eval_results.update(binary_metric_dict)
+            #! 日志精简：
+            #! metric_dict / binary_metric_dict 包含大量逐类 IoU，例如
+            #! current_future/IoU_car、future/IoU_road 等。TextLoggerHook 会把
+            #! eval_results 里的所有 key 全部展开打印，导致训练日志非常长。
+            #! 因此默认不再把这些详细逐类指标写入 eval_results，只保留
+            #! 上方 compact table 对应的 step_* / avg_* 精简指标。
+            #!
+            #! 如果后续需要 TensorBoard 记录逐类 IoU，可以临时打开：
+            #! eval_results.update(metric_dict)
+            #! eval_results.update(binary_metric_dict)
 
             if logger is not None:
                 #* 为避免训练中日志过长，默认不打印每个类别的长表。
