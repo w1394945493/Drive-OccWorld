@@ -242,6 +242,9 @@ def main():
             print(f"  当前帧 img_shape: {img_metas[-1].get('img_shape')}")
             print(f"  当前帧 pad_shape: {img_metas[-1].get('pad_shape')}")
             print(
+                '  当前帧 lidar2global_rotation shape: '
+                f"{np.asarray(img_metas[-1].get('lidar2global_rotation')).shape}")
+            print(
                 '  当前帧 ref_lidar_to_cur_lidar shape: '
                 f"{np.asarray(img_metas[-1].get('ref_lidar_to_cur_lidar')).shape}")
 

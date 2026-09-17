@@ -125,6 +125,9 @@ def print_batch_summary(batch):
         print(f'img_metas: batch={len(img_metas)}, T_input={len(img_metas[0])}')
         print(f"  当前帧 token: {img_metas[0][-1].get('token')}")
         print(f"  当前帧 lidar2img num: {len(img_metas[0][-1].get('lidar2img'))}")
+        print(
+            '  当前帧 lidar2global_rotation shape: '
+            f"{np.asarray(img_metas[0][-1].get('lidar2global_rotation')).shape}")
     print(f"current_token: {batch.get('current_token')}")
     print(f"window_tokens[0]: {batch.get('window_tokens', [''])[0]}")
 

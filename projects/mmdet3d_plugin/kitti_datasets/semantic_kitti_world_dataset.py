@@ -330,6 +330,7 @@ class SemanticKITTIWorldDataset(Dataset):
         for meta_idx, frame_input in enumerate(input_frame_inputs):
             info = self.data_infos[self.token2idx[frame_input['token']]]
             cur_lidar2global = self._lidar_to_global(info)
+            global2cur_lidar = np.linalg.inv(cur_lidar2global)
             cur_lidar_to_ref_lidar = global2ref_lidar @ cur_lidar2global
             ref_lidar_to_cur_lidar = np.linalg.inv(cur_lidar_to_ref_lidar)
 
@@ -352,6 +353,17 @@ class SemanticKITTIWorldDataset(Dataset):
                 ori_shape=ori_shape,
                 pad_shape=pad_shape,
                 img_norm_cfg=copy.deepcopy(self.img_norm_cfg),
+                #! 修复原因：
+                #! Drive-OccWorld 复用 BEVFormer 的 PerceptionTransformer，
+                #! get_bev_features() 会读取 img_meta['lidar2global_rotation']
+                #! 将 can_bus 中的 global 位移转换到当前 LiDAR 坐标系，
+                #! 用于计算 BEV shift / rotate_prev_bev。nuScenes pkl 原本会
+                #! 提供这些字段；SemanticKITTI converter 只保存了
+                #! ego2global/lidar2ego，因此这里在 Dataset 中在线补齐。
+                lidar2global_rotation=cur_lidar2global[:3, :3],
+                lidar2global_translation=cur_lidar2global[:3, 3],
+                global2lidar_rotation=global2cur_lidar[:3, :3],
+                global2lidar_translation=global2cur_lidar[:3, 3],
                 cur_lidar_to_ref_lidar=cur_lidar_to_ref_lidar,
                 ref_lidar_to_cur_lidar=ref_lidar_to_cur_lidar,
                 total_cur2ref_lidar_transform=cur_lidar_to_ref_lidar,
