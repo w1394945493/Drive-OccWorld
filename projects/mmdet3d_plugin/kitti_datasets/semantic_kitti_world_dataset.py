@@ -207,11 +207,31 @@ class SemanticKITTIWorldDataset(Dataset):
             selected.append(cams[cam_name])
         return selected
 
+    @staticmethod
+    def _to_homogeneous_4x4(mat):
+        """Convert KITTI-style 3x4 projection matrix to BEVFormer-style 4x4.
+
+        #! 修复原因：
+        #! SemanticKITTI/KITTI 标定中 lidar2img 通常是 P2 @ Tr_velo_to_cam，
+        #! shape 为 3x4；但 Drive-OccWorld 复用的 BEVFormer encoder
+        #! point_sampling() 会把 lidar2img reshape 成 (..., 4, 4)。
+        #! 因此这里在 Dataset 层补齐最后一行 [0,0,0,1]，使其符合
+        #! nuScenes/BEVFormer 的 4x4 齐次矩阵协议。
+        """
+        mat = np.asarray(mat, dtype=np.float64)
+        if mat.shape == (4, 4):
+            return mat
+        if mat.shape == (3, 4):
+            mat4 = np.eye(4, dtype=np.float64)
+            mat4[:3, :4] = mat
+            return mat4
+        raise ValueError(f'Unsupported lidar2img shape: {mat.shape}')
+
     def _build_single_frame_input(self, info, is_current=False):
         """Build pipeline input dict for one frame."""
         cam_infos = self._select_camera_infos(info)
         img_filename = [cam['data_path'] for cam in cam_infos]
-        lidar2img = [np.asarray(cam['lidar2img'], dtype=np.float64)
+        lidar2img = [self._to_homogeneous_4x4(cam['lidar2img'])
                      for cam in cam_infos]
         cam_intrinsic = [np.asarray(cam['cam_intrinsic'], dtype=np.float64)
                          for cam in cam_infos]
