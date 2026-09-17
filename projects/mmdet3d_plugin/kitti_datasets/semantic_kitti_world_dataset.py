@@ -122,6 +122,12 @@ class SemanticKITTIWorldDataset(Dataset):
         self.format_for_train = format_for_train
         self.test_mode = test_mode
         self.pipeline = Compose(pipeline) if pipeline is not None else None
+        #! SemanticKITTI 第一阶段评估已经在 evaluate() 内部打印 compact table。
+        #! 如果继续让 MMCV TextLoggerHook 把 eval_results 作为普通训练日志
+        #! 再打印一遍，会出现类似 Epoch [1][5/10]、time=0、data_time=0、
+        #! memory 异常等误导信息。因此让自定义 EvalHook 在 evaluate() 后
+        #! 清理 log_buffer，保留 compact table，跳过二次 TextLoggerHook 输出。
+        self.suppress_eval_log_buffer = True
 
         data = self._load_pkl(ann_file)
         self.metadata = data.get('metadata', {})

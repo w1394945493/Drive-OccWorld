@@ -46,15 +46,13 @@ class CustomDistEvalHook(BaseDistEvalHook):
         """Evaluate the model only at the start of training by epoch."""
         self._decide_interval(runner)
         super().before_train_epoch(runner)
-        #! 修复原因：
-        #! Epoch 结束后的评估虽然已经在 _do_evaluate() 末尾做了一次 barrier，
-        #! 但随后 rank0 还会通过 TextLoggerHook 打印评估指标，而其他 rank
-        #! 可能更早进入下一轮 before_train_epoch / train loop。
-        #! 这样就可能出现日志中评估指标已经打印，但多卡训练迟迟不进入下一
-        #! epoch 的现象。这里在每个 epoch 开始前再同步一次，保证所有 rank
-        #! 都完成上一轮评估和日志 hook 后，再一起进入新 epoch。
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
+        # if dist.is_available() and dist.is_initialized():
+        #     dist.barrier()
+        #! 这里曾尝试在每个 epoch 开始前额外同步所有 rank，但实际多卡
+        #! 训练中可能出现某些 rank 尚未进入 before_train_epoch，而另一些
+        #! rank 已经在此处等待，从而导致评估指标已打印但迟迟不进入下一
+        #! epoch 的死锁现象。当前只保留 _do_evaluate() 末尾的同步；
+        #! epoch 开始前不再额外 barrier。
 
     def before_train_iter(self, runner):
         self._decide_interval(runner)
@@ -97,6 +95,16 @@ class CustomDistEvalHook(BaseDistEvalHook):
 
             if self.save_best:
                 self._save_ckpt(runner, key_score)
+
+            if getattr(self.dataloader.dataset,
+                       'suppress_eval_log_buffer', False):
+                #! SemanticKITTIWorldDataset.evaluate() 已经主动打印了
+                #! compact forecasting table。若继续保留 log_buffer.ready=True，
+                #! MMCV TextLoggerHook 会把同一批 eval_results 再打印成
+                #! “Epoch [1][5/10] time=0 data_time=0 memory=...” 形式，
+                #! 既重复又容易误导为新一轮训练日志。这里清空 ready 状态，
+                #! 保留 evaluate() 表格输出，跳过 TextLoggerHook 的二次打印。
+                runner.log_buffer.clear()
 
         #! 修复原因：
         #! 分布式评估时，custom_multi_gpu_test() 返回后只有 rank0 会继续执行
