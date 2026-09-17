@@ -38,7 +38,7 @@ MANIFEST
 pretrained
 tensorboard_comp
 dbg
-scripts
+# scripts
 viz/figs/
 work_dirs
 *dbg*

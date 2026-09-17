@@ -6,6 +6,7 @@ from .core.hooks.ema import ExpMomentumEMAHook, LinearMomentumEMAHook
 from .datasets.pipelines import (
   PhotoMetricDistortionMultiViewImage, PadMultiViewImage, 
   NormalizeMultiviewImage,  CustomCollect3D, RandomScaleImageMultiViewImage)
+from .kitti_datasets import SemanticKITTIWorldDataset
 from .models.utils import *
 from .models.opt.adamw import AdamW2
 from .bevformer import *
