@@ -343,41 +343,116 @@ class WorldHeadV1(WorldHeadBase):
 
         return loss_dict
 
+    # 原实现保留如下，便于对照 Drive-OccWorld 原始代码：
+    # def loss_sem_norm(self, output_voxels=None, target_voxels=None, **kwargs):
+    #     """
+    #         output_voxels = inter_num, select_frame*bs, cls, h,w,d
+    #         target_voxels =            select_frame*bs,      H,W,D
+    #     """
+    #     inter, B, C, pH, pW, pD = output_voxels.shape
+    #     tB, tH, tW, tD = target_voxels.shape
+    #
+    #     H, W, D = 256, 256, 20
+    #     # output_voxel align to H,W,D
+    #     if pH != H:
+    #         output_voxels = F.interpolate(output_voxels.flatten(0,1), size=(H, W, D), mode='trilinear', align_corners=False)
+    #         output_voxels = output_voxels.view(inter, B,C,H,W,D)
+    #
+    #     # target_voxel align to H,W,D
+    #     ratio = tH // H
+    #     if ratio != 1:
+    #         target_voxels = target_voxels.reshape(B, H, ratio, W, ratio, D, ratio).permute(0,1,3,5,2,4,6).reshape(B, H, W, D, ratio**3)
+    #         empty_idx = self.empty_idx
+    #         empty_mask = target_voxels.sum(-1) == empty_idx
+    #         target_voxels = target_voxels.to(torch.int64)
+    #         occ_space = target_voxels[~empty_mask]
+    #         occ_space[occ_space==0] = -torch.arange(len(occ_space[occ_space==0])).to(occ_space.device) - 1
+    #         target_voxels[~empty_mask] = occ_space
+    #         target_voxels = torch.mode(target_voxels, dim=-1)[0]
+    #         target_voxels[target_voxels<0] = 255
+    #         target_voxels = target_voxels.long()
+    #
+    #     assert torch.isnan(output_voxels).sum().item() == 0
+    #     assert torch.isnan(target_voxels).sum().item() == 0
+    #
+    #
+    #     loss_dict = {}
+    #     for index, output_voxel in enumerate(output_voxels):
+    #         inter_loss = CE_ssc_loss(output_voxel, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=255)
+    #         loss_dict['loss_sem_norm_{}'.format(index)] = inter_loss
+    #
+    #     return loss_dict
+
     def loss_sem_norm(self, output_voxels=None, target_voxels=None, **kwargs):
         """
             output_voxels = inter_num, select_frame*bs, cls, h,w,d
             target_voxels =            select_frame*bs,      H,W,D
         """
+        #* sem_norm 辅助监督分支。
+        #! 修复原因：
+        #! 原实现把监督尺寸写死为 (256,256,20)，适配原 nuScenes/OpenOccupancy
+        #! 512x512x40 -> 256x256x20 的压缩逻辑。但 SemanticKITTI GT 是
+        #! (256,256,32)，且当 pred_height=16 时 output_voxels 的高度为 16。
+        #! 因此这里和 loss_voxel() 保持一致，统一读取
+        #! self.loss_voxel_align_size / self.empty_idx：
+        #! - 原配置默认仍是 (256,256,20)，不破坏原工作；
+        #! - SemanticKITTI 配置显式传入 occ_size=(256,256,32)，
+        #!   可将 [128,128,16] 或其他预测尺寸插值到 [256,256,32]。
         inter, B, C, pH, pW, pD = output_voxels.shape
         tB, tH, tW, tD = target_voxels.shape
+        assert B == tB
 
-        H, W, D = 256, 256, 20
+        empty_idx = self.empty_idx
+        if self.loss_voxel_align_size is None:
+            H, W, D = tH, tW, tD
+        else:
+            H, W, D = self.loss_voxel_align_size
+
         # output_voxel align to H,W,D
-        if pH != H:
-            output_voxels = F.interpolate(output_voxels.flatten(0,1), size=(H, W, D), mode='trilinear', align_corners=False)
-            output_voxels = output_voxels.view(inter, B,C,H,W,D)
+        if (pH, pW, pD) != (H, W, D):
+            output_voxels = F.interpolate(
+                output_voxels.flatten(0, 1),
+                size=(H, W, D),
+                mode='trilinear',
+                align_corners=False)
+            output_voxels = output_voxels.view(inter, B, C, H, W, D)
 
-        # target_voxel align to H,W,D
-        ratio = tH // H
-        if ratio != 1:
-            target_voxels = target_voxels.reshape(B, H, ratio, W, ratio, D, ratio).permute(0,1,3,5,2,4,6).reshape(B, H, W, D, ratio**3)
-            empty_idx = self.empty_idx
+        # target_voxel align to H,W,D.
+        # 和 loss_voxel() 一样，仅沿用原始等比例整数倍压缩逻辑。
+        if (tH, tW, tD) != (H, W, D):
+            assert tH % H == 0 and tW % W == 0 and tD % D == 0, (
+                f'target shape {(tH, tW, tD)} must be integer multiples of '
+                f'loss_voxel_align_size {(H, W, D)}')
+            ratio_h, ratio_w, ratio_d = tH // H, tW // W, tD // D
+            assert ratio_h == ratio_w == ratio_d, (
+                'Only isotropic downsample is supported by the original '
+                f'voxel compression logic, got ratios {(ratio_h, ratio_w, ratio_d)}')
+            ratio = ratio_h
+            target_voxels = target_voxels.reshape(
+                B, H, ratio, W, ratio, D, ratio
+            ).permute(0, 1, 3, 5, 2, 4, 6).reshape(
+                B, H, W, D, ratio ** 3)
             empty_mask = target_voxels.sum(-1) == empty_idx
             target_voxels = target_voxels.to(torch.int64)
             occ_space = target_voxels[~empty_mask]
-            occ_space[occ_space==0] = -torch.arange(len(occ_space[occ_space==0])).to(occ_space.device) - 1
+            occ_space[occ_space == 0] = (
+                -torch.arange(len(occ_space[occ_space == 0]),
+                              device=occ_space.device) - 1)
             target_voxels[~empty_mask] = occ_space
             target_voxels = torch.mode(target_voxels, dim=-1)[0]
-            target_voxels[target_voxels<0] = 255
+            target_voxels[target_voxels < 0] = 255
             target_voxels = target_voxels.long()
 
         assert torch.isnan(output_voxels).sum().item() == 0
         assert torch.isnan(target_voxels).sum().item() == 0
 
-
         loss_dict = {}
         for index, output_voxel in enumerate(output_voxels):
-            inter_loss = CE_ssc_loss(output_voxel, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=255)
+            inter_loss = CE_ssc_loss(
+                output_voxel,
+                target_voxels,
+                self.class_weights.type_as(output_voxels),
+                ignore_index=255)
             loss_dict['loss_sem_norm_{}'.format(index)] = inter_loss
 
         return loss_dict
