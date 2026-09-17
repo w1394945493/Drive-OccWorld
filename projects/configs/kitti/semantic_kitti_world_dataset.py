@@ -31,7 +31,9 @@ future_queue_length = 4
 use_camera = 'left'
 
 # 这里先不设置 pipeline，让 Dataset 返回原始 frame_inputs + segmentation，
-# 便于直接检查 pkl 字段、时序窗口和 occupancy shape。
+# 同时由 Dataset 直接读取 history+current 图像，便于检查第一阶段模型输入：
+#   img: [history + current, num_cam, H, W, C]
+#   segmentation: [history + current + future, H_occ, W_occ, D_occ]
 semantic_kitti_train_dataset = dict(
     type='SemanticKITTIWorldDataset',
     ann_file=f'{ann_root}/semantickitti_infos_train.pkl',
@@ -42,6 +44,8 @@ semantic_kitti_train_dataset = dict(
     future_queue_length=future_queue_length,
     filter_invalid=True,
     load_occ=True,
+    load_img=True,
+    to_float32=True,
     test_mode=False,
 )
 
@@ -55,6 +59,8 @@ semantic_kitti_val_dataset = dict(
     future_queue_length=future_queue_length,
     filter_invalid=True,
     load_occ=True,
+    load_img=True,
+    to_float32=True,
     test_mode=True,
 )
 

@@ -102,13 +102,33 @@ def main():
         raise IndexError(
             f'index={args.index} out of range [0, {len(dataset) - 1}]')
 
-    data = dataset.get_data_info(args.index)
+    data = dataset[args.index]
     print('\n' + '-' * 100)
     print('时序窗口信息 Window summary')
     print('-' * 100)
     print(f"当前参考帧 current_token: {data['current_token']}")
     print(f"窗口内所有 token window_tokens: {data['window_tokens']}")
     print(f"窗口帧数量 num frame_inputs: {len(data['frame_inputs'])}")
+
+    img = data.get('img', None)
+    if img is None:
+        print('图像队列 img: None')
+    else:
+        print(
+            f'图像队列 img: shape={img.shape}, dtype={img.dtype} '
+            '[T_input, N_cam, H, W, C]')
+
+    img_metas = data.get('img_metas', None)
+    if img_metas is None:
+        print('图像 meta 队列 img_metas: None')
+    else:
+        print(f'图像 meta 队列 img_metas: len={len(img_metas)}')
+        if img_metas:
+            print(f"  第一帧 meta token: {img_metas[0].get('token')}")
+            print(f"  当前帧 meta token: {img_metas[-1].get('token')}")
+            print(
+                '  当前帧 ref_lidar_to_cur_lidar shape: '
+                f"{np.asarray(img_metas[-1].get('ref_lidar_to_cur_lidar')).shape}")
 
     segmentation = data.get('segmentation', None)
     if segmentation is None:

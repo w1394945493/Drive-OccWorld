@@ -60,6 +60,8 @@ class SemanticKITTIWorldDataset(Dataset):
                  future_queue_length=4,
                  filter_invalid=True,
                  load_occ=True,
+                 load_img=True,
+                 to_float32=True,
                  test_mode=False):
         super().__init__()
         if use_camera not in self.CAMERA_GROUPS:
@@ -75,6 +77,8 @@ class SemanticKITTIWorldDataset(Dataset):
         self.future_queue_length = int(future_queue_length)
         self.filter_invalid = filter_invalid
         self.load_occ = load_occ
+        self.load_img = load_img
+        self.to_float32 = to_float32
         self.test_mode = test_mode
         self.pipeline = Compose(pipeline) if pipeline is not None else None
 
@@ -103,6 +107,35 @@ class SemanticKITTIWorldDataset(Dataset):
             raise FileNotFoundError(f'Missing ann_file: {path}')
         with open(path, 'rb') as f:
             return pickle.load(f)
+
+    @staticmethod
+    def _quat_wxyz_to_rot(quat):
+        """Convert wxyz quaternion to 3x3 rotation matrix."""
+        w, x, y, z = np.asarray(quat, dtype=np.float64)
+        n = np.sqrt(w * w + x * x + y * y + z * z) + 1e-12
+        w, x, y, z = w / n, x / n, y / n, z / n
+        return np.asarray([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ], dtype=np.float64)
+
+    @classmethod
+    def _pose_matrix(cls, translation, rotation):
+        """Build 4x4 pose matrix from translation and wxyz quaternion."""
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, :3] = cls._quat_wxyz_to_rot(rotation)
+        pose[:3, 3] = np.asarray(translation, dtype=np.float64)
+        return pose
+
+    @classmethod
+    def _lidar_to_global(cls, info):
+        """Build LiDAR -> global transform from info pose fields."""
+        ego2global = cls._pose_matrix(
+            info['ego2global_translation'], info['ego2global_rotation'])
+        lidar2ego = cls._pose_matrix(
+            info['lidar2ego_translation'], info['lidar2ego_rotation'])
+        return ego2global @ lidar2ego
 
     def __len__(self):
         return len(self.valid_indices)
@@ -187,6 +220,57 @@ class SemanticKITTIWorldDataset(Dataset):
         )
         return input_dict
 
+    def _load_images(self, frame_inputs):
+        """Load history/current images into shape [T, N, H, W, C].
+
+        T = history_queue_length + 1，N = 1(left) 或 2(stereo)。
+        这里先保持 HWC 格式，便于测试脚本直观看 shape；后续接模型训练时，
+        可以再在 pipeline/format bundle 中转成 [T, N, C, H, W] tensor。
+        """
+        frame_imgs = []
+        for frame_input in frame_inputs:
+            cam_imgs = []
+            for img_path in frame_input['img_filename']:
+                img = mmcv.imread(img_path, flag='color')
+                if img is None:
+                    raise FileNotFoundError(f'Cannot read image: {img_path}')
+                if self.to_float32:
+                    img = img.astype(np.float32)
+                cam_imgs.append(img)
+            frame_imgs.append(np.stack(cam_imgs, axis=0))
+        return np.stack(frame_imgs, axis=0)
+
+    def _build_img_metas(self, input_frame_inputs, current_input):
+        """Build meta list for history + current image frames.
+
+        Drive-OccWorld/BEVFormer 会使用 ref_lidar_to_cur_lidar /
+        cur_lidar_to_ref_lidar 做历史 BEV 对齐。这里以当前参考帧为 ref，
+        根据 converter 写入的 ego2global/lidar2ego 位姿计算相对变换。
+        """
+        ref_info = self.data_infos[self.token2idx[current_input['token']]]
+        ref_lidar2global = self._lidar_to_global(ref_info)
+        global2ref_lidar = np.linalg.inv(ref_lidar2global)
+
+        metas = []
+        for frame_input in input_frame_inputs:
+            info = self.data_infos[self.token2idx[frame_input['token']]]
+            cur_lidar2global = self._lidar_to_global(info)
+            cur_lidar_to_ref_lidar = global2ref_lidar @ cur_lidar2global
+            ref_lidar_to_cur_lidar = np.linalg.inv(cur_lidar_to_ref_lidar)
+
+            meta = copy.deepcopy(frame_input)
+            meta.update(
+                img_shape=None,
+                ori_shape=None,
+                pad_shape=None,
+                cur_lidar_to_ref_lidar=cur_lidar_to_ref_lidar,
+                ref_lidar_to_cur_lidar=ref_lidar_to_cur_lidar,
+                total_cur2ref_lidar_transform=cur_lidar_to_ref_lidar,
+                total_ref2cur_lidar_transform=ref_lidar_to_cur_lidar,
+            )
+            metas.append(meta)
+        return metas
+
     @staticmethod
     def _load_occ(occ_path):
         """Load dense occupancy label from converter-produced occ_path."""
@@ -216,9 +300,17 @@ class SemanticKITTIWorldDataset(Dataset):
                 occ_seq.append(self._load_occ(info['occ_path']))
 
         current_info = self.data_infos[raw_index]
+        input_frame_inputs = frame_inputs[:current_pos + 1]
+        current_input = frame_inputs[current_pos]
+        img = self._load_images(input_frame_inputs) if self.load_img else None
+        img_metas = self._build_img_metas(input_frame_inputs, current_input)
+
         return dict(
             frame_inputs=frame_inputs,
-            current_input=frame_inputs[current_pos],
+            input_frame_inputs=input_frame_inputs,
+            current_input=current_input,
+            img=img,
+            img_metas=img_metas,
             segmentation=np.stack(occ_seq) if self.load_occ else None,
             window_tokens=[self.data_infos[i]['token'] for i in window_indices],
             current_token=current_info['token'],
@@ -232,8 +324,8 @@ class SemanticKITTIWorldDataset(Dataset):
             附加回输出。这适合先验证单帧/当前帧图像读取链路。
 
         若不提供 pipeline：
-            直接返回包含 frame_inputs 和 segmentation 的原始 dict，便于调试
-            历史/未来窗口是否正确。
+            直接返回包含 img / img_metas / segmentation / frame_inputs 的 dict，
+            便于调试历史/未来窗口和第一阶段模型输入是否正确。
 
         后续若要完全贴合 Drive-OccWorld 的 [history,current] 图像队列格式，
         可在此基础上增加 queue 合并逻辑。
