@@ -1,9 +1,15 @@
-"""Drive-OccWorld config for SemanticKITTI experiments.
+"""Debug config for SemanticKITTI Drive-OccWorld experiments.
 
 用途：
     在 SemanticKITTIWorldDataset 已能读取历史/当前图像与未来 occupancy
     序列的基础上，进一步定义 Drive_OccWorld 模型配置。最终目标是跑通
-    SemanticKITTI 上的完整 future occupancy forecasting 流程：
+    SemanticKITTI 上的 future occupancy forecasting 流程。
+    本 debug 版本相比 semantic_kitti_drive_occworld.py 更轻量：
+
+        - image backbone 从 ResNet101 + DCNv2 改为 ResNet50；
+        - 使用 ResNet50/FPN 常见 COCO/nuImages 预训练权重初始化 backbone；
+        - 保持图像几何预处理为 pad-only，不做 resize/crop，避免 lidar2img
+          需要额外同步更新。
 
         历史/当前单目图像 -> BEV -> future occupancy forecasting
 
@@ -17,7 +23,7 @@
 
 使用方式：
     python scripts/test_semantic_kitti_world_dataset.py \
-        --config projects/configs/kitti/semantic_kitti_drive_occworld.py \
+        --config projects/configs/kitti/semantic_kitti_drive_occworld_debug.py \
         --split train \
         --index 0
 """
@@ -84,12 +90,20 @@ use_camera = 'left'
 pad_shape = (384, 1248)
 size_divisor = 32
 
-# 对齐 Drive-OccWorld / BEVFormer nuScenes 配置的 Caffe 风格 BGR 归一化。
-# mmcv.imread 默认读 BGR，因此 to_rgb=False。
+#* ================== Debug 版图像归一化 ==================
+# 参照 Uni-Occ/SuperOcc 的 ResNet50 预训练设置：
+#   mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True
+#
+# 原正式配置使用 ResNet101 + DCNv2 + Caffe 风格 BGR 归一化：
+#   mean=[103.530, 116.280, 123.675], std=[1,1,1], to_rgb=False
+#
+# todo: 当前只改颜色归一化，不改 resize/crop。
+# todo: 如果后续参考 Uni-Occ 把图像 resize 到 256x704，需要同步更新
+# todo: cam_intrinsic / lidar2img，否则 BEVFormer 的图像-几何投影会错位。
 img_norm_cfg = dict(
-    mean=[103.530, 116.280, 123.675],
-    std=[1.0, 1.0, 1.0],
-    to_rgb=False,
+    mean=[123.675, 116.28, 103.53],
+    std=[58.395, 57.12, 57.375],
+    to_rgb=True,
 )
 
 # * ================== SemanticKITTI occupancy / BEV 配置 ==================
@@ -150,8 +164,8 @@ _dim_ = 256
 _pos_dim_ = _dim_ // 2
 _ffn_dim_ = _dim_ * 2
 _num_levels_ = 4
-future_decoder_layer_num = 1
-bevformer_encoder_layer_num = 3
+future_decoder_layer_num = 3
+bevformer_encoder_layer_num = 6
 
 # WorldHeadV1.forward_head 会输出当前帧 + future_queue_length 帧的 occupancy。
 frame_loss_weight = [[1] for _ in range(future_queue_length + 1)]
@@ -176,22 +190,29 @@ model = dict(
     future_pred_frame_num=future_pred_frame_num_train,
     test_future_frame_num=future_pred_frame_num_test,
 
-    #* ================== 图像 backbone ==================
-    # 参照 fine_grained/action_condition_MMO_MSO_custom_offline_with_planning.py：
-    # 使用 ResNet101 + DCNv2，并通过 load_from 加载 FCOS3D 预训练权重。
-    # 相比前期调试用 ResNet50，该设置更接近原 Drive-OccWorld 正式配置，
-    # 但显存和计算开销也会更高。
+    #* ================== 图像 backbone：debug 版 ResNet50 ==================
+    # 参照 Uni-Occ/SuperOcc 的轻量图像 backbone 设置，使用 ResNet50 + FPN。
+    # 相比正式配置的 ResNet101 + DCNv2，该版本显存和计算开销更低，
+    # 便于后续评估是否采用 ResNet50 作为 SemanticKITTI baseline。
     img_backbone=dict(
+        # todo: 这里使用 Uni-Occ/SuperOcc 中的 nuImages/COCO 风格 ResNet50
+        # todo: 预训练权重，只初始化 backbone。由于该权重 key 通常带
+        # todo: "backbone." 前缀，因此设置 prefix='backbone.'。
+        # todo: 如果实际环境没有该文件，可启动时覆盖：
+        # todo:   --cfg-options model.img_backbone.init_cfg=None
+        init_cfg=dict(
+            type='Pretrained',
+            checkpoint='/c20250502/wangyushen/Weights/pretrained/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth',
+            prefix='backbone.'),
         type='ResNet',
-        depth=101,
+        depth=50,
         num_stages=4,
         out_indices=(1, 2, 3,),
         frozen_stages=1,
-        norm_cfg=dict(type='BN2d', requires_grad=False),
+        norm_cfg=dict(type='BN2d', requires_grad=True),
         norm_eval=True,
-        style='caffe',
-        dcn=dict(type='DCNv2', deform_groups=1, fallback_on_stride=False),
-        stage_with_dcn=(False, False, True, True)),
+        style='pytorch',
+        with_cp=True),
     img_neck=dict(
         type='FPN',
         in_channels=[512, 1024, 2048],
@@ -516,10 +537,8 @@ evaluation = dict(interval=eval_interval)
 workflow = [('train', 1)]
 find_unused_parameters = False
 cudnn_benchmark = True
-# * 加载与 ResNet101 + DCNv2 对应的 FCOS3D 预训练权重。
-# 该路径参照原 Drive-OccWorld fine-grained with planning 配置。
-# 如果环境中该文件不存在，可在启动训练时用
-#   --cfg-options load_from=None
-# 临时关闭预训练加载。
-load_from = "/c20250502/wangyushen/Weights/pretrained/r101_dcn_fcos3d_pretrain.pth"
+# Debug 版 backbone 已通过 model.img_backbone.init_cfg 单独加载 ResNet50
+# 预训练权重；这里不要再使用正式配置的 ResNet101 + DCNv2 全局 load_from，
+# 否则会出现 backbone 结构/key 不匹配。
+load_from = None
 resume_from = None
