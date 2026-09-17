@@ -165,28 +165,37 @@ def rotation_matrix_to_quaternion_wxyz(rot):
     return quat.tolist()
 
 
-def list_frame_tokens(sequence_dir):
-    """List available dense-occupancy frame tokens by scanning voxels/*.bin."""
-    voxel_dir = osp.join(sequence_dir, 'voxels')
-    if not osp.isdir(voxel_dir):
-        raise FileNotFoundError(f'Missing voxels directory: {voxel_dir}')
+def list_frame_tokens(ann_file, sequence):
+    """List available dense-occupancy frame tokens from labels/<seq>/*_1_1.npy."""
+    occ_label_dir = osp.join(ann_file, sequence)
+    if not osp.isdir(occ_label_dir):
+        raise FileNotFoundError(
+            f'Missing occupancy label directory: {occ_label_dir}')
 
     #* ================== 构建当前 sequence 的可用帧 token 列表 ==================
-    # SemanticKITTI/SSC 标签通常按帧号命名，例如：
-    #   voxels/000000.bin, voxels/000001.bin, ...
-    # 这里以 occupancy 可用帧为准，而不是以 image_2/image_3 或 poses.txt 为准；
-    # 只有存在 voxels/*.bin 的帧才会进入 tokens。
+    # 第一阶段训练监督真正读取的是 dense occupancy 标签：
+    #   labels/<sequence>/<token>_1_1.npy
+    # 因此这里直接扫描 labels/<sequence>/*_1_1.npy 来构建 tokens。
+    #
+    # 这样可以保证：
+    #   当前 token 以及基于 tokens 构建出的 prev/next token，
+    #   都对应一个真实存在的 occ_path。
+    #
+    # 注意：这里不再扫描 sequences/<sequence>/voxels/*.bin。
+    # 原因是 voxels/*.bin 与 labels/*_1_1.npy 通常同名但不是同一个监督文件；
+    # 如果只用 voxels 决定 token，可能出现有 voxel bin 但没有 dense occ npy 的样本。
     #
     # sorted(...) 会按字符串顺序排序。由于 SemanticKITTI 帧号是 6 位补零格式，
     # 字符串顺序等价于时间顺序。
     # 因此后面 prev/next 的“相邻帧”含义就是：
-    #   在排序后的可用 occupancy token 列表中索引相邻。
+    #   在排序后的“有 occupancy 标注”的 token 列表中索引相邻。
     # 它不是额外根据 timestamp / pose / image 最近邻搜索出来的。
     tokens = sorted(
-        osp.splitext(entry.name)[0] for entry in os.scandir(voxel_dir)
-        if entry.is_file() and entry.name.endswith('.bin'))
+        entry.name[:-len('_1_1.npy')]
+        for entry in os.scandir(occ_label_dir)
+        if entry.is_file() and entry.name.endswith('_1_1.npy'))
     if not tokens:
-        raise RuntimeError(f'No .bin files found in {voxel_dir}')
+        raise RuntimeError(f'No *_1_1.npy files found in {occ_label_dir}')
     return tokens
 
 
@@ -477,14 +486,12 @@ def main():
     data_root = osp.abspath(args.data_root)
     sequence = args.sequence
     sequence_dir = osp.join(data_root, 'sequences', sequence)
-    ann_file = osp.join(data_root, 'labels')
+    ann_file = resolve_ann_file(data_root)
     if not osp.isdir(sequence_dir):
         raise FileNotFoundError(f'Missing sequence directory: {sequence_dir}')
-    if not osp.isdir(ann_file):
-        raise FileNotFoundError(f'Missing occupancy label root: {ann_file}')
 
     calib = read_calib(osp.join(sequence_dir, 'calib.txt'))
-    tokens = list_frame_tokens(sequence_dir)
+    tokens = list_frame_tokens(ann_file, sequence)
     poses_lidar = load_lidar_poses(data_root, sequence, calib)
     token_pose_indices = [token_to_pose_index(token) for token in tokens]
 
