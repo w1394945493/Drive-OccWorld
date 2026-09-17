@@ -10,6 +10,7 @@ import argparse
 import copy
 import mmcv
 import os
+import re
 import time
 import torch
 import warnings
@@ -30,12 +31,65 @@ from mmseg import __version__ as mmseg_version
 from mmcv.utils import TORCH_VERSION, digit_version
 
 
+def find_latest_checkpoint(work_dir):
+    """Find latest checkpoint in work_dir for auto-resume.
+
+    #! 自动断点续训逻辑：
+    #! 1. 优先使用 MMCV CheckpointHook 通常维护的 latest.pth；
+    #! 2. 如果 latest.pth 不存在，则在保存目录中查找 epoch_*.pth / iter_*.pth；
+    #! 3. epoch/iter 数字越大，认为 checkpoint 越新；
+    #! 4. 如果数字相同，使用文件修改时间更新的那个。
+    #!
+    #! 注意：这里返回的是用于 runner.resume() 的完整训练状态 checkpoint，
+    #! 会恢复 model / optimizer / lr scheduler / epoch 或 iter。
+    #! 这和 load_from 只加载模型权重不同。
+    """
+    if work_dir is None:
+        return None
+
+    work_dir = osp.abspath(work_dir)
+    if not osp.isdir(work_dir):
+        return None
+
+    latest_path = osp.join(work_dir, 'latest.pth')
+    if osp.isfile(latest_path):
+        return latest_path
+
+    checkpoint_pattern = re.compile(r'^(epoch|iter)_(\d+)\.pth$')
+    candidates = []
+    for filename in os.listdir(work_dir):
+        match = checkpoint_pattern.match(filename)
+        if match is None:
+            continue
+        checkpoint_path = osp.join(work_dir, filename)
+        if not osp.isfile(checkpoint_path):
+            continue
+        checkpoint_type = match.group(1)
+        checkpoint_step = int(match.group(2))
+        checkpoint_mtime = osp.getmtime(checkpoint_path)
+        # epoch checkpoint 和 iter checkpoint 通常不会混用；
+        # 若混用，仅按数字和修改时间选最新，避免复杂推断。
+        candidates.append(
+            (checkpoint_step, checkpoint_mtime, checkpoint_type,
+             checkpoint_path))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[-1][-1]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument(
         '--resume-from', help='the checkpoint file to resume from')
+    parser.add_argument(
+        '--no-auto-resume',
+        action='store_true',
+        help='disable automatically resuming from latest checkpoint in work_dir')
     parser.add_argument(
         '--no-validate',
         action='store_true',
@@ -206,6 +260,32 @@ def main():
     # log some basic info
     logger.info(f'Distributed training: {distributed}')
     logger.info(f'Config:\n{cfg.pretty_text}')
+
+    #* ================== 自动断点续训 ==================
+    # 如果用户没有通过 --resume-from 或 cfg.resume_from 显式指定断点，
+    # 则自动从 work_dir 中寻找之前保存的 checkpoint。
+    #
+    #! 这样训练中断后，重新运行同一个 --work-dir 会优先恢复完整训练状态；
+    #! 若找不到 checkpoint，则保持原逻辑，继续使用 cfg.load_from 加载预训练权重。
+    auto_resume = cfg.get('auto_resume', True) and not args.no_auto_resume
+    if args.resume_from is not None and not osp.isfile(args.resume_from):
+        logger.warning(
+            f'--resume-from is specified but file does not exist: '
+            f'{args.resume_from}. Auto-resume will be skipped.')
+    elif auto_resume and not cfg.get('resume_from', None):
+        latest_checkpoint = find_latest_checkpoint(cfg.work_dir)
+        if latest_checkpoint is not None:
+            cfg.resume_from = latest_checkpoint
+            logger.info(
+                f'Auto-resume enabled: found checkpoint {latest_checkpoint}')
+        else:
+            logger.info(
+                f'Auto-resume enabled, but no checkpoint found in '
+                f'{osp.abspath(cfg.work_dir)}. Training will start normally.')
+    elif not auto_resume:
+        logger.info('Auto-resume disabled.')
+    else:
+        logger.info(f'Resume checkpoint explicitly set: {cfg.resume_from}')
 
     # set random seeds
     if args.seed is not None:
