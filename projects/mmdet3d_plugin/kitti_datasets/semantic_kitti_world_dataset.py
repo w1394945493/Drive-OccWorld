@@ -887,6 +887,106 @@ class SemanticKITTIWorldDataset(Dataset):
         metric_dict[f'{title}/binary_mIoU'] = binary_miou
         return table, metric_dict
 
+    def _semantic_miou_from_hist(self, hist):
+        """Return non-empty semantic mIoU from one confusion matrix."""
+        ious = self._hist_to_ious(hist)
+        valid = [
+            float(iou) for cls_idx, iou in enumerate(ious)
+            if cls_idx != self.empty_idx and np.isfinite(iou)
+        ]
+        return float(np.mean(valid)) if valid else np.nan
+
+    def _binary_occupied_iou_from_hist(self, hist):
+        """Return occupied IoU after merging all non-empty classes."""
+        binary_hist = self._semantic_hist_to_binary_hist(hist)
+        binary_ious = self._hist_to_ious(binary_hist)
+        return float(binary_ious[1]) if len(binary_ious) > 1 and np.isfinite(binary_ious[1]) else np.nan
+
+    def _collect_per_frame_histograms(self, results):
+        """Sum per-frame confusion matrices across samples.
+
+        Drive_OccWorld.forward_test() returns:
+            hist_for_iou_per_frame = [hist_t0, hist_t1, ...]
+
+        EvalHook gathers these into list[dict]. This helper converts them into:
+            [sum_hist_t0, sum_hist_t1, ...]
+        """
+        per_sample_values = self._collect_result_values(
+            results, 'hist_for_iou_per_frame')
+        if not per_sample_values:
+            return []
+
+        per_frame_sums = []
+        for sample_values in per_sample_values:
+            if sample_values is None or np.isscalar(sample_values):
+                continue
+            for frame_idx, hist in enumerate(sample_values):
+                hist_np = self._as_numpy_hist(hist)
+                if hist_np.ndim != 2:
+                    continue
+                while len(per_frame_sums) <= frame_idx:
+                    per_frame_sums.append(None)
+                per_frame_sums[frame_idx] = (
+                    hist_np if per_frame_sums[frame_idx] is None
+                    else per_frame_sums[frame_idx] + hist_np)
+
+        return [hist for hist in per_frame_sums if hist is not None]
+
+    @staticmethod
+    def _pct(value):
+        """Format ratio as percentage for compact paper-style tables."""
+        if value is None or not np.isfinite(value):
+            return 'nan'
+        return round(float(value) * 100.0, 2)
+
+    def _format_compact_forecast_table(self, per_frame_hists):
+        """Build compact table: current/future-step mIoU and occupied IoU.
+
+        #* 输出格式参考论文表格：
+        #*   mIoU(%): 0, 1, 2, ..., Avg.
+        #*   IoU(%):  0, 1, 2, ..., Avg.
+        #
+        其中：
+          - 0 表示当前参考帧；
+          - 1/2/3/... 表示第几个未来预测 step；
+          - mIoU 是非 empty 语义 mIoU；
+          - IoU 是二值 occupied IoU，即所有非 empty 类合并后的占据 IoU；
+          - Avg. 按论文常见写法，只平均未来步，不包含当前 0-step。
+        """
+        table = PrettyTable()
+        step_names = [str(i) for i in range(len(per_frame_hists))]
+        table.field_names = ['metric'] + step_names + ['Avg.']
+
+        miou_values = [
+            self._semantic_miou_from_hist(hist)
+            for hist in per_frame_hists
+        ]
+        occ_iou_values = [
+            self._binary_occupied_iou_from_hist(hist)
+            for hist in per_frame_hists
+        ]
+
+        future_mious = [v for v in miou_values[1:] if np.isfinite(v)]
+        future_occ_ious = [v for v in occ_iou_values[1:] if np.isfinite(v)]
+        avg_miou = float(np.mean(future_mious)) if future_mious else np.nan
+        avg_occ_iou = float(np.mean(future_occ_ious)) if future_occ_ious else np.nan
+
+        table.add_row(
+            ['mIoU(%)'] + [self._pct(v) for v in miou_values] +
+            [self._pct(avg_miou)])
+        table.add_row(
+            ['IoU(% occupied)'] + [self._pct(v) for v in occ_iou_values] +
+            [self._pct(avg_occ_iou)])
+
+        metric_dict = {}
+        for frame_idx, value in enumerate(miou_values):
+            metric_dict[f'forecast/step_{frame_idx}_mIoU'] = value
+        for frame_idx, value in enumerate(occ_iou_values):
+            metric_dict[f'forecast/step_{frame_idx}_occupied_IoU'] = value
+        metric_dict['forecast/future_avg_mIoU'] = avg_miou
+        metric_dict['forecast/future_avg_occupied_IoU'] = avg_occ_iou
+        return table, metric_dict
+
     def evaluate(self, results, logger=None, **kwargs):
         """Evaluate current/future occupancy IoU and mIoU.
 
@@ -910,6 +1010,27 @@ class SemanticKITTIWorldDataset(Dataset):
         #*    occupied，额外评估 empty / occupied 二值占据 IoU。
         """
         eval_results = {}
+
+        #* ================== 精简 forecast 表格 ==================
+        # 如果模型返回逐时间步 hist，则优先打印类似论文中的 compact table：
+        #   0/current, 1-step, 2-step, ... future Avg.
+        # 这样日志不会被每类 IoU 长表刷屏，更适合训练中快速观察。
+        per_frame_hists = self._collect_per_frame_histograms(results)
+        if per_frame_hists:
+            compact_table, compact_metrics = self._format_compact_forecast_table(
+                per_frame_hists)
+            eval_results.update(compact_metrics)
+            if logger is not None:
+                logger.info(
+                    'SemanticKITTI compact forecasting metrics '
+                    '(0=current, 1..N=future, Avg.=future average):')
+                logger.info('\n' + compact_table.get_string())
+            else:
+                print(
+                    '\nSemanticKITTI compact forecasting metrics '
+                    '(0=current, 1..N=future, Avg.=future average):')
+                print(compact_table)
+
         eval_items = [
             ('hist_for_iou', 'current_future', '当前帧 + 未来帧'),
             ('hist_for_iou_current', 'current', '当前帧'),
@@ -938,16 +1059,29 @@ class SemanticKITTIWorldDataset(Dataset):
             eval_results.update(binary_metric_dict)
 
             if logger is not None:
-                logger.info(
-                    f'SemanticKITTI occupancy IoU evaluation: {readable_name}')
-                logger.info('\n' + table.get_string())
-                logger.info(
-                    f'SemanticKITTI binary occupancy IoU evaluation: {readable_name}')
-                logger.info('\n' + binary_table.get_string())
+                #* 为避免训练中日志过长，默认不打印每个类别的长表。
+                # 如需逐类排查，metric_dict 中仍保留了每类 IoU，
+                # 可在调试时临时打开下面两组 logger.info。
+                # logger.info(
+                #     f'SemanticKITTI occupancy IoU evaluation: {readable_name}')
+                # logger.info('\n' + table.get_string())
+                # logger.info(
+                #     f'SemanticKITTI binary occupancy IoU evaluation: {readable_name}')
+                # logger.info('\n' + binary_table.get_string())
+                pass
             else:
-                print(f'\nSemanticKITTI occupancy IoU evaluation: {readable_name}')
-                print(table)
-                print(f'\nSemanticKITTI binary occupancy IoU evaluation: {readable_name}')
-                print(binary_table)
+                # 控制台模式同样默认只输出 compact table。
+                pass
 
+        #! 快速调试 workaround：
+        #! 单卡 launcher=none + IterBasedRunner 下，MMDet 默认 EvalHook
+        #! 在 after_train_iter 触发评估后，会继续交给 TextLoggerHook 打印日志。
+        #! TextLoggerHook 的 iter 日志模板默认读取 time / data_time 字段；
+        #! 但 Dataset.evaluate() 返回的是评估指标，不包含这两个训练耗时字段，
+        #! 因而会触发 KeyError: 'data_time'。
+        #!
+        #! 这里补 0.0 只是为了让快速评估调试链路跑通，不表示真实评估耗时。
+        #! 更干净的长期方案是实现单卡 CustomEvalHook 或改 logger hook。
+        eval_results.setdefault('time', 0.0)
+        eval_results.setdefault('data_time', 0.0)
         return eval_results

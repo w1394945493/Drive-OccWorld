@@ -624,7 +624,21 @@ class Drive_OccWorld(BEVFormer):
         hist_for_iou_current = self.evaluate_occupancy_forecasting(occ_preds[-1][0:1], occ_gts[0:1], img_metas=img_metas, save_pred=False)
         hist_for_iou_future = self.evaluate_occupancy_forecasting(occ_preds[-1][1:], occ_gts[1:], img_metas=img_metas, save_pred=False)
         hist_for_iout_future_time_weighting = self.evaluate_occupancy_forecasting(occ_preds[-1][1:], occ_gts[1:], img_metas=img_metas, time_weighting=True)
-        return hist_for_iou, hist_for_iou_current, hist_for_iou_future, hist_for_iout_future_time_weighting
+        #* 额外返回逐时间步 confusion matrix，用于 Dataset.evaluate()
+        #* 输出类似论文表格的精简结果：
+        #*   0-step/current, 1-step, 2-step, ... future Avg。
+        # 原有 hist_for_iou_current / hist_for_iou_future 是 current 和 future
+        # 聚合后的指标，无法区分每个未来步；因此这里逐帧单独计算 hist。
+        hist_for_iou_per_frame = [
+            self.evaluate_occupancy_forecasting(
+                occ_preds[-1][frame_idx:frame_idx + 1],
+                occ_gts[frame_idx:frame_idx + 1],
+                img_metas=img_metas,
+                save_pred=False)
+            for frame_idx in range(select_frames * bs)
+        ]
+        return (hist_for_iou, hist_for_iou_current, hist_for_iou_future,
+                hist_for_iout_future_time_weighting, hist_for_iou_per_frame)
 
     def evaluate_instance(self, occ_preds, flow_preds, occ_gts, instance_gts):
         # occ_preds
@@ -965,9 +979,14 @@ class Drive_OccWorld(BEVFormer):
         #* ================== 4. 测试：评估 occupancy / flow / planning ==================
         test_output = {}
         # evaluate occ
-        occ_iou, occ_iou_current, occ_iou_future, occ_iou_future_time_weighting = self.evaluate_occ(next_bev_preds, segmentation, img_metas)
+        (occ_iou, occ_iou_current, occ_iou_future,
+         occ_iou_future_time_weighting,
+         occ_iou_per_frame) = self.evaluate_occ(
+            next_bev_preds, segmentation, img_metas)
         test_output.update(hist_for_iou=occ_iou, hist_for_iou_current=occ_iou_current,
-                           hist_for_iou_future=occ_iou_future, hist_for_iou_future_time_weighting=occ_iou_future_time_weighting)
+                           hist_for_iou_future=occ_iou_future,
+                           hist_for_iou_future_time_weighting=occ_iou_future_time_weighting,
+                           hist_for_iou_per_frame=occ_iou_per_frame)
         # evaluate flow(instance)
         if self.turn_on_flow:
             vpq = self.evaluate_instance(next_bev_preds, next_bev_preds_flow, segmentation, instance)
