@@ -32,6 +32,27 @@ plugin_dir = 'projects/mmdet3d_plugin/'
 data_root = '/c20250502/wangyushen/Datasets/kitti/semantickitti/dataset'
 ann_root = "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/data/semantic_kitti"
 
+# *=======================================================
+# * 训练参数
+# 统一管理 train.py 常用训练控制项，方便命令行或改配置时快速定位。
+# - samples_per_gpu: 每张 GPU 的 batch size；
+# - workers_per_gpu: 每张 GPU 对应的 dataloader worker 数；
+# - max_epochs: 总训练 epoch 数；
+# - log_interval: 训练日志打印间隔；
+# - eval_interval: 评估间隔；EpochBasedRunner 下表示每多少个 epoch 评估一次；
+# - checkpoint_interval: 保存模型间隔；EpochBasedRunner 下表示每多少个 epoch 保存一次；
+# - max_keep_ckpts: 最多保留多少个 checkpoint，避免 work_dir 无限增大。
+# - learning_rate: AdamW 基础学习率；img_backbone 会在 optimizer.paramwise_cfg
+#   中乘以 lr_mult=0.1。
+samples_per_gpu = 1
+workers_per_gpu = 2
+max_epochs = 24
+log_interval = 10
+eval_interval = 1
+checkpoint_interval = 1
+max_keep_ckpts = 1
+learning_rate = 1e-4
+
 # * ================== 快速调试样本数开关 ==================
 # 默认 None 表示使用完整 train/val split。
 # 调试 EvalHook 是否能跑通时，可以命令行覆盖：
@@ -428,8 +449,8 @@ semantic_kitti_val_dataset = dict(
 )
 
 data = dict(
-    samples_per_gpu=1,
-    workers_per_gpu=2,
+    samples_per_gpu=samples_per_gpu,
+    workers_per_gpu=workers_per_gpu,
     #! custom_train_detector 会从 cfg.data 中读取这两个 sampler 配置。
     #! 单卡 launcher=none 时主要使用 GroupSampler；分布式时使用这里的配置。
     shuffler_sampler=dict(type='DistributedGroupSampler'),
@@ -455,7 +476,7 @@ data = dict(
 #       checkpoint_config.by_epoch=False lr_config.by_epoch=False
 optimizer = dict(
     type='AdamW',
-    lr=1e-4,
+    lr=learning_rate,
     weight_decay=0.01,
     paramwise_cfg=dict(
         custom_keys={
@@ -474,12 +495,15 @@ lr_config = dict(
     min_lr_ratio=1e-3,
     by_epoch=True)
 
-total_epochs = 12
-runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
+total_epochs = max_epochs
+runner = dict(type='EpochBasedRunner', max_epochs=max_epochs)
 
-checkpoint_config = dict(interval=1, by_epoch=True, max_keep_ckpts=2)
+checkpoint_config = dict(
+    interval=checkpoint_interval,
+    by_epoch=True,
+    max_keep_ckpts=max_keep_ckpts)
 log_config = dict(
-    interval=10,
+    interval=log_interval,
     hooks=[
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
@@ -487,7 +511,7 @@ log_config = dict(
 
 # 每个 epoch 结束后评估一次。
 # 调试时建议用 --cfg-options data.val.max_samples=20 缩短评估时间。
-evaluation = dict(interval=1)
+evaluation = dict(interval=eval_interval)
 
 workflow = [('train', 1)]
 find_unused_parameters = False

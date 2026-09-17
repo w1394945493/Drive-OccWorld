@@ -992,7 +992,14 @@ class Drive_OccWorld(BEVFormer):
             vpq = self.evaluate_instance(next_bev_preds, next_bev_preds_flow, segmentation, instance)
             test_output.update(vpq=vpq)
         else:
-            test_output.update(vpq=0.1)
+            # test_output.update(vpq=0.1)
+            #! 修复原因：
+            #! SemanticKITTI 第一阶段配置 turn_on_flow=False，不预测 flow / instance，
+            #! 因此 VPQ 没有实际意义。原来的占位 vpq=0.1 会让多卡评估
+            #! custom_multi_gpu_test() 误以为需要收集 VPQ 指标，额外触发一次
+            #! collect_results_cpu()，增加 part_*.pkl 同步/覆盖风险。
+            #! 关闭 flow 时不返回 vpq，让评估只汇总 occupancy IoU/mIoU。
+            pass
         # =============================================#
         # evluate plan
         if self.turn_on_plan:

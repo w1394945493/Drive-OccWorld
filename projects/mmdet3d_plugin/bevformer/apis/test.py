@@ -233,9 +233,7 @@ def collect_results_cpu(result_part, size, tmpdir=None):
     mmcv.dump(result_part, osp.join(tmpdir, f'part_{rank}.pkl'))
     dist.barrier()
     # collect all parts
-    if rank != 0:
-        return None
-    else:
+    if rank == 0:
         # load results of all parts from tmp dir
         part_list = []
         for i in range(world_size):
@@ -264,7 +262,18 @@ def collect_results_cpu(result_part, size, tmpdir=None):
         #!
         #! 这里保留 part_*.pkl，不在每个指标收集后删除目录；后续同名文件会被覆盖，
         #! 文件很小，对磁盘影响可以忽略。若需要清理，可在整轮评估结束后统一清理。
-        return ordered_results
+    else:
+        ordered_results = None
+
+    #! 修复原因：
+    #! 上面的 dist.barrier() 只能保证所有 rank 都已经写完 part_*.pkl；
+    #! 但 rank!=0 原先会立刻 return，进入下一次 collect_results_cpu()，
+    #! 并覆盖同名 part_1.pkl。此时 rank0 可能还在读取上一轮 part_1.pkl，
+    #! 就会读到半写入文件，报 EOFError: Ran out of input。
+    #! 因此这里增加第二个 barrier，保证 rank0 读取完成后，
+    #! 其他 rank 才能进入下一轮指标收集。
+    dist.barrier()
+    return ordered_results
 
 
 def collect_results_gpu(result_part, size):
