@@ -979,7 +979,21 @@ class Drive_OccWorld(BEVFormer):
         if self.turn_on_plan:
             self.evaluate_plan(next_pose_preds, sdc_planning, sdc_planning_mask, segmentation_bev, img_metas)
 
-        return test_output
+        # 原始写法：直接返回单个 dict。
+        # return test_output
+        #! 修改原因：
+        #! tools/train.py 中的 EvalHook 会调用 mmdet.apis.single_gpu_test。
+        #! single_gpu_test 期望模型每个 batch 的测试输出是 list，
+        #! list 中每个元素对应 batch 内一个样本的预测/评估结果。
+        #! 如果这里直接返回 dict，single_gpu_test 内部访问 result[0] 时
+        #! 会把 0 当成 dict key，从而触发 KeyError: 0。
+        #!
+        #! 当前 Drive-OccWorld / SemanticKITTI 评估默认只支持 bs=1，
+        #! 因此把单样本 test_output 包成 [test_output]。这样 EvalHook
+        #! 后续 results.extend(result) 得到 list[dict]，再交给
+        #! SemanticKITTIWorldDataset.evaluate() 汇总 hist_for_iou / mIoU /
+        #! binary IoU。
+        return [test_output]
 
 
 
