@@ -88,4 +88,14 @@ class CustomDistEvalHook(BaseDistEvalHook):
 
             if self.save_best:
                 self._save_ckpt(runner, key_score)
+
+        #! 修复原因：
+        #! 分布式评估时，custom_multi_gpu_test() 返回后只有 rank0 会继续执行
+        #! dataset.evaluate()、打印表格和写 logger；其他 rank 会更早返回并可能进入
+        #! 下一轮训练。若 rank0 仍在评估/写日志，而其他 rank 已经开始新的 DDP
+        #! forward/backward，容易造成各 rank collective 调用顺序不一致，从而表现为
+        #! “评估指标已打印，但训练长时间停住不继续”。
+        #! 这里在评估 hook 末尾同步所有 rank，确保 rank0 完成评估日志后，
+        #! 全部进程再一起进入下一个 epoch/iter。
+        dist.barrier()
   
