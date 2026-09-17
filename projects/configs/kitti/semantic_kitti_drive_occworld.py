@@ -45,9 +45,9 @@ ann_root = "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/data/semantic_
 # - learning_rate: AdamW 基础学习率；img_backbone 会在 optimizer.paramwise_cfg
 #   中乘以 lr_mult=0.1。
 samples_per_gpu = 1
-workers_per_gpu = 2
+workers_per_gpu = 4
 max_epochs = 24
-log_interval = 1
+log_interval = 50
 eval_interval = 1
 checkpoint_interval = 1
 max_keep_ckpts = 1
@@ -150,8 +150,8 @@ _dim_ = 256
 _pos_dim_ = _dim_ // 2
 _ffn_dim_ = _dim_ * 2
 _num_levels_ = 4
-future_decoder_layer_num = 1
-bevformer_encoder_layer_num = 3
+future_decoder_layer_num = 3
+bevformer_encoder_layer_num = 6
 
 # WorldHeadV1.forward_head 会输出当前帧 + future_queue_length 帧的 occupancy。
 frame_loss_weight = [[1] for _ in range(future_queue_length + 1)]
@@ -490,7 +490,7 @@ optimizer_config = dict(
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=100,
+    warmup_iters=500,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
     by_epoch=True)
