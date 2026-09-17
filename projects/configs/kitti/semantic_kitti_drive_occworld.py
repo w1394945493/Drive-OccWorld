@@ -388,6 +388,7 @@ semantic_kitti_train_dataset = dict(
     img_norm_cfg=img_norm_cfg,
     pad_shape=pad_shape,
     size_divisor=size_divisor,
+    empty_idx=empty_idx,
     #* 正式接入 tools/train.py 时打开 DataContainer 格式：
     #* - 只返回 Drive_OccWorld.forward_train 接收的字段；
     #* - 保持 img_metas / segmentation 的特殊 list 结构，避免默认 collate 破坏。
@@ -410,6 +411,7 @@ semantic_kitti_val_dataset = dict(
     img_norm_cfg=img_norm_cfg,
     pad_shape=pad_shape,
     size_divisor=size_divisor,
+    empty_idx=empty_idx,
     format_for_train=True,
     test_mode=True,
 )

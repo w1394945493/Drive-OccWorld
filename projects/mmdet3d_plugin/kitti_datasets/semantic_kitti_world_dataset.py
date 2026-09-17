@@ -4,6 +4,7 @@ import pickle
 
 import mmcv
 import numpy as np
+from prettytable import PrettyTable
 from mmdet.datasets.builder import DATASETS
 from mmdet.datasets.pipelines import Compose
 import torch
@@ -78,6 +79,7 @@ class SemanticKITTIWorldDataset(Dataset):
                  img_norm_cfg=None,
                  pad_shape=(384, 1248),
                  size_divisor=32,
+                 empty_idx=0,
                  format_for_train=False,
                  test_mode=False):
         super().__init__()
@@ -111,6 +113,7 @@ class SemanticKITTIWorldDataset(Dataset):
         self.img_norm_cfg = img_norm_cfg
         self.pad_shape = tuple(pad_shape) if pad_shape is not None else None
         self.size_divisor = size_divisor
+        self.empty_idx = int(empty_idx)
         #* format_for_train=True 时，Dataset 会把输出包装成 MMDetection/MMCV
         #* train.py 期望的 DataContainer 格式，只保留 Drive_OccWorld.forward_train
         #* 真正接收的字段；False 时保留完整调试字段，方便脚本直接检查样本内容。
@@ -652,6 +655,289 @@ class SemanticKITTIWorldDataset(Dataset):
         )
         return formatted
 
-    def evaluate(self, results, **kwargs):
-        """Placeholder for compatibility with MMDetection dataset API."""
-        return {}
+    @staticmethod
+    def _as_numpy_hist(hist):
+        """Convert one confusion matrix-like result to numpy array."""
+        if torch.is_tensor(hist):
+            hist = hist.detach().cpu().numpy()
+        return np.asarray(hist, dtype=np.float64)
+
+    @classmethod
+    def _collect_result_values(cls, results, key):
+        """Collect ``key`` values from MMDet eval outputs.
+
+        Drive_OccWorld.forward_test() returns a dict for each sample:
+            {
+              'hist_for_iou': ...,
+              'hist_for_iou_current': ...,
+              'hist_for_iou_future': ...,
+              ...
+            }
+
+        Depending on the eval hook / test API, Dataset.evaluate() may receive:
+          1. list[dict]: standard MMDet single_gpu_test style；
+          2. dict[list]: some custom hooks may pre-aggregate by key。
+
+        This helper normalizes both forms into list[value].
+        """
+        if results is None:
+            return []
+        if isinstance(results, dict):
+            value = results.get(key, [])
+            return value if isinstance(value, list) else [value]
+        if isinstance(results, (list, tuple)):
+            values = []
+            for item in results:
+                if isinstance(item, dict) and key in item:
+                    values.append(item[key])
+            return values
+        return []
+
+    @classmethod
+    def _sum_histograms(cls, hist_values):
+        """Sum confusion matrices while skipping invalid placeholders."""
+        hist_sum = None
+        for hist in hist_values:
+            # Drive_OccWorld.forward_test() 的 only_generate_dataset 分支可能返回 0。
+            if hist is None:
+                continue
+            if np.isscalar(hist):
+                continue
+            hist_np = cls._as_numpy_hist(hist)
+            if hist_np.ndim != 2:
+                continue
+            hist_sum = hist_np if hist_sum is None else hist_sum + hist_np
+        return hist_sum
+
+    @staticmethod
+    def _hist_to_ious(hist):
+        """Convert confusion matrix to per-class IoU.
+
+        hist[gt, pred] is produced by Drive_OccWorld.fast_hist().
+        For class c:
+            TP    = hist[c, c]
+            gt    = hist[c, :].sum()
+            pred  = hist[:, c].sum()
+            union = pred + gt - TP
+
+        #* 这里实现的是“每一类 IoU / per-class IoU”。
+        对每个类别 c 单独计算：
+
+            IoU_c = intersection_c / union_c
+                  = TP_c / (Pred_c + GT_c - TP_c)
+
+        返回的 ious 是长度为 num_classes 的数组，例如 SemanticKITTI 下：
+
+            ious[0] -> empty 类 IoU
+            ious[1] -> car 类 IoU
+            ...
+            ious[19] -> traffic-sign 类 IoU
+
+        #! 注意：这里还没有计算 mIoU；mIoU 是在 _format_iou_table()
+        #! 中对这些 per-class IoU 再求平均得到的。
+        """
+        num_classes = hist.shape[0]
+        ious = np.full((num_classes,), np.nan, dtype=np.float64)
+        for cls_idx in range(num_classes):
+            # 当前类别预测正确的 voxel 数，即 intersection。
+            tp = hist[cls_idx, cls_idx]
+            # 当前类别在 GT 中真实存在的 voxel 总数。
+            gt = hist[cls_idx, :].sum()
+            # 当前类别被模型预测出来的 voxel 总数。
+            pred = hist[:, cls_idx].sum()
+            # IoU 分母：预测集合 ∪ GT 集合。
+            union = pred + gt - tp
+            if union > 0:
+                #* per-class IoU 计算位置。
+                ious[cls_idx] = tp / union
+        return ious
+
+    def _format_iou_table(self, ious, title):
+        """Build pretty table and metric dict for SemanticKITTI IoU.
+
+        #* 这里负责两件事：
+        #* 1. 把 _hist_to_ious() 得到的每类 IoU 写入日志表格和 metric_dict；
+        #* 2. 计算 mIoU，也就是对多个类别 IoU 求平均。
+
+        当前 mIoU 的定义：
+
+            mIoU = mean(IoU_c for c in non-empty classes with valid union)
+
+        也就是默认不把 empty/free space 类计入 SemanticKITTI 语义 mIoU。
+        这样可以避免 empty 类占比过大导致指标虚高。
+        """
+        table = PrettyTable()
+        table.field_names = ['class_id', 'class', 'IoU']
+
+        metric_dict = {}
+        # valid_non_empty 收集所有“非 empty 且有效”的类别 IoU，
+        # 后面会对它求平均得到 mIoU。
+        valid_non_empty = []
+        for cls_idx, cls_name in enumerate(self.CLASSES):
+            if cls_idx >= len(ious):
+                break
+            iou = ious[cls_idx]
+            iou_value = float(iou) if np.isfinite(iou) else np.nan
+            #* 每类 IoU 日志表格输出位置。
+            table.add_row([
+                cls_idx,
+                cls_name,
+                'nan' if np.isnan(iou_value) else round(iou_value, 4)
+            ])
+            #* 每类 IoU 指标写入位置，例如 current/IoU_car。
+            metric_dict[f'{title}/IoU_{cls_name}'] = iou_value
+            # SemanticKITTI mIoU 通常不把 empty/free 类计入语义 mIoU。
+            if cls_idx != self.empty_idx and np.isfinite(iou_value):
+                valid_non_empty.append(iou_value)
+
+        if valid_non_empty:
+            #* mIoU 计算位置：对非 empty 类别的 per-class IoU 求平均。
+            miou = float(np.mean(valid_non_empty))
+        else:
+            miou = np.nan
+        #* mIoU 日志表格输出位置。
+        table.add_row(['-', 'mIoU(non-empty)', 'nan' if np.isnan(miou) else round(miou, 4)])
+        #* mIoU 指标写入位置，例如 current/mIoU、future/mIoU。
+        metric_dict[f'{title}/mIoU'] = miou
+
+        # empty 类 IoU 仍单独记录，方便观察 free-space/empty 预测是否异常；
+        # 但它不参与上面的 mIoU。
+        if len(ious) > self.empty_idx and np.isfinite(ious[self.empty_idx]):
+            metric_dict[f'{title}/IoU_empty'] = float(ious[self.empty_idx])
+        return table, metric_dict
+
+    def _semantic_hist_to_binary_hist(self, hist):
+        """Merge semantic confusion matrix into binary empty/occupied matrix.
+
+        #* 这里实现“二值占据 IoU”所需的 confusion matrix 合并。
+        SemanticKITTI 语义 hist 是 num_classes x num_classes，其中：
+          - empty_idx 表示 empty/free space；
+          - 其他所有类别都表示 occupied。
+
+        合并后 binary_hist 的类别定义为：
+          - 0: empty/free；
+          - 1: occupied，即所有非 empty 语义类别的并集。
+
+        注意 hist 的行列约定来自 Drive_OccWorld.fast_hist()：
+            hist[gt, pred]
+
+        因此：
+          binary_hist[0, 0] = GT empty 且 Pred empty；
+          binary_hist[0, 1] = GT empty 但 Pred occupied；
+          binary_hist[1, 0] = GT occupied 但 Pred empty；
+          binary_hist[1, 1] = GT occupied 且 Pred occupied。
+        """
+        num_classes = hist.shape[0]
+        empty = int(self.empty_idx)
+        occupied_indices = [
+            cls_idx for cls_idx in range(num_classes)
+            if cls_idx != empty
+        ]
+
+        binary_hist = np.zeros((2, 2), dtype=np.float64)
+        binary_hist[0, 0] = hist[empty, empty]
+        binary_hist[0, 1] = hist[empty, occupied_indices].sum()
+        binary_hist[1, 0] = hist[occupied_indices, empty].sum()
+        binary_hist[1, 1] = hist[np.ix_(occupied_indices, occupied_indices)].sum()
+        return binary_hist
+
+    @staticmethod
+    def _format_binary_iou_table(binary_ious, title):
+        """Build table and metric dict for binary empty/occupied IoU.
+
+        #* 这里实现“空/非空占据预测”的指标输出。
+        binary_ious[0] 是 empty/free IoU；
+        binary_ious[1] 是 occupied IoU；
+        binary_mIoU 是二者平均值。
+        """
+        table = PrettyTable()
+        table.field_names = ['binary_class_id', 'binary_class', 'IoU']
+
+        class_names = ['empty', 'occupied']
+        metric_dict = {}
+        valid_ious = []
+        for cls_idx, cls_name in enumerate(class_names):
+            iou = binary_ious[cls_idx]
+            iou_value = float(iou) if np.isfinite(iou) else np.nan
+            table.add_row([
+                cls_idx,
+                cls_name,
+                'nan' if np.isnan(iou_value) else round(iou_value, 4)
+            ])
+            metric_dict[f'{title}/binary_IoU_{cls_name}'] = iou_value
+            if np.isfinite(iou_value):
+                valid_ious.append(iou_value)
+
+        binary_miou = float(np.mean(valid_ious)) if valid_ious else np.nan
+        table.add_row([
+            '-',
+            'binary_mIoU(empty+occupied)',
+            'nan' if np.isnan(binary_miou) else round(binary_miou, 4)
+        ])
+        metric_dict[f'{title}/binary_mIoU'] = binary_miou
+        return table, metric_dict
+
+    def evaluate(self, results, logger=None, **kwargs):
+        """Evaluate current/future occupancy IoU and mIoU.
+
+        #* 对齐 nuScenesWorldDatasetTemplateOffline.evaluate() 的评估入口。
+        Drive_OccWorld.forward_test() 已经在模型侧把预测 occupancy 与 GT
+        occupancy 转成 confusion matrix：
+          - hist_for_iou: 当前帧 + 未来帧整体；
+          - hist_for_iou_current: 当前参考帧；
+          - hist_for_iou_future: 未来帧；
+          - hist_for_iou_future_time_weighting: 未来帧按时间衰减加权。
+
+        这里负责跨样本累加 confusion matrix，并输出 SemanticKITTI 20 类
+        per-class IoU 和不含 empty 类的 mIoU。
+
+        #* 整体流程：
+        #* 1. _collect_result_values(): 从 EvalHook 收集每个样本的 hist；
+        #* 2. _sum_histograms(): 跨样本累加 confusion matrix；
+        #* 3. _hist_to_ious(): 根据累计 confusion matrix 计算每一类 IoU；
+        #* 4. _format_iou_table(): 打印每类 IoU，并计算/记录 mIoU。
+        #* 5. _semantic_hist_to_binary_hist(): 把所有非 empty 类合并成
+        #*    occupied，额外评估 empty / occupied 二值占据 IoU。
+        """
+        eval_results = {}
+        eval_items = [
+            ('hist_for_iou', 'current_future', '当前帧 + 未来帧'),
+            ('hist_for_iou_current', 'current', '当前帧'),
+            ('hist_for_iou_future', 'future', '未来帧'),
+            ('hist_for_iou_future_time_weighting',
+             'future_time_weighting', '未来帧 time-weighting'),
+        ]
+
+        for result_key, metric_prefix, readable_name in eval_items:
+            hist_values = self._collect_result_values(results, result_key)
+            hist_sum = self._sum_histograms(hist_values)
+            if hist_sum is None:
+                continue
+
+            ious = self._hist_to_ious(hist_sum)
+            table, metric_dict = self._format_iou_table(ious, metric_prefix)
+            eval_results.update(metric_dict)
+
+            #* 额外计算二值占据 IoU：empty vs occupied。
+            # 这回答的是“哪里被占据”是否预测正确，不关心 occupied
+            # 体素具体属于 car/road/building 等哪个语义类别。
+            binary_hist = self._semantic_hist_to_binary_hist(hist_sum)
+            binary_ious = self._hist_to_ious(binary_hist)
+            binary_table, binary_metric_dict = self._format_binary_iou_table(
+                binary_ious, metric_prefix)
+            eval_results.update(binary_metric_dict)
+
+            if logger is not None:
+                logger.info(
+                    f'SemanticKITTI occupancy IoU evaluation: {readable_name}')
+                logger.info('\n' + table.get_string())
+                logger.info(
+                    f'SemanticKITTI binary occupancy IoU evaluation: {readable_name}')
+                logger.info('\n' + binary_table.get_string())
+            else:
+                print(f'\nSemanticKITTI occupancy IoU evaluation: {readable_name}')
+                print(table)
+                print(f'\nSemanticKITTI binary occupancy IoU evaluation: {readable_name}')
+                print(binary_table)
+
+        return eval_results
