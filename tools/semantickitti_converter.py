@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build a small Drive-OccWorld-light style PKL for SemanticKITTI.
+"""Build a Drive-OccWorld-light style PKL for SemanticKITTI.
 
 第一阶段目标：
     基于 SemanticKITTI 构建「单目图像 -> BEV -> future occupancy forecasting」
-    的轻量数据入口。该脚本只负责生成一个 sequence 中 N 帧的小样本 PKL，
+    的轻量数据入口。该脚本默认生成完整 train/val 风格 PKL，
     用来验证数据字段、相机标定、ego pose、occupancy 路径是否可用。
 
 与 nuScenes Drive-OccWorld 原始数据的区别：
@@ -41,6 +41,13 @@ from tqdm import tqdm
 
 DEFAULT_DATA_ROOT = '/c20250502/wangyushen/Datasets/kitti/semantickitti/dataset'
 
+SEMANTIC_KITTI_SPLITS = {
+    # SemanticKITTI 常用划分：00-07/09/10 训练，08 验证。
+    # test 序列通常没有公开语义/occupancy GT；第一阶段只生成 train/val。
+    'train': ['00', '01', '02', '03', '04', '05', '06', '07', '09', '10'],
+    'val': ['08'],
+}
+
 
 def resolve_ann_file(data_root):
     """由数据集根目录确定 FoundationSSC dense occupancy 根目录。
@@ -59,21 +66,15 @@ def resolve_ann_file(data_root):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Build a small SemanticKITTI Drive-OccWorld style PKL.')
+        description='Build SemanticKITTI Drive-OccWorld-light train/val PKLs.')
     parser.add_argument('--data-root', default=DEFAULT_DATA_ROOT,
                         help='SemanticKITTI root, usually ending with /dataset')
-    parser.add_argument('--sequence', default='00',
-                        help='SemanticKITTI sequence id, e.g. 00')
-    parser.add_argument('--frame-idx', type=int, default=0,
-                        help='start index in the available occupancy token list')
-    parser.add_argument('--num-frames', type=int, default=8,
-                        help='number of consecutive available occupancy frames to dump')
-    parser.add_argument('--all-frames', action='store_true',
-                        help='dump all available occupancy frames in the sequence')
     parser.add_argument('--cmd-thresh', type=float, default=2.0,
                         help='lateral threshold for pseudo left/right/forward command')
-    parser.add_argument('--out-pkl', required=True,
-                        help='output PKL path')
+    parser.add_argument('--out-dir', required=True,
+                        help=('directory to save generated PKLs. The script writes '
+                              'semantickitti_infos_train.pkl and '
+                              'semantickitti_infos_val.pkl under this directory.'))
     parser.add_argument('--check-files', action='store_true',
                         help='check image / occupancy files exist; may be slower on network FS')
     return parser.parse_args()
@@ -341,28 +342,35 @@ def build_frame_info_from_cache(
         check_files=False):
     """Build one Drive-OccWorld-light SemanticKITTI frame info."""
     sequence_dir = osp.join(data_root, 'sequences', sequence)
-    token = tokens[frame_idx]
+    raw_token = tokens[frame_idx]
+    # SemanticKITTI 的帧号在不同 sequence 间会重复，例如 00/000000 和
+    # 01/000000。完整 train pkl 合并多个 sequence 后，为了和 nuScenes
+    # “token 全局唯一”的用法接近，这里把 pkl 内 token 写成 sequence_frameid。
+    # 具体文件路径仍然使用 raw_token。
+    token = f'{sequence}_{raw_token}'
     pose_idx = token_pose_indices[frame_idx]
     if pose_idx >= len(poses_lidar):
         raise IndexError(
-            f'token {token} maps to pose index {pose_idx}, '
+            f'token {raw_token} maps to pose index {pose_idx}, '
             f'but poses.txt has only {len(poses_lidar)} lines.')
 
-    #* prev/next 只表示排序后 tokens 列表里的前后相邻帧。
+    #* prev/next 只表示排序后 tokens 列表里的前后相邻 occupancy 标注帧。
     # 例如 tokens = ['000000', '000001', '000002'] 时：
-    #   frame_idx=1 -> prev='000000', next='000002'。
+    #   frame_idx=1 -> prev='00_000000', next='00_000002'。
     # 边界帧没有前/后相邻帧时，用空字符串 '' 占位，和 nuScenes pkl 风格接近。
-    prev_token = tokens[frame_idx - 1] if frame_idx > 0 else ''
-    next_token = tokens[frame_idx + 1] if frame_idx + 1 < len(tokens) else ''
+    prev_token = f'{sequence}_{tokens[frame_idx - 1]}' if frame_idx > 0 else ''
+    next_token = (
+        f'{sequence}_{tokens[frame_idx + 1]}'
+        if frame_idx + 1 < len(tokens) else '')
     scene_name = f'sequence-{sequence}'
     pose = poses_lidar[pose_idx]
     cam_front_left = build_cam_info(
-        sequence_dir, token, calib,
+        sequence_dir, raw_token, calib,
         image_dir='image_2',
         proj_key='P2',
         cam_type='CAM_FRONT_LEFT')
     cam_front_right = build_cam_info(
-        sequence_dir, token, calib,
+        sequence_dir, raw_token, calib,
         image_dir='image_3',
         proj_key='P3',
         cam_type='CAM_FRONT_RIGHT')
@@ -371,7 +379,7 @@ def build_frame_info_from_cache(
         'CAM_FRONT_RIGHT': cam_front_right,
     }
 
-    occ_path = osp.join(ann_file, sequence, f'{token}_1_1.npy')
+    occ_path = osp.join(ann_file, sequence, f'{raw_token}_1_1.npy')
 
     if check_files:
         for cam_name, cam_info in cams.items():
@@ -409,7 +417,7 @@ def build_frame_info_from_cache(
 
     return {
         #* ================== 1. 基础时序字段 ==================
-        'token': token,                         # str，当前帧 id，例如 '000000'
+        'token': token,                         # str，全局唯一帧 id，例如 '00_000000'
         'scene_token': scene_name,              # str，场景/序列 id，这里为 'sequence-00' 等
         'scene_name': scene_name,               # str，场景/序列名；和 scene_token 保持一致
         'location': 'semantickitti',            # str，占位地图名；nuScenes 中对应 boston/singapore 等
@@ -437,7 +445,7 @@ def build_frame_info_from_cache(
 
         #* ================== 3. occupancy 标签路径 ==================
         'occ_path': occ_path,                                         # str，dense occupancy 标签 .npy 路径
-        'lidar_path': osp.join(sequence_dir, 'velodyne', f'{token}.bin'),  # str，原始 LiDAR bin 路径
+        'lidar_path': osp.join(sequence_dir, 'velodyne', f'{raw_token}.bin'),  # str，原始 LiDAR bin 路径
 
         #* ================== 4. ego/LiDAR 位姿 ==================
         # 第一阶段把 LiDAR 坐标系直接作为 ego 坐标系。
@@ -480,13 +488,9 @@ def print_summary(infos):
           f"value={np.asarray(info['command']).tolist()}  # 0=Right, 1=Left, 2=Forward")
 
 
-def main():
-    args = parse_args()
-
-    data_root = osp.abspath(args.data_root)
-    sequence = args.sequence
+def build_sequence_infos(data_root, ann_file, sequence, args):
+    """Build all frame infos with occupancy labels for one SemanticKITTI sequence."""
     sequence_dir = osp.join(data_root, 'sequences', sequence)
-    ann_file = resolve_ann_file(data_root)
     if not osp.isdir(sequence_dir):
         raise FileNotFoundError(f'Missing sequence directory: {sequence_dir}')
 
@@ -495,19 +499,11 @@ def main():
     poses_lidar = load_lidar_poses(data_root, sequence, calib)
     token_pose_indices = [token_to_pose_index(token) for token in tokens]
 
-    if args.num_frames <= 0:
-        raise ValueError(f'num_frames must be positive, got {args.num_frames}')
-    start = args.frame_idx
-    end = start + args.num_frames
-    if start < 0 or start >= len(tokens):
-        raise IndexError(f'frame_idx={start} out of range [0, {len(tokens) - 1}]')
-    if end > len(tokens):
-        raise IndexError(
-            f'Requested [{start}, {end}) exceeds token length {len(tokens)}.')
-
+    start = 0
+    end = len(tokens)
     print(f'Loaded sequence-{sequence}: {len(tokens)} occupancy tokens, '
           f'{len(poses_lidar)} poses.')
-    print(f'Build small window: token-list index [{start}, {end}).')
+    print(f'Build full sequence-{sequence}: token-list index [{start}, {end}).')
 
     infos = []
     for frame_idx in tqdm(
@@ -525,25 +521,58 @@ def main():
             frame_idx=frame_idx,
             cmd_thresh=args.cmd_thresh,
             check_files=args.check_files))
+    return infos, {
+        'sequence': sequence,
+        'start_frame_idx': int(start),
+        'num_frames': int(len(infos)),
+        'total_occupancy_tokens': int(len(tokens)),
+    }
 
-    data = {
+
+def build_split_data(data_root, ann_file, split, args):
+    """Build pkl data dict for one split."""
+    sequences = SEMANTIC_KITTI_SPLITS[split]
+    print(f'\nBuild SemanticKITTI split={split}: {sequences}')
+    infos = []
+    sequence_summaries = []
+    for sequence in sequences:
+        seq_infos, seq_summary = build_sequence_infos(
+            data_root=data_root,
+            ann_file=ann_file,
+            sequence=sequence,
+            args=args)
+        infos.extend(seq_infos)
+        sequence_summaries.append(seq_summary)
+
+    return {
         'infos': infos,
         'metadata': {
             'data_root': data_root,
             'ann_file': ann_file,
-            'sequence': sequence,
-            'start_frame_idx': int(start),
+            'split': split,
+            'sequences': sequences,
+            'sequence_summaries': sequence_summaries,
             'num_frames': int(len(infos)),
         },
     }
 
-    out_pkl = osp.abspath(args.out_pkl)
-    os.makedirs(osp.dirname(out_pkl), exist_ok=True)
-    with open(out_pkl, 'wb') as f:
-        pickle.dump(data, f)
 
-    print_summary(infos)
-    print(f'Wrote PKL to: {out_pkl}')
+def main():
+    args = parse_args()
+
+    data_root = osp.abspath(args.data_root)
+    ann_file = resolve_ann_file(data_root)
+    out_dir = osp.abspath(args.out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    for split in ['train', 'val']:
+        data = build_split_data(data_root, ann_file, split, args)
+        out_pkl = osp.join(out_dir, f'semantickitti_infos_{split}.pkl')
+        with open(out_pkl, 'wb') as f:
+            pickle.dump(data, f)
+
+        print_summary(data['infos'])
+        print(f'Wrote {split} PKL to: {out_pkl}')
 
 
 if __name__ == '__main__':
