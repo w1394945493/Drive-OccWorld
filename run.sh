@@ -37,11 +37,45 @@ python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/test.py \
 
 # ========================================================#
 python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/semantickitti_converter.py \
-    --out-dir /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/out/semantic_kitti
+    --out-dir /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/data/semantic_kitti
 
 python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/compare_semkitti_nuscenes_pkl.py \
     --semkitti-pkl /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/out/semantic_kitti/semantickitti_infos_train.pkl
 
 python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/scripts/test_semantic_kitti_world_dataset.py
 
-python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/scripts/test_semantic_kitti_drive_occworld_forward.py
+python scripts/test_semantic_kitti_drive_occworld_forward.py \
+  --config projects/configs/kitti/semantic_kitti_drive_occworld.py \
+  --index 0 \
+  --train-iters 100
+
+
+CUDA_VISIBLE_DEVICES=4 \
+PYTHONPATH="$(pwd)" \
+python tools/train.py \
+  projects/configs/kitti/semantic_kitti_drive_occworld.py \
+  --work-dir out/semantic_kitti_drive_occworld_epoch_debug \
+  --cfg-options \
+  total_epochs=2 \
+  runner.max_epochs=2 \
+  data.train.max_samples=20 \
+  data.val.max_samples=5 \
+  data.workers_per_gpu=0 \
+  checkpoint_config.interval=1 \
+  evaluation.interval=1
+
+CUDA_VISIBLE_DEVICES=0,1 \
+PYTHONPATH="$(pwd)" \
+torchrun --nproc_per_node=2 --master_port=29501 \
+  tools/train.py \
+  projects/configs/kitti/semantic_kitti_drive_occworld.py \
+  --launcher pytorch \
+  --work-dir out/semantic_kitti_drive_occworld_epoch_debug_ddp \
+  --cfg-options \
+  total_epochs=4 \
+  runner.max_epochs=4 \
+  data.train.max_samples=20 \
+  data.val.max_samples=10 \
+  data.workers_per_gpu=0 \
+  checkpoint_config.interval=1 \
+  evaluation.interval=1

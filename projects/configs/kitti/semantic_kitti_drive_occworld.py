@@ -30,9 +30,9 @@ plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 
 data_root = '/c20250502/wangyushen/Datasets/kitti/semantickitti/dataset'
-ann_root = 'out/semantic_kitti'
+ann_root = "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/data/semantic_kitti"
 
-#* ================== 快速调试样本数开关 ==================
+# * ================== 快速调试样本数开关 ==================
 # 默认 None 表示使用完整 train/val split。
 # 调试 EvalHook 是否能跑通时，可以命令行覆盖：
 #   --cfg-options data.val.max_samples=20
@@ -41,20 +41,20 @@ ann_root = 'out/semantic_kitti'
 train_max_samples = None
 val_max_samples = None
 
-#* ================== Stage-1 时序窗口配置 ==================
+# * ================== Stage-1 时序窗口配置 ==================
 # 对齐 Drive-OccWorld 第一阶段：
 # - history_queue_length: 输入历史帧数量；
 # - future_queue_length : 需要加载的未来 occupancy 标注数量。
 history_queue_length = 2
 future_queue_length = 4
 
-#* ================== 相机输入模式 ==================
+# * ================== 相机输入模式 ==================
 # 可选：
 # - left:   只使用 image_2 / CAM_FRONT_LEFT，推荐作为单目 baseline；
 # - stereo: 使用 image_2 + image_3 双目前视图像。
 use_camera = 'left'
 
-#* ================== 图像预处理配置 ==================
+# * ================== 图像预处理配置 ==================
 # 当前 SemanticKITTI 原图常见大小为 376x1241。
 # 第一阶段先不做 resize/crop/flip，只 pad 到 384x1248：
 # - 384 和 1248 都能被 32 整除，适合 CNN/FPN；
@@ -71,7 +71,7 @@ img_norm_cfg = dict(
     to_rgb=False,
 )
 
-#* ================== SemanticKITTI occupancy / BEV 配置 ==================
+# * ================== SemanticKITTI occupancy / BEV 配置 ==================
 # SemanticKITTI dense occupancy 标签当前 shape 为 [256, 256, 32]，255 为 ignore。
 # 第一阶段为了减少额外 resize/remap，先让 BEV 网格与 occupancy 的 H/W 对齐。
 point_cloud_range = [0.0, -25.6, -2.0, 51.2, 25.6, 4.4]
@@ -112,7 +112,7 @@ semantic_kitti_class_names = [
 num_cls = len(semantic_kitti_class_names)
 empty_idx = 0
 
-#* ================== Drive-OccWorld 模型配置 ==================
+# * ================== Drive-OccWorld 模型配置 ==================
 # 目标是逐步跑通 SemanticKITTI 上的完整 Drive-OccWorld 流程。
 # 当前阶段先采用较小模型参数，便于定位数据/forward/loss 链路问题；
 # 后续确认链路稳定后，可继续扩大 backbone、embed_dims 和 transformer 层数。
@@ -438,7 +438,7 @@ data = dict(
     val=semantic_kitti_val_dataset,
 )
 
-#* ================== 正式 train.py 运行配置 ==================
+# * ================== 正式 train.py 运行配置 ==================
 # 当前仍是 SemanticKITTI 第一阶段 default 配置：
 # - 单卡 samples_per_gpu=1；
 # - 内部 BEV 分辨率 128x128x16；
@@ -492,7 +492,7 @@ evaluation = dict(interval=1)
 workflow = [('train', 1)]
 find_unused_parameters = False
 cudnn_benchmark = True
-#* 加载与 ResNet101 + DCNv2 对应的 FCOS3D 预训练权重。
+# * 加载与 ResNet101 + DCNv2 对应的 FCOS3D 预训练权重。
 # 该路径参照原 Drive-OccWorld fine-grained with planning 配置。
 # 如果环境中该文件不存在，可在启动训练时用
 #   --cfg-options load_from=None
