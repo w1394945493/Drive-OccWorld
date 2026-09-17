@@ -21,6 +21,7 @@ import sys
 import numpy as np
 from mmcv import Config
 from mmdet.datasets import build_dataset
+from torch.utils.data import DataLoader
 
 
 def parse_args():
@@ -40,6 +41,16 @@ def parse_args():
         type=int,
         default=0,
         help='过滤无效边界样本后的 dataset index。')
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=1,
+        help='DataLoader 调试使用的 batch size；当前建议先保持 1。')
+    parser.add_argument(
+        '--num-workers',
+        type=int,
+        default=0,
+        help='DataLoader 调试使用的 worker 数量。')
     return parser.parse_args()
 
 
@@ -76,6 +87,86 @@ def summarize_frame_input(frame_input, prefix):
     print(f"  lidar2img 数量: {len(lidar2img)}")
     if lidar2img:
         print(f"    lidar2img[0] shape: {np.asarray(lidar2img[0]).shape}")
+
+
+def semantic_kitti_debug_collate(batch):
+    """SemanticKITTIWorldDataset 的轻量调试 collate。
+
+    目的：
+        先确认 batch_size=1 时 DataLoader 能正常取数，并把模型最关心的
+        img / segmentation 加上 batch 维。
+
+    说明：
+        这里不是最终训练用 collate。真正接入 MMDet 训练时，可以继续改成
+        DataContainer / mmcv.parallel.collate 风格。当前阶段先保留最直观结构：
+          - img: np.ndarray, [B, T_input, N_cam, C, H, W]
+          - segmentation: np.ndarray, [B, T_all, H, W, D]
+          - img_metas: list，长度 B，每个元素是该样本的历史+当前 meta list
+    """
+    collated = {}
+    first = batch[0]
+    for key in first.keys():
+        values = [sample[key] for sample in batch]
+        if key in ('img', 'segmentation') and values[0] is not None:
+            collated[key] = np.stack(values, axis=0)
+        else:
+            collated[key] = values
+    return collated
+
+
+def summarize_dataloader_batch(dataset, batch_size=1, num_workers=0):
+    """Run one DataLoader iteration and print collated batch structure."""
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=semantic_kitti_debug_collate)
+    batch = next(iter(dataloader))
+
+    print('\n' + '-' * 100)
+    print('DataLoader batch 检查')
+    print('-' * 100)
+    print(f'batch_size: {batch_size}')
+    print(f'num_workers: {num_workers}')
+    print(f"batch keys: {list(batch.keys())}")
+
+    img = batch.get('img', None)
+    if img is None:
+        print('batch img: None')
+    else:
+        print(
+            f'batch img: shape={img.shape}, dtype={img.dtype} '
+            '[B, T_input, N_cam, C, H, W]')
+
+    segmentation = batch.get('segmentation', None)
+    if segmentation is None:
+        print('batch segmentation: None')
+    else:
+        print(
+            f'batch segmentation: shape={segmentation.shape}, '
+            f'dtype={segmentation.dtype}, min={segmentation.min()}, '
+            f'max={segmentation.max()} [B, T_all, H, W, D]')
+
+    img_metas = batch.get('img_metas', None)
+    if img_metas is None:
+        print('batch img_metas: None')
+    else:
+        print(f'batch img_metas: len={len(img_metas)}，每个元素对应一个样本')
+        if img_metas:
+            print(f'  第 0 个样本 img_metas 帧数: {len(img_metas[0])}')
+            if img_metas[0]:
+                print(f"  第 0 个样本当前帧 token: {img_metas[0][-1].get('token')}")
+                print(
+                    '  第 0 个样本当前帧 ref_lidar_to_cur_lidar shape: '
+                    f"{np.asarray(img_metas[0][-1].get('ref_lidar_to_cur_lidar')).shape}")
+
+    current_token = batch.get('current_token', None)
+    if current_token is not None:
+        print(f'batch current_token: {current_token}')
+    window_tokens = batch.get('window_tokens', None)
+    if window_tokens is not None:
+        print(f'batch window_tokens[0]: {window_tokens[0]}')
 
 
 def main():
@@ -152,6 +243,11 @@ def main():
     summarize_frame_input(
         data['frame_inputs'][dataset.history_queue_length], '当前参考帧 Current frame')
     summarize_frame_input(data['frame_inputs'][-1], '最后未来帧 Last future frame')
+
+    summarize_dataloader_batch(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers)
 
     print('\n检查完成。')
 
