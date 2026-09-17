@@ -55,14 +55,14 @@
         },
         
         {
-            "name": "drive-occworld test offline with planning",
+            "name": "kitti train",
             "type": "debugpy",
             "request": "launch",
-            "program": "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/test.py",
+            "program": "tools/train.py",
             "args": [
-                "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/fine_grained/action_condition_MMO_MSO_custom_offline_with_planning.py",
-                "--eval",
-                "bbox",
+                "projects/configs/kitti/semantic_kitti_drive_occworld_debug.py",
+                "--work-dir",
+                "out/semantic_kitti_drive_occworld_epoch_debug_r50",
             ],
             "env": {
                 "CUDA_VISIBLE_DEVICES": "4",
