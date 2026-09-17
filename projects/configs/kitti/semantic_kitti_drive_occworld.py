@@ -68,9 +68,13 @@ img_norm_cfg = dict(
 point_cloud_range = [0.0, -25.6, -2.0, 51.2, 25.6, 4.4]
 voxel_size = [0.2, 0.2, 0.2]
 occ_size = [256, 256, 32]
-bev_h_ = 256
-bev_w_ = 256
-pred_height = 32
+# bev_h_ = 256
+# bev_w_ = 256
+# pred_height = 32
+bev_h_ = 128
+bev_w_ = 128
+pred_height = 16
+
 
 # SemanticKITTI 常用 20 类编码为 0..19，255 为 ignore。
 # 这里仅用于 num_classes / class_weights 长度；类别名主要帮助阅读配置。
