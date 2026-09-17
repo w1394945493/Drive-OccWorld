@@ -32,6 +32,15 @@ plugin_dir = 'projects/mmdet3d_plugin/'
 data_root = '/c20250502/wangyushen/Datasets/kitti/semantickitti/dataset'
 ann_root = 'out/semantic_kitti'
 
+#* ================== 快速调试样本数开关 ==================
+# 默认 None 表示使用完整 train/val split。
+# 调试 EvalHook 是否能跑通时，可以命令行覆盖：
+#   --cfg-options data.val.max_samples=20
+# 如果想快速 overfit/debug 训练，也可以覆盖：
+#   --cfg-options data.train.max_samples=100
+train_max_samples = None
+val_max_samples = None
+
 #* ================== Stage-1 时序窗口配置 ==================
 # 对齐 Drive-OccWorld 第一阶段：
 # - history_queue_length: 输入历史帧数量；
@@ -389,6 +398,7 @@ semantic_kitti_train_dataset = dict(
     pad_shape=pad_shape,
     size_divisor=size_divisor,
     empty_idx=empty_idx,
+    max_samples=train_max_samples,
     #* 正式接入 tools/train.py 时打开 DataContainer 格式：
     #* - 只返回 Drive_OccWorld.forward_train 接收的字段；
     #* - 保持 img_metas / segmentation 的特殊 list 结构，避免默认 collate 破坏。
@@ -412,6 +422,7 @@ semantic_kitti_val_dataset = dict(
     pad_shape=pad_shape,
     size_divisor=size_divisor,
     empty_idx=empty_idx,
+    max_samples=val_max_samples,
     format_for_train=True,
     test_mode=True,
 )

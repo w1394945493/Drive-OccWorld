@@ -209,6 +209,7 @@ def main():
     print(f'图像 pad_shape: {dataset.pad_shape}')
     print(f'图像 size_divisor: {dataset.size_divisor}')
     print(f'图像归一化 img_norm_cfg: {dataset.img_norm_cfg}')
+    print(f'快速调试 max_samples: {dataset.max_samples}')
     print(f'pkl 原始样本数 raw infos length: {len(dataset.data_infos)}')
     print(f'过滤边界后的有效样本数 valid dataset length: {len(dataset)}')
 

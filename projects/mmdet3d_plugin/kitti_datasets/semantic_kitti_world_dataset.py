@@ -80,6 +80,7 @@ class SemanticKITTIWorldDataset(Dataset):
                  pad_shape=(384, 1248),
                  size_divisor=32,
                  empty_idx=0,
+                 max_samples=None,
                  format_for_train=False,
                  test_mode=False):
         super().__init__()
@@ -114,6 +115,7 @@ class SemanticKITTIWorldDataset(Dataset):
         self.pad_shape = tuple(pad_shape) if pad_shape is not None else None
         self.size_divisor = size_divisor
         self.empty_idx = int(empty_idx)
+        self.max_samples = max_samples
         #* format_for_train=True 时，Dataset 会把输出包装成 MMDetection/MMCV
         #* train.py 期望的 DataContainer 格式，只保留 Drive_OccWorld.forward_train
         #* 真正接收的字段；False 时保留完整调试字段，方便脚本直接检查样本内容。
@@ -139,6 +141,14 @@ class SemanticKITTIWorldDataset(Dataset):
             ]
         else:
             self.valid_indices = list(range(len(self.data_infos)))
+        #* ================== 快速调试/快速评估样本数截断 ==================
+        # max_samples 只截断当前 Dataset 的有效样本列表，不改 pkl，也不影响
+        # prev/next 时序窗口构造。常用于：
+        #   - data.val.max_samples=20：快速测试 EvalHook / evaluate() 是否正常；
+        #   - data.train.max_samples=100：快速 overfit/debug 一小段训练数据。
+        # 默认 None 表示使用完整 split。
+        if self.max_samples is not None:
+            self.valid_indices = self.valid_indices[:int(self.max_samples)]
         #! tools/train.py 在非分布式训练时会使用 mmdet GroupSampler，
         #! 该 sampler 要求 dataset.flag 存在。SemanticKITTI 第一阶段不做
         #! aspect-ratio 分组，统一置 0 即可。
