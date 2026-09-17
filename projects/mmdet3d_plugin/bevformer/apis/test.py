@@ -43,78 +43,6 @@ def custom_encode_mask_results(mask_results):
                         dtype='uint8'))[0])  # encoded with RLE
     return [encoded_mask_results]
 
-# def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
-#     """Test model with multiple gpus.
-#     This method tests model with multiple gpus and collects the results
-#     under two different modes: gpu and cpu modes. By setting 'gpu_collect=True'
-#     it encodes results to gpu tensors and use gpu communication for results
-#     collection. On cpu mode it saves the results on different gpus to 'tmpdir'
-#     and collects them by the rank 0 worker.
-#     Args:
-#         model (nn.Module): Model to be tested.
-#         data_loader (nn.Dataloader): Pytorch data loader.
-#         tmpdir (str): Path of directory to save the temporary results from
-#             different gpus under cpu mode.
-#         gpu_collect (bool): Option to use either gpu or cpu to collect results.
-#     Returns:
-#         list: The prediction results.
-#     """
-#     model.eval()
-#     bbox_results = []
-#     mask_results = []
-#     dataset = data_loader.dataset
-#     rank, world_size = get_dist_info()
-#     if rank == 0:
-#         prog_bar = mmcv.ProgressBar(len(dataset))
-#     time.sleep(2)  # This line can prevent deadlock problem in some cases.
-#     have_mask = False
-#     for i, data in enumerate(data_loader):
-#         with torch.no_grad():
-#             result = model(return_loss=False, rescale=True, **data)
-#             # encode mask results
-#             if isinstance(result, dict):
-#                 if 'bbox_results' in result.keys():
-#                     bbox_result = result['bbox_results']
-#                     batch_size = len(result['bbox_results'])
-#                     bbox_results.extend(bbox_result)
-#                 if 'mask_results' in result.keys() and result['mask_results'] is not None:
-#                     mask_result = custom_encode_mask_results(result['mask_results'])
-#                     mask_results.extend(mask_result)
-#                     have_mask = True
-#             else:
-#                 batch_size = len(result)
-#                 bbox_results.extend(result)
-#             torch.cuda.empty_cache()
-
-#             #if isinstance(result[0], tuple):
-#             #    assert False, 'this code is for instance segmentation, which our code will not utilize.'
-#             #    result = [(bbox_results, encode_mask_results(mask_results))
-#             #              for bbox_results, mask_results in result]
-#         if rank == 0:
-
-#             for _ in range(batch_size * world_size):
-#                 prog_bar.update()
-
-#     # collect results from all ranks
-#     if gpu_collect:
-#         bbox_results = collect_results_gpu(bbox_results, len(dataset))
-#         if have_mask:
-#             mask_results = collect_results_gpu(mask_results, len(dataset))
-#         else:
-#             mask_results = None
-#     else:
-#         bbox_results = collect_results_cpu(bbox_results, len(dataset), tmpdir)
-#         tmpdir = tmpdir+'_mask' if tmpdir is not None else None
-#         if have_mask:
-#             mask_results = collect_results_cpu(mask_results, len(dataset), tmpdir)
-#         else:
-#             mask_results = None
-
-#     if mask_results is None:
-#         return bbox_results
-#     return {'bbox_results': bbox_results, 'mask_results': mask_results}
-
-
 def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, show=False, out_dir=None):
     """Test model with multiple gpus.
     This method tests model with multiple gpus and collects the results
@@ -323,8 +251,19 @@ def collect_results_cpu(result_part, size, tmpdir=None):
             ordered_results.extend(list(res))
         # the dataloader may pad some samples
         ordered_results = ordered_results[:size]
+
         # remove tmp dir
-        shutil.rmtree(tmpdir)
+        # shutil.rmtree(tmpdir)
+        #! 修复原因：
+        #! custom_multi_gpu_test() 会针对多个指标多次调用 collect_results_cpu()
+        #! （hist_for_iou / hist_for_iou_current / hist_for_iou_future / vpq 等）。
+        #! 当 EvalHook 传入固定 tmpdir，例如 work_dir/.eval_hook 时，如果第一次
+        #! collect 后 rank0 立即删除整个 tmpdir，其他 rank 在下一次 collect 中刚写出
+        #! 的 part_*.pkl 可能被异步删除，导致 rank0 读取 part_1.pkl 时报：
+        #! FileNotFoundError: .../.eval_hook/part_1.pkl。
+        #!
+        #! 这里保留 part_*.pkl，不在每个指标收集后删除目录；后续同名文件会被覆盖，
+        #! 文件很小，对磁盘影响可以忽略。若需要清理，可在整轮评估结束后统一清理。
         return ordered_results
 
 
