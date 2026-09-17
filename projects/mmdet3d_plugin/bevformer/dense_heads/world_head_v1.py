@@ -21,6 +21,8 @@ class WorldHeadV1(WorldHeadBase):
                  pred_future_frame_num=0,
                  per_frame_loss_weight=(1.0,),
                  loss_weight_cfg=None,
+                 loss_voxel_align_size=(256, 256, 20),
+                 empty_idx=0,
 
                  *args,
                  **kwargs):
@@ -34,6 +36,18 @@ class WorldHeadV1(WorldHeadBase):
         self.pred_frame_num = 1 + self.pred_history_frame_num + self.pred_future_frame_num
         self.per_frame_loss_weight = per_frame_loss_weight
         assert len(self.per_frame_loss_weight) == self.pred_frame_num
+        #* loss_voxel_align_size 控制 occupancy loss 的监督对齐尺寸。
+        # 默认保持原 Drive-OccWorld 行为：(256, 256, 20)，对应将
+        # nuScenes/OpenOccupancy 高分辨率 512x512x40 标签按 2x2x2
+        # 压缩到 256x256x20 计算 loss。
+        # SemanticKITTI 可在配置中显式设为 (256, 256, 32)，从而在不破坏
+        # 原工作默认设置的前提下，兼容 SemanticKITTI 的标签高度维。
+        self.loss_voxel_align_size = loss_voxel_align_size
+        #* empty_idx 表示 occupancy 标签中的“空体素/自由空间”类别 id。
+        # 默认仍为 0，保持原 Drive-OccWorld / OpenOccupancy 行为；
+        # 但不同数据集的 empty/free 类别 id 可能不同，因此允许通过配置文件覆盖，
+        # 避免在 loss 下采样和 geo_scal_loss 中硬编码 empty_idx=0。
+        self.empty_idx = empty_idx
 
         self.class_weights = np.ones((self.num_classes,))
         self.class_weights[1:] = 5
@@ -191,27 +205,101 @@ class WorldHeadV1(WorldHeadBase):
         else:
             return self.forward_head_layers(next_bev_feats) # multi-decoder_layers
 
+    # 原实现保留如下，便于和 Drive-OccWorld 原代码对照：
+    # def loss_voxel(self, output_voxels, target_voxels, tag):
+    #     #* 对应论文训练损失：CE + semantic/geometric scaling + Lovasz 约束 occupancy semantics/geometries。
+    #     B, C, pH, pW, pD = output_voxels.shape
+    #     tB, tH, tW, tD = target_voxels.shape
+    #
+    #     H, W, D = 256, 256, 20
+    #     # output_voxel align to H,W,D
+    #     if pH != H:
+    #         output_voxels = F.interpolate(output_voxels, size=(H, W, D), mode='trilinear', align_corners=False)
+    #     # target_voxel align to H,W,D
+    #     ratio = tH // H
+    #     if ratio != 1:
+    #         target_voxels = target_voxels.reshape(B, H, ratio, W, ratio, D, ratio).permute(0,1,3,5,2,4,6).reshape(B, H, W, D, ratio**3)
+    #         empty_idx = 0
+    #         empty_mask = target_voxels.sum(-1) == empty_idx    # B,H,W,D
+    #         target_voxels = target_voxels.to(torch.int64)
+    #         occ_space = target_voxels[~empty_mask]
+    #         occ_space[occ_space==0] = -torch.arange(len(occ_space[occ_space==0])).to(occ_space.device) - 1
+    #         target_voxels[~empty_mask] = occ_space
+    #         target_voxels = torch.mode(target_voxels, dim=-1)[0]
+    #         target_voxels[target_voxels<0] = 255
+    #         target_voxels = target_voxels.long()
+    #
+    #     assert torch.isnan(output_voxels).sum().item() == 0
+    #     assert torch.isnan(target_voxels).sum().item() == 0
+    #
+    #     loss_dict = {}
+    #
+    #     loss_dict['loss_voxel_ce_{}'.format(tag)] = self.loss_voxel_ce_weight * CE_ssc_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=255)
+    #
+    #     if self.multi_loss:
+    #         loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = self.loss_voxel_sem_scal_weight * sem_scal_loss(output_voxels, target_voxels, ignore_index=255)
+    #         loss_dict['loss_voxel_lovasz_{}'.format(tag)] = self.loss_voxel_lovasz_weight * lovasz_softmax(torch.softmax(output_voxels, dim=1), target_voxels, ignore=255)
+    #         if self.loss_voxel_geo_scal_weight is not None:
+    #             loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=empty_idx)
+    #
+    #     return loss_dict
+
     def loss_voxel(self, output_voxels, target_voxels, tag):
         #* 对应论文训练损失：CE + semantic/geometric scaling + Lovasz 约束 occupancy semantics/geometries。
+        #* 修复/兼容原因：
+        # 原实现将 loss 对齐尺寸写死为 256x256x20，适合原 nuScenes/OpenOccupancy
+        # 512x512x40 标签按 2x2x2 压缩后的监督尺寸。但 SemanticKITTI 当前标签为
+        # 256x256x32，若继续写死 D=20 会破坏高度维；同时原实现只在 ratio!=1
+        # 分支中定义 empty_idx，当 GT 已经等于监督尺寸时会出现 empty_idx 未定义。
+        #
+        # 因此这里把监督对齐尺寸改为可配置：
+        # - 默认 self.loss_voxel_align_size=(256,256,20)，不破坏原工作；
+        # - SemanticKITTI 配置中可设为 (256,256,32)，对齐其真实标签尺寸。
+        #! empty_idx 也从配置读取，不再硬编码为 0。这样如果某个数据集
+        #! 使用其他类别 id 表示 empty/free space，只需要改配置。
         B, C, pH, pW, pD = output_voxels.shape
         tB, tH, tW, tD = target_voxels.shape
+        assert B == tB
 
-        H, W, D = 256, 256, 20
+        empty_idx = self.empty_idx
+        if self.loss_voxel_align_size is None:
+            H, W, D = tH, tW, tD
+        else:
+            H, W, D = self.loss_voxel_align_size
+
         # output_voxel align to H,W,D
-        if pH != H:
-            output_voxels = F.interpolate(output_voxels, size=(H, W, D), mode='trilinear', align_corners=False)
-        # target_voxel align to H,W,D
-        ratio = tH // H
-        if ratio != 1:
-            target_voxels = target_voxels.reshape(B, H, ratio, W, ratio, D, ratio).permute(0,1,3,5,2,4,6).reshape(B, H, W, D, ratio**3)
-            empty_idx = 0
+        if (pH, pW, pD) != (H, W, D):
+            output_voxels = F.interpolate(
+                output_voxels,
+                size=(H, W, D),
+                mode='trilinear',
+                align_corners=False)
+
+        # target_voxel align to H,W,D.
+        # 原逻辑只支持等比例整数倍压缩，例如 512x512x40 -> 256x256x20。
+        # 若未来设置非整数比例尺寸，应先显式实现新的重采样策略，避免静默错误。
+        if (tH, tW, tD) != (H, W, D):
+            assert tH % H == 0 and tW % W == 0 and tD % D == 0, (
+                f'target shape {(tH, tW, tD)} must be integer multiples of '
+                f'loss_voxel_align_size {(H, W, D)}')
+            ratio_h, ratio_w, ratio_d = tH // H, tW // W, tD // D
+            assert ratio_h == ratio_w == ratio_d, (
+                'Only isotropic downsample is supported by the original '
+                f'voxel compression logic, got ratios {(ratio_h, ratio_w, ratio_d)}')
+            ratio = ratio_h
+            target_voxels = target_voxels.reshape(
+                B, H, ratio, W, ratio, D, ratio
+            ).permute(0, 1, 3, 5, 2, 4, 6).reshape(
+                B, H, W, D, ratio ** 3)
             empty_mask = target_voxels.sum(-1) == empty_idx    # B,H,W,D
             target_voxels = target_voxels.to(torch.int64)
             occ_space = target_voxels[~empty_mask]
-            occ_space[occ_space==0] = -torch.arange(len(occ_space[occ_space==0])).to(occ_space.device) - 1
+            occ_space[occ_space == 0] = (
+                -torch.arange(len(occ_space[occ_space == 0]),
+                              device=occ_space.device) - 1)
             target_voxels[~empty_mask] = occ_space
             target_voxels = torch.mode(target_voxels, dim=-1)[0]
-            target_voxels[target_voxels<0] = 255
+            target_voxels[target_voxels < 0] = 255
             target_voxels = target_voxels.long()
 
         assert torch.isnan(output_voxels).sum().item() == 0
@@ -219,15 +307,30 @@ class WorldHeadV1(WorldHeadBase):
 
         loss_dict = {}
 
-        loss_dict['loss_voxel_ce_{}'.format(tag)] = self.loss_voxel_ce_weight * CE_ssc_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=255)
+        loss_dict['loss_voxel_ce_{}'.format(tag)] = (
+            self.loss_voxel_ce_weight *
+            CE_ssc_loss(output_voxels, target_voxels,
+                        self.class_weights.type_as(output_voxels),
+                        ignore_index=255))
 
         if self.multi_loss:
-            loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = self.loss_voxel_sem_scal_weight * sem_scal_loss(output_voxels, target_voxels, ignore_index=255)
-            loss_dict['loss_voxel_lovasz_{}'.format(tag)] = self.loss_voxel_lovasz_weight * lovasz_softmax(torch.softmax(output_voxels, dim=1), target_voxels, ignore=255)
+            loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = (
+                self.loss_voxel_sem_scal_weight *
+                sem_scal_loss(output_voxels, target_voxels, ignore_index=255))
+            loss_dict['loss_voxel_lovasz_{}'.format(tag)] = (
+                self.loss_voxel_lovasz_weight *
+                lovasz_softmax(torch.softmax(output_voxels, dim=1),
+                               target_voxels, ignore=255))
             if self.loss_voxel_geo_scal_weight is not None:
-                loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=empty_idx)
+                loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = (
+                    self.loss_voxel_geo_scal_weight *
+                    geo_scal_loss(output_voxels, target_voxels,
+                                  ignore_index=255,
+                                  non_empty_idx=empty_idx))
 
         return loss_dict
+
+
 
     def loss_occ(self, output_voxels=None, target_voxels=None, **kwargs):
         """
@@ -258,7 +361,7 @@ class WorldHeadV1(WorldHeadBase):
         ratio = tH // H
         if ratio != 1:
             target_voxels = target_voxels.reshape(B, H, ratio, W, ratio, D, ratio).permute(0,1,3,5,2,4,6).reshape(B, H, W, D, ratio**3)
-            empty_idx = 0
+            empty_idx = self.empty_idx
             empty_mask = target_voxels.sum(-1) == empty_idx
             target_voxels = target_voxels.to(torch.int64)
             occ_space = target_voxels[~empty_mask]
@@ -351,7 +454,7 @@ class WorldHeadV1(WorldHeadBase):
         ratio = tH // H
         if ratio != 1:
             target_voxels = target_voxels.reshape(B, H, ratio, W, ratio, D, ratio).permute(0,1,3,5,2,4,6).reshape(B, H, W, D, ratio**3)
-            empty_idx = 0
+            empty_idx = self.empty_idx
             empty_mask = target_voxels.sum(-1) == empty_idx
             target_voxels = target_voxels.to(torch.int64)
             occ_space = target_voxels[~empty_mask]

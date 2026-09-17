@@ -174,6 +174,10 @@ model = dict(
         per_frame_loss_weight=world_head_per_frame_loss_weight,
         num_pred_fcs=1,
         num_pred_height=pred_height,
+        #! occupancy 中 empty/free space 的类别 id。
+        #! 原 Drive-OccWorld 代码在 loss 中硬编码 empty_idx=0；
+        #! 这里改为配置项，后续如果数据集类别定义变化，只需要修改 empty_idx。
+        empty_idx=empty_idx,
 
         #* ================== 第一阶段动作条件设置 ==================
         # 不使用 nuScenes CAN bus，因此 use_can_bus=False，避免读取
@@ -197,6 +201,12 @@ model = dict(
         bev_w=bev_w_,
         pc_range=point_cloud_range,
         loss_weight=frame_loss_weight,
+        #! 原 Drive-OccWorld 的 WorldHeadV1.loss_voxel 默认按
+        #! (256, 256, 20) 对齐监督，适配 nuScenes/OpenOccupancy
+        #! 512x512x40 -> 256x256x20 的压缩逻辑。
+        #! SemanticKITTI 当前 occupancy 标签为 (256, 256, 32)，
+        #! 因此这里显式覆盖，避免高度维被错误插值到 20。
+        loss_voxel_align_size=occ_size,
         loss_weight_cfg=dict(
             loss_voxel_ce_weight=1.0,
             loss_voxel_sem_scal_weight=1.0,
