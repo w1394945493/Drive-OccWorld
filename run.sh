@@ -43,3 +43,5 @@ python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/compare_semki
     --semkitti-pkl /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/out/semantic_kitti/semantickitti_infos_train.pkl
 
 python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/scripts/test_semantic_kitti_world_dataset.py
+
+python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/scripts/test_semantic_kitti_drive_occworld_forward.py

@@ -112,7 +112,7 @@ memory_queue_len = 1
 future_pred_frame_num_train = future_queue_length
 future_pred_frame_num_test = future_queue_length
 
-_dim_ = 128
+_dim_ = 256
 _pos_dim_ = _dim_ // 2
 _ffn_dim_ = _dim_ * 2
 _num_levels_ = 4
