@@ -39,12 +39,16 @@ class SemanticKITTIWorldDataset(Dataset):
         - img_metas: 历史帧 + 当前帧的几何与图像 meta；
         - segmentation: shape = [history + current + future, H, W, D]，
           直接由 occ_path 读取并 stack，供 Drive-OccWorld 第一阶段 occupancy loss 使用。
+        - sdc_planning / command / vel_steering:
+          第一阶段为了跑通 Drive-OccWorld 的 future_pred() 接口构造的兼容字段。
+          它们不是 nuScenes CAN bus/planner 的真实监督，只用于最小链路调试。
 
     注意：
         这是第一阶段轻量 Dataset，不直接复用 NuScenesWorldDatasetTemplate 的原因是：
           1. SemanticKITTI 没有 nuScenes SDK / CAN bus / sample_annotations；
           2. occupancy 路径已经逐帧写入 pkl，无需按 scene_token/lidar_token 拼路径；
-          3. 第一阶段只需要图像和 occupancy 序列，规划相关字段先不引入。
+          3. 第一阶段只需要图像和 occupancy 序列；规划/action 字段仅构造
+             最小 dummy/pseudo 输入，用于跑通原 Drive-OccWorld forward。
     """
 
     CAMERA_GROUPS = {
@@ -365,6 +369,67 @@ class SemanticKITTIWorldDataset(Dataset):
         # 保留原始 shape；后续 config/模型里再决定是否 resize / remap 类别。
         return occ.astype(np.int64, copy=False)
 
+    def _build_stage1_drive_occworld_compat_fields(self, current_info):
+        """Build pseudo fields required by Drive-OccWorld forward.
+
+        #* ================== 第一阶段兼容字段：只为跑通链路 ==================
+        Drive-OccWorld 原始 nuScenes 训练链路即使关闭 turn_on_plan，也会在
+        future_pred() 中使用 sdc_planning 构造 plan_traj，用于未来 BEV query
+        与历史 BEV memory 的坐标对齐：
+
+            plan_traj = sdc_planning[:, :future_frame_index, :2]
+
+        SemanticKITTI 第一阶段暂不验证真实 action-conditioned forecasting 和
+        occupancy-based planning，因此这里仅根据 converter 写入的
+        gt_ego_fut_trajs 构造 pseudo sdc_planning，并补齐 command /
+        vel_steering 等接口字段。
+
+        注意：
+            - sdc_planning 不是网络预测，也不是 nuScenes CAN bus 真值；
+            - vel_steering 全 0，只是占位 dummy action state；
+            - sample_traj / gt_future_boxes / flow / instance 当前不构造，
+              因为 turn_on_plan=False、turn_on_flow=False 时不会使用。
+        """
+        # Drive-OccWorld 中 command 常见 shape=(future_pred_frame_num+1,)。
+        # 当前 converter 已按 nuScenes v2 风格写入 shape=(5,)。
+        command = np.asarray(
+            current_info.get(
+                'command',
+                np.full((self.future_queue_length + 1,), 2, dtype=np.int64)),
+            dtype=np.int64)
+
+        future_steps = int(command.shape[0])
+
+        # gt_ego_fut_trajs: converter 中由 SemanticKITTI pose 差分得到，
+        # shape 通常为 (6, 2)。这里取前 future_steps 步作为 pseudo 未来位移。
+        gt_ego_fut_trajs = np.asarray(
+            current_info.get('gt_ego_fut_trajs',
+                             np.zeros((future_steps, 2), dtype=np.float32)),
+            dtype=np.float32)
+
+        # sdc_planning: Drive-OccWorld 期望每步至少有 [dx, dy, dyaw]。
+        # 第一阶段先只填 dx/dy，dyaw 置 0，保证 future_pred() 可以使用
+        # [:, :, :2] 完成未来 BEV 坐标对齐。
+        sdc_planning = np.zeros((future_steps, 3), dtype=np.float32)
+        copy_steps = min(future_steps, gt_ego_fut_trajs.shape[0])
+        sdc_planning[:copy_steps, :2] = gt_ego_fut_trajs[:copy_steps, :2]
+
+        # sdc_planning_mask: 第一阶段统一置 1，表示这些 pseudo step 可用。
+        # 如果后续要严格处理序列尾部，可结合 fut_valid_flag 或窗口有效性细化。
+        sdc_planning_mask = np.ones((future_steps,), dtype=np.float32)
+
+        # vel_steering: Drive-OccWorld action condition 的细粒度自车状态字段。
+        # nuScenes 中可包含速度/角速度/转向等；SemanticKITTI 没有 CAN bus，
+        # 当前先用全 0 dummy 值占位，只为跑通原模型接口。
+        vel_steering = np.zeros((future_steps, 4), dtype=np.float32)
+
+        return dict(
+            sdc_planning=sdc_planning,
+            sdc_planning_mask=sdc_planning_mask,
+            command=command,
+            vel_steering=vel_steering,
+        )
+
     def get_data_info(self, index):
         """Return raw window information before pipeline processing."""
         raw_index = self.valid_indices[index]
@@ -393,6 +458,8 @@ class SemanticKITTIWorldDataset(Dataset):
             img, shape_metas = None, None
         img_metas = self._build_img_metas(
             input_frame_inputs, current_input, shape_metas=shape_metas)
+        compat_fields = self._build_stage1_drive_occworld_compat_fields(
+            current_info)
 
         return dict(
             frame_inputs=frame_inputs,
@@ -401,6 +468,10 @@ class SemanticKITTIWorldDataset(Dataset):
             img=img,
             img_metas=img_metas,
             segmentation=np.stack(occ_seq) if self.load_occ else None,
+            #* 这些字段是为了兼容 Drive-OccWorld 原 forward 接口的
+            #* pseudo/dummy 字段；第一阶段关闭 planning/action ablation 时，
+            #* 它们只用于让 future_pred() 的对齐逻辑先跑通。
+            **compat_fields,
             window_tokens=[self.data_infos[i]['token'] for i in window_indices],
             current_token=current_info['token'],
         )

@@ -94,20 +94,30 @@ def semantic_kitti_debug_collate(batch):
 
     目的：
         先确认 batch_size=1 时 DataLoader 能正常取数，并把模型最关心的
-        img / segmentation 加上 batch 维。
+        img / segmentation / 第一阶段 pseudo planning-action 字段加上 batch 维。
 
     说明：
         这里不是最终训练用 collate。真正接入 MMDet 训练时，可以继续改成
         DataContainer / mmcv.parallel.collate 风格。当前阶段先保留最直观结构：
           - img: np.ndarray, [B, T_input, N_cam, C, H, W]
           - segmentation: np.ndarray, [B, T_all, H, W, D]
+          - sdc_planning: np.ndarray, [B, T_action, 3]，pseudo 未来自车位移
+          - command: np.ndarray, [B, T_action]，pseudo 高层驾驶指令
+          - vel_steering: np.ndarray, [B, T_action, 4]，dummy 细粒度动作状态
           - img_metas: list，长度 B，每个元素是该样本的历史+当前 meta list
     """
     collated = {}
     first = batch[0]
     for key in first.keys():
         values = [sample[key] for sample in batch]
-        if key in ('img', 'segmentation') and values[0] is not None:
+        if key in (
+            'img',
+            'segmentation',
+            'sdc_planning',
+            'sdc_planning_mask',
+            'command',
+            'vel_steering',
+        ) and values[0] is not None:
             collated[key] = np.stack(values, axis=0)
         else:
             collated[key] = values
@@ -167,6 +177,11 @@ def summarize_dataloader_batch(dataset, batch_size=1, num_workers=0):
     window_tokens = batch.get('window_tokens', None)
     if window_tokens is not None:
         print(f'batch window_tokens[0]: {window_tokens[0]}')
+
+    for key in ('sdc_planning', 'sdc_planning_mask', 'command', 'vel_steering'):
+        value = batch.get(key, None)
+        if value is not None:
+            print(f'batch {key}: shape={value.shape}, dtype={value.dtype}')
 
 
 def main():
@@ -238,6 +253,37 @@ def main():
             f'occupancy 序列 segmentation: shape={segmentation.shape}, '
             f'dtype={segmentation.dtype}, '
             f'min={segmentation.min()}, max={segmentation.max()}')
+
+    print('\n' + '-' * 100)
+    print('Drive-OccWorld 第一阶段兼容字段 Pseudo fields')
+    print('-' * 100)
+    sdc_planning = data.get('sdc_planning', None)
+    if sdc_planning is None:
+        print('sdc_planning: None')
+    else:
+        print(
+            f'sdc_planning: shape={sdc_planning.shape}, dtype={sdc_planning.dtype} '
+            '[T_action, 3]，由 gt_ego_fut_trajs 构造，dyaw 暂置 0')
+        print(f'  sdc_planning 前两步: {sdc_planning[:2].tolist()}')
+
+    sdc_planning_mask = data.get('sdc_planning_mask', None)
+    if sdc_planning_mask is not None:
+        print(
+            f'sdc_planning_mask: shape={sdc_planning_mask.shape}, '
+            f'dtype={sdc_planning_mask.dtype}, value={sdc_planning_mask.tolist()}')
+
+    command = data.get('command', None)
+    if command is not None:
+        print(
+            f'command: shape={command.shape}, dtype={command.dtype}, '
+            f'value={command.tolist()}  # 0=Right, 1=Left, 2=Forward')
+
+    vel_steering = data.get('vel_steering', None)
+    if vel_steering is not None:
+        print(
+            f'vel_steering: shape={vel_steering.shape}, '
+            f'dtype={vel_steering.dtype}, sum={float(vel_steering.sum()):.3f} '
+            '# dummy 全 0，占位用')
 
     summarize_frame_input(data['frame_inputs'][0], '最早历史帧 First history frame')
     summarize_frame_input(
