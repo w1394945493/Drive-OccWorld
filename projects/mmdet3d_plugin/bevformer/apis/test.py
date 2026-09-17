@@ -91,7 +91,7 @@ def custom_encode_mask_results(mask_results):
 #             #    result = [(bbox_results, encode_mask_results(mask_results))
 #             #              for bbox_results, mask_results in result]
 #         if rank == 0:
-            
+
 #             for _ in range(batch_size * world_size):
 #                 prog_bar.update()
 
@@ -133,12 +133,13 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
     """
 
     model.eval()
-    
+
     # init predictions
     iou_metric = []
     iou_current_metric = []
     iou_future_metric = []
     iou_future_time_weighting_metric = []
+    iou_per_frame_metric = []
     vpq_metric = []
     plan_metric = {
             'plan_L2_1s':[],
@@ -165,14 +166,47 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
     rank, world_size = get_dist_info()
     if rank == 0:
         prog_bar = mmcv.ProgressBar(len(dataset))
-    
+
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
-    
+
+    def _to_result_dict(result):
+        """Normalize model test output to dict.
+
+        #! 修复原因：
+        #! 为了兼容 mmdet/apis/single_gpu_test()，Drive_OccWorld.forward_test()
+        #! 现在返回 [test_output]；但本工程自定义的 custom_multi_gpu_test()
+        #! 原来假设 result 一定是 dict，并直接调用 result.keys()。
+        #! 多卡评估时因此会报：
+        #! AttributeError: 'list' object has no attribute 'keys'
+        #!
+        #! 这里兼容两种格式：
+        #! - dict: 原始 Drive-OccWorld 多卡评估返回；
+        #! - [dict]: mmdet 标准 single_gpu_test 兼容返回。
+        """
+        if isinstance(result, list):
+            assert len(result) == 1 and isinstance(result[0], dict), \
+                'custom_multi_gpu_test expects result to be dict or [dict].'
+            return result[0]
+        assert isinstance(result, dict), \
+            'custom_multi_gpu_test expects result to be dict or [dict].'
+        return result
+
+    def _sum_per_frame_hist(hist_list):
+        """Sum per-frame confusion matrices collected on one rank."""
+        if len(hist_list) == 0:
+            return []
+        num_frames = len(hist_list[0])
+        return [
+            sum(sample_hist[frame_idx] for sample_hist in hist_list)
+            for frame_idx in range(num_frames)
+        ]
+
     for i, data in enumerate(data_loader):
 
         with torch.no_grad():
 
             result = model(return_loss=False, rescale=True, **data)
+            result = _to_result_dict(result)
 
             if 'hist_for_iou' in result.keys():
                 iou_metric.append(result['hist_for_iou'])
@@ -182,6 +216,8 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
                 iou_future_metric.append(result['hist_for_iou_future'])
             if 'hist_for_iou_future_time_weighting' in result.keys():
                 iou_future_time_weighting_metric.append(result['hist_for_iou_future_time_weighting'])
+            if 'hist_for_iou_per_frame' in result.keys():
+                iou_per_frame_metric.append(result['hist_for_iou_per_frame'])
             if 'vpq' in result.keys():
                 vpq_metric.append(result['vpq'])
             if 'plan_metric' in result.keys():
@@ -189,7 +225,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
                     plan_metric[key].append(result['plan_metric'][key])
 
             batch_size = 1
-                
+
         if rank == 0:
             for _ in range(batch_size * world_size):
                 prog_bar.update()
@@ -216,6 +252,15 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
         iou_future_time_weighting_metric = [sum(iou_future_time_weighting_metric)]
         iou_future_time_weighting_metric = collect_results_cpu(iou_future_time_weighting_metric, len(dataset), tmpdir)
         res['hist_for_iou_future_time_weighting'] = iou_future_time_weighting_metric
+
+    # *============================================================#
+    if 'hist_for_iou_per_frame' in result.keys():
+        # 每个样本返回的是 [step0_hist, step1_hist, ...]；
+        # 先在当前 rank 内按 step 累加，再交给 collect_results_cpu 汇总各 rank。
+        iou_per_frame_metric = [_sum_per_frame_hist(iou_per_frame_metric)]
+        iou_per_frame_metric = collect_results_cpu(
+            iou_per_frame_metric, len(dataset), tmpdir)
+        res['hist_for_iou_per_frame'] = iou_per_frame_metric
 
     if 'vpq' in result.keys():
         res['vpq_len'] = len(dataset)   # 5569
@@ -274,7 +319,7 @@ def collect_results_cpu(result_part, size, tmpdir=None):
         bacause we change the sample of the evaluation stage to make sure that each gpu will handle continuous sample,
         '''
         #for res in zip(*part_list):
-        for res in part_list:  
+        for res in part_list:
             ordered_results.extend(list(res))
         # the dataloader may pad some samples
         ordered_results = ordered_results[:size]
