@@ -49,9 +49,9 @@ def parse_args():
                         help=('nuScenes occupancy root used by LoadOccupancy. '
                               'Expected path pattern: '
                               '<root>/scene_{scene_token}/occupancy/{lidar_token}.npy'))
-    parser.add_argument('--semkitti-index', type=int, default=0,
+    parser.add_argument('--semkitti-index', type=int, default=1,
                         help='sample index in SemanticKITTI infos')
-    parser.add_argument('--nuscenes-index', type=int, default=0,
+    parser.add_argument('--nuscenes-index', type=int, default=1,
                         help='sample index in nuScenes infos')
     parser.add_argument('--max-keys', type=int, default=120,
                         help='max number of keys to print in long key lists')

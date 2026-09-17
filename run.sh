@@ -37,7 +37,9 @@ python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/test.py \
 
 # ========================================================#
 python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/semantickitti_converter.py \
-    --out-pkl out/semantic_kitti/mini.pkl
+    --out-dir /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/out/semantic_kitti
 
 python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/compare_semkitti_nuscenes_pkl.py \
-    --semkitti-pkl /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/out/semantic_kitti/mini.pkl 
+    --semkitti-pkl /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/out/semantic_kitti/semantickitti_infos_train.pkl
+
+python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/scripts/test_semantic_kitti_world_dataset.py
