@@ -197,6 +197,19 @@ def main():
     #   img_metas = [each[num_frames-1] for each in img_metas]
     img_metas = batch['img_metas']
 
+    #! 当前阶段先默认 bs=1 跑通 SemanticKITTI 全流程。
+    #! Drive-OccWorld 原始代码中 compute_occ_loss 等函数会使用
+    #! segmentation[0][history_queue_length:]，也就是默认 list 内部张量
+    #! 的第 0 维是时间维 T，而不是 batch 维 B。因此这里把 DataLoader
+    #! 得到的 [B,T,H,W,D] 在 bs=1 情况下转成 list([T,H,W,D])。
+    #! 若后续要支持 bs>1，需要系统性修改 drive_occworld.py 的 loss/eval
+    #! 逻辑，而不是仅调整这个测试脚本。
+    if segmentation.shape[0] != 1:
+        raise AssertionError(
+            '当前 forward 调试脚本只支持 batch_size=1；'
+            f'got segmentation batch={segmentation.shape[0]}')
+    segmentation_for_model = [segmentation[0]]
+
     print('\n' + '-' * 100)
     print('开始 forward_train')
     print('-' * 100)
@@ -205,7 +218,7 @@ def main():
             losses = model.forward_train(
                 img_metas=img_metas,
                 img=img,
-                segmentation=[segmentation],
+                segmentation=segmentation_for_model,
                 sdc_planning=sdc_planning,
                 sdc_planning_mask=sdc_planning_mask,
                 command=command,
