@@ -34,3 +34,10 @@ PYTHONPATH="$(pwd)" \
 python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/test.py \
     /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/fine_grained/action_condition_MMO_MSO_custom_offline_with_planning.py \
     --eval bbox
+
+# ========================================================#
+python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/semantickitti_converter.py \
+    --out-pkl out/semantic_kitti/mini.pkl
+
+python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/compare_semkitti_nuscenes_pkl.py \
+    --semkitti-pkl /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/out/semantic_kitti/mini.pkl 
