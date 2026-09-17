@@ -46,6 +46,15 @@ class CustomDistEvalHook(BaseDistEvalHook):
         """Evaluate the model only at the start of training by epoch."""
         self._decide_interval(runner)
         super().before_train_epoch(runner)
+        #! 修复原因：
+        #! Epoch 结束后的评估虽然已经在 _do_evaluate() 末尾做了一次 barrier，
+        #! 但随后 rank0 还会通过 TextLoggerHook 打印评估指标，而其他 rank
+        #! 可能更早进入下一轮 before_train_epoch / train loop。
+        #! 这样就可能出现日志中评估指标已经打印，但多卡训练迟迟不进入下一
+        #! epoch 的现象。这里在每个 epoch 开始前再同步一次，保证所有 rank
+        #! 都完成上一轮评估和日志 hook 后，再一起进入新 epoch。
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     def before_train_iter(self, runner):
         self._decide_interval(runner)
