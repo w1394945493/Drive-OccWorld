@@ -977,7 +977,7 @@ class SemanticKITTIWorldDataset(Dataset):
             ['mIoU(%)'] + [self._pct(v) for v in miou_values] +
             [self._pct(avg_miou)])
         table.add_row(
-            ['IoU(% occupied)'] + [self._pct(v) for v in occ_iou_values] +
+            ['IoU(%)'] + [self._pct(v) for v in occ_iou_values] +
             [self._pct(avg_occ_iou)])
 
         metric_dict = {}
