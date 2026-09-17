@@ -382,6 +382,10 @@ semantic_kitti_train_dataset = dict(
     img_norm_cfg=img_norm_cfg,
     pad_shape=pad_shape,
     size_divisor=size_divisor,
+    #* 正式接入 tools/train.py 时打开 DataContainer 格式：
+    #* - 只返回 Drive_OccWorld.forward_train 接收的字段；
+    #* - 保持 img_metas / segmentation 的特殊 list 结构，避免默认 collate 破坏。
+    format_for_train=True,
     test_mode=False,
 )
 
@@ -400,12 +404,72 @@ semantic_kitti_val_dataset = dict(
     img_norm_cfg=img_norm_cfg,
     pad_shape=pad_shape,
     size_divisor=size_divisor,
+    format_for_train=True,
     test_mode=True,
 )
 
 data = dict(
     samples_per_gpu=1,
-    workers_per_gpu=0,
+    workers_per_gpu=2,
+    #! custom_train_detector 会从 cfg.data 中读取这两个 sampler 配置。
+    #! 单卡 launcher=none 时主要使用 GroupSampler；分布式时使用这里的配置。
+    shuffler_sampler=dict(type='DistributedGroupSampler'),
+    nonshuffler_sampler=dict(type='DistributedSampler'),
     train=semantic_kitti_train_dataset,
     val=semantic_kitti_val_dataset,
 )
+
+#* ================== 正式 train.py 运行配置 ==================
+# 当前仍是 SemanticKITTI 第一阶段 debug/default 配置：
+# - 单卡 samples_per_gpu=1；
+# - 内部 BEV 分辨率 128x128x16；
+# - 不加载预训练权重；
+# - 先用较短 iter 验证 runner / checkpoint / log 链路。
+#
+# 推荐首次运行：
+#   python tools/train.py projects/configs/kitti/semantic_kitti_drive_occworld.py \
+#       --work-dir work_dirs/semantic_kitti_drive_occworld_debug \
+#       --no-validate
+#
+# 若要延长训练，优先通过命令行覆盖：
+#   --cfg-options runner.max_iters=5000 checkpoint_config.interval=1000
+optimizer = dict(
+    type='AdamW',
+    lr=1e-4,
+    weight_decay=0.01,
+    paramwise_cfg=dict(
+        custom_keys={
+            'img_backbone': dict(lr_mult=0.1),
+        }))
+
+optimizer_config = dict(
+    # 先保守加梯度裁剪，避免小 batch / 随机初始化早期偶发梯度尖峰。
+    grad_clip=dict(max_norm=35, norm_type=2))
+
+lr_config = dict(
+    policy='CosineAnnealing',
+    warmup='linear',
+    warmup_iters=100,
+    warmup_ratio=1.0 / 3,
+    min_lr_ratio=1e-3,
+    by_epoch=False)
+
+runner = dict(type='IterBasedRunner', max_iters=1000)
+
+checkpoint_config = dict(interval=500, by_epoch=False, max_keep_ckpts=2)
+log_config = dict(
+    interval=10,
+    hooks=[
+        dict(type='TextLoggerHook'),
+        dict(type='TensorboardLoggerHook'),
+    ])
+
+# validation 目前仍建议首次用 --no-validate 跳过。
+# 后续如果需要正式评估，需要继续实现 SemanticKITTI occupancy metric/evaluate。
+evaluation = dict(interval=1000)
+
+workflow = [('train', 1)]
+find_unused_parameters = False
+cudnn_benchmark = True
+load_from = None
+resume_from = None

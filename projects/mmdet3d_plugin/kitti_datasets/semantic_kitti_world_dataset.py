@@ -6,6 +6,7 @@ import mmcv
 import numpy as np
 from mmdet.datasets.builder import DATASETS
 from mmdet.datasets.pipelines import Compose
+import torch
 from torch.utils.data import Dataset
 
 
@@ -56,6 +57,13 @@ class SemanticKITTIWorldDataset(Dataset):
         'stereo': ('CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT'),
     }
 
+    CLASSES = (
+        'empty', 'car', 'bicycle', 'motorcycle', 'truck', 'other-vehicle',
+        'person', 'bicyclist', 'motorcyclist', 'road', 'parking', 'sidewalk',
+        'other-ground', 'building', 'fence', 'vegetation', 'trunk',
+        'terrain', 'pole', 'traffic-sign')
+    PALETTE = None
+
     def __init__(self,
                  ann_file,
                  pipeline=None,
@@ -70,6 +78,7 @@ class SemanticKITTIWorldDataset(Dataset):
                  img_norm_cfg=None,
                  pad_shape=(384, 1248),
                  size_divisor=32,
+                 format_for_train=False,
                  test_mode=False):
         super().__init__()
         if use_camera not in self.CAMERA_GROUPS:
@@ -102,6 +111,10 @@ class SemanticKITTIWorldDataset(Dataset):
         self.img_norm_cfg = img_norm_cfg
         self.pad_shape = tuple(pad_shape) if pad_shape is not None else None
         self.size_divisor = size_divisor
+        #* format_for_train=True 时，Dataset 会把输出包装成 MMDetection/MMCV
+        #* train.py 期望的 DataContainer 格式，只保留 Drive_OccWorld.forward_train
+        #* 真正接收的字段；False 时保留完整调试字段，方便脚本直接检查样本内容。
+        self.format_for_train = format_for_train
         self.test_mode = test_mode
         self.pipeline = Compose(pipeline) if pipeline is not None else None
 
@@ -123,6 +136,10 @@ class SemanticKITTIWorldDataset(Dataset):
             ]
         else:
             self.valid_indices = list(range(len(self.data_infos)))
+        #! tools/train.py 在非分布式训练时会使用 mmdet GroupSampler，
+        #! 该 sampler 要求 dataset.flag 存在。SemanticKITTI 第一阶段不做
+        #! aspect-ratio 分组，统一置 0 即可。
+        self.flag = np.zeros(len(self.valid_indices), dtype=np.uint8)
 
     @staticmethod
     def _load_pkl(path):
@@ -576,6 +593,8 @@ class SemanticKITTIWorldDataset(Dataset):
         可在此基础上增加 queue 合并逻辑。
         """
         data = self.get_data_info(index)
+        if self.format_for_train:
+            return self._format_for_train(data)
         if self.pipeline is None:
             return data
 
@@ -584,6 +603,43 @@ class SemanticKITTIWorldDataset(Dataset):
         results['window_tokens'] = data['window_tokens']
         results['current_token'] = data['current_token']
         return results
+
+    def _format_for_train(self, data):
+        """Format one sample for MMDetection/MMCV train.py.
+
+        #! 修复/适配原因：
+        #! 调试模式下返回的 frame_inputs/window_tokens/current_token 等字段
+        #! 有助于人工检查，但 Drive_OccWorld.forward_train() 不接收这些参数。
+        #! 如果直接交给 tools/train.py，它们会被作为多余 kwargs 传入模型。
+        #! 因此正式训练模式只保留模型 forward_train 需要的字段。
+        #
+        #! img_metas 和 segmentation 不能被默认 collate 随意 stack：
+        #! - img_metas 需要保持 list[dict]，放在 CPU；
+        #! - segmentation 需要保持 list[tensor]，因为原 Drive-OccWorld
+        #!   compute_occ_loss 使用 segmentation[0] 作为 [T,H,W,D]。
+        """
+        from mmcv.parallel import DataContainer as DC
+
+        formatted = dict(
+            img=DC(torch.from_numpy(data['img']).float(), stack=True),
+            img_metas=DC(data['img_metas'], cpu_only=True),
+            segmentation=DC(
+                torch.from_numpy(data['segmentation']).long(),
+                stack=False),
+            sdc_planning=DC(
+                torch.from_numpy(data['sdc_planning']).float(),
+                stack=True),
+            sdc_planning_mask=DC(
+                torch.from_numpy(data['sdc_planning_mask']).float(),
+                stack=True),
+            command=DC(
+                torch.from_numpy(data['command']).long(),
+                stack=True),
+            vel_steering=DC(
+                torch.from_numpy(data['vel_steering']).float(),
+                stack=True),
+        )
+        return formatted
 
     def evaluate(self, results, **kwargs):
         """Placeholder for compatibility with MMDetection dataset API."""

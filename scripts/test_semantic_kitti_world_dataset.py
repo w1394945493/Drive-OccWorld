@@ -189,6 +189,11 @@ def main():
     cfg = setup_repo_imports(args.config)
 
     dataset_cfg = cfg.data[args.split]
+    # 该脚本用于人工检查完整时序窗口、路径和 meta 信息；
+    # 即使正式 train.py 配置中 format_for_train=True，这里也强制关闭，
+    # 保留 frame_inputs / window_tokens / current_token 等调试字段。
+    dataset_cfg = dataset_cfg.copy()
+    dataset_cfg.format_for_train = False
     dataset = build_dataset(dataset_cfg)
 
     print('=' * 100)

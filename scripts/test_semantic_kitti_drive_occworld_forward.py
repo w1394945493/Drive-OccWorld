@@ -109,6 +109,10 @@ def debug_collate(batch):
     first = batch[0]
     for key in first.keys():
         values = [sample[key] for sample in batch]
+        # 兼容 Dataset format_for_train=True 时返回的 MMCV DataContainer。
+        # DataContainer.data 才是真正的 tensor/list[dict]。
+        if hasattr(values[0], 'data'):
+            values = [value.data for value in values]
         if key in (
             'img',
             'segmentation',
@@ -117,14 +121,20 @@ def debug_collate(batch):
             'command',
             'vel_steering',
         ) and values[0] is not None:
-            collated[key] = np.stack(values, axis=0)
+            if torch.is_tensor(values[0]):
+                collated[key] = torch.stack(values, dim=0)
+            else:
+                collated[key] = np.stack(values, axis=0)
         else:
             collated[key] = values
     return collated
 
 
 def to_tensor(value, device, dtype=None):
-    tensor = torch.from_numpy(value)
+    if torch.is_tensor(value):
+        tensor = value
+    else:
+        tensor = torch.from_numpy(value)
     if dtype is not None:
         tensor = tensor.to(dtype=dtype)
     return tensor.to(device)
