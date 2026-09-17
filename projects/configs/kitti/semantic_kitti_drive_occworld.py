@@ -146,16 +146,22 @@ model = dict(
     future_pred_frame_num=future_pred_frame_num_train,
     test_future_frame_num=future_pred_frame_num_test,
 
-    #* 阶段一先用 ResNet50，减少 forward 调试成本。
+    #* ================== 图像 backbone ==================
+    # 参照 fine_grained/action_condition_MMO_MSO_custom_offline_with_planning.py：
+    # 使用 ResNet101 + DCNv2，并通过 load_from 加载 FCOS3D 预训练权重。
+    # 相比前期调试用 ResNet50，该设置更接近原 Drive-OccWorld 正式配置，
+    # 但显存和计算开销也会更高。
     img_backbone=dict(
         type='ResNet',
-        depth=50,
+        depth=101,
         num_stages=4,
-        out_indices=(1, 2, 3),
+        out_indices=(1, 2, 3,),
         frozen_stages=1,
         norm_cfg=dict(type='BN2d', requires_grad=False),
         norm_eval=True,
-        style='caffe'),
+        style='caffe',
+        dcn=dict(type='DCNv2', deform_groups=1, fallback_on_stride=False),
+        stage_with_dcn=(False, False, True, True)),
     img_neck=dict(
         type='FPN',
         in_channels=[512, 1024, 2048],
@@ -471,5 +477,10 @@ evaluation = dict(interval=1000)
 workflow = [('train', 1)]
 find_unused_parameters = False
 cudnn_benchmark = True
-load_from = None
+#* 加载与 ResNet101 + DCNv2 对应的 FCOS3D 预训练权重。
+# 该路径参照原 Drive-OccWorld fine-grained with planning 配置。
+# 如果环境中该文件不存在，可在启动训练时用
+#   --cfg-options load_from=None
+# 临时关闭预训练加载。
+load_from = "/c20250502/wangyushen/Weights/pretrained/r101_dcn_fcos3d_pretrain.pth"
 resume_from = None

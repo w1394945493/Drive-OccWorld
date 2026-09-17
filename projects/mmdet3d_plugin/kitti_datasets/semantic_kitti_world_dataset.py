@@ -626,18 +626,29 @@ class SemanticKITTIWorldDataset(Dataset):
             segmentation=DC(
                 torch.from_numpy(data['segmentation']).long(),
                 stack=False),
+            #! MMCV DataContainer 在 stack=True 时默认 pad_dims=2，
+            #! 适合图像类高维张量；但 sdc_planning/sdc_planning_mask/
+            #! command/vel_steering 是二维或一维动作/轨迹张量。
+            #! 若不显式设置 pad_dims=None，mmcv.parallel.collate 会检查
+            #! ndim > pad_dims，导致 shape=[5,3] 或 [5] 的字段触发
+            #! AssertionError。因此这些非图像张量只需要直接 stack，
+            #! 不做按 H/W 维度 padding。
             sdc_planning=DC(
                 torch.from_numpy(data['sdc_planning']).float(),
-                stack=True),
+                stack=True,
+                pad_dims=None),
             sdc_planning_mask=DC(
                 torch.from_numpy(data['sdc_planning_mask']).float(),
-                stack=True),
+                stack=True,
+                pad_dims=None),
             command=DC(
                 torch.from_numpy(data['command']).long(),
-                stack=True),
+                stack=True,
+                pad_dims=None),
             vel_steering=DC(
                 torch.from_numpy(data['vel_steering']).float(),
-                stack=True),
+                stack=True,
+                pad_dims=None),
         )
         return formatted
 
