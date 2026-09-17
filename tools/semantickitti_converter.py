@@ -7,7 +7,7 @@
     用来验证数据字段、相机标定、ego pose、occupancy 路径是否可用。
 
 与 nuScenes Drive-OccWorld 原始数据的区别：
-    - 只使用 SemanticKITTI 单目相机 image_2；
+    - 使用 SemanticKITTI 前视双目相机 image_2 / image_3；
     - 不生成 CAN bus / action condition / planning / sample_traj；
     - 不依赖 nuScenes SDK；
     - 只保留 future occupancy forecasting 第一阶段必需字段。
@@ -20,12 +20,14 @@
 
 每个 frame_info 主要包含：
     - token / scene_token / frame_idx / timestamp；
-    - cams["CAM_FRONT"]：单目图像路径、相机内参、lidar2img 等；
-    - occ_path / voxel_path：FoundationSSC dense occupancy 标签路径；
+    - cams["CAM_FRONT_LEFT"] / cams["CAM_FRONT_RIGHT"]：前视左右目图像路径、
+      相机内参、lidar2img 等；
+    - occ_path：FoundationSSC dense occupancy 标签路径；
     - ego2global / lidar2ego：自车位姿和简化外参；
     - prev / next：同一 sequence 内前后帧 token；
-    - gt_ego_his_trajs / gt_ego_fut_trajs：由 pose 差分得到的自车运动标签，
-      先作为调试和后续扩展字段保留，第一阶段模型可不使用。
+    - gt_ego_fut_trajs / command：和 Drive-OccWorld nuScenes v2 pkl
+      形状对齐的轻量未来轨迹/指令字段，第一阶段模型可不使用；
+    - fut_valid_flag：轻量有效性标记，便于后续 Dataset 过滤尾部未来帧不足样本。
 """
 
 import argparse
@@ -68,10 +70,6 @@ def parse_args():
                         help='number of consecutive available occupancy frames to dump')
     parser.add_argument('--all-frames', action='store_true',
                         help='dump all available occupancy frames in the sequence')
-    parser.add_argument('--his-ts', type=int, default=2,
-                        help='history steps kept in metadata/debug fields')
-    parser.add_argument('--fut-ts', type=int, default=4,
-                        help='future steps kept in metadata/debug fields')
     parser.add_argument('--cmd-thresh', type=float, default=2.0,
                         help='lateral threshold for pseudo left/right/forward command')
     parser.add_argument('--out-pkl', required=True,
@@ -111,6 +109,8 @@ def read_calib(calib_path):
         raise KeyError(f'{calib_path} does not contain Tr.')
     if 'P2' not in calib:
         raise KeyError(f'{calib_path} does not contain P2 for image_2.')
+    if 'P3' not in calib:
+        raise KeyError(f'{calib_path} does not contain P3 for image_3.')
     return calib
 
 
@@ -170,6 +170,18 @@ def list_frame_tokens(sequence_dir):
     voxel_dir = osp.join(sequence_dir, 'voxels')
     if not osp.isdir(voxel_dir):
         raise FileNotFoundError(f'Missing voxels directory: {voxel_dir}')
+
+    #* ================== 构建当前 sequence 的可用帧 token 列表 ==================
+    # SemanticKITTI/SSC 标签通常按帧号命名，例如：
+    #   voxels/000000.bin, voxels/000001.bin, ...
+    # 这里以 occupancy 可用帧为准，而不是以 image_2/image_3 或 poses.txt 为准；
+    # 只有存在 voxels/*.bin 的帧才会进入 tokens。
+    #
+    # sorted(...) 会按字符串顺序排序。由于 SemanticKITTI 帧号是 6 位补零格式，
+    # 字符串顺序等价于时间顺序。
+    # 因此后面 prev/next 的“相邻帧”含义就是：
+    #   在排序后的可用 occupancy token 列表中索引相邻。
+    # 它不是额外根据 timestamp / pose / image 最近邻搜索出来的。
     tokens = sorted(
         osp.splitext(entry.name)[0] for entry in os.scandir(voxel_dir)
         if entry.is_file() and entry.name.endswith('.bin'))
@@ -207,16 +219,6 @@ def relative_positions_in_current(poses_lidar, current_pose_idx, pose_indices):
         point = global_to_current @ poses_lidar[idx] @ origin
         points.append(point[:3])
     return np.asarray(points, dtype=np.float64)
-
-
-def build_history_trajs(poses_lidar, token_pose_indices, frame_idx, his_ts):
-    """Build his_ts adjacent historical ego displacements in current frame."""
-    token_indices = [max(0, frame_idx - i) for i in range(his_ts, -1, -1)]
-    pose_indices = [token_pose_indices[i] for i in token_indices]
-    current_pose_idx = token_pose_indices[frame_idx]
-    positions = relative_positions_in_current(
-        poses_lidar, current_pose_idx, pose_indices)
-    return (positions[1:] - positions[:-1])[:, :2].astype(np.float32)
 
 
 def build_future_trajs(poses_lidar, token_pose_indices, frame_idx, fut_ts):
@@ -267,30 +269,44 @@ def build_pseudo_command_sequence(fut_trajs, cmd_thresh, command_steps=5):
     return np.full((command_steps,), command, dtype=np.int64)
 
 
-def build_cam_front_info(sequence_dir, token, calib):
-    """Build monocular CAM_FRONT meta from SemanticKITTI image_2 and calib."""
-    image_path = osp.join(sequence_dir, 'image_2', f'{token}.png')
+def build_cam_info(sequence_dir, token, calib, image_dir, proj_key, cam_type):
+    """Build nuScenes-style camera meta from one SemanticKITTI front camera.
 
-    # P2 is a 3x4 projection matrix from cam0 rect coordinates to image_2.
-    # For first-stage BEVFormer-style projection, we store:
-    #   lidar2img = P2 @ Tr_lidar_to_cam0.
-    # P2 in calib has been converted to 4x4 with the original 3x4 values
-    # in the first three rows, so P2[:3, :4] keeps the actual projection.
-    p2 = calib['P2'][:3, :4].astype(np.float64)
+    SemanticKITTI / KITTI 常用：
+        - image_2 + P2: 左目彩色前视相机；
+        - image_3 + P3: 右目彩色前视相机。
+
+    这里显式命名为 CAM_FRONT_LEFT / CAM_FRONT_RIGHT，避免把 KITTI 的左目
+    图像误认为 nuScenes 中几何意义上的居中 CAM_FRONT。
+    """
+    image_path = osp.join(sequence_dir, image_dir, f'{token}.png')
+
+    # P2/P3 是从 rect cam0 坐标到对应图像平面的 3x4 投影矩阵。
+    # 对 BEVFormer-style 图像投影，直接保存：
+    #   lidar2img = P{2/3} @ Tr_lidar_to_cam0。
+    # calib 中 P2/P3 已被扩展成 4x4，因此这里取前三行四列保留原始投影。
+    proj = calib[proj_key][:3, :4].astype(np.float64)
     lidar_to_cam0 = calib['Tr'].astype(np.float64)
-    lidar2img = p2 @ lidar_to_cam0
+    lidar2img = proj @ lidar_to_cam0
 
     # 和 nuScenes pkl 对齐：cam_intrinsic 使用 3x3，而不是 4x4。
-    cam_intrinsic = p2[:3, :3].astype(np.float64)
+    cam_intrinsic = proj[:3, :3].astype(np.float64)
 
-    # sensor2lidar means camera -> LiDAR.  It is useful for later dataset
-    # compatibility even if the first-stage loader only consumes lidar2img.
-    sensor2lidar = np.linalg.inv(lidar_to_cam0)
+    # P2/P3 的第 4 列编码了相机相对 rect cam0 的平移。为了让
+    # sensor2lidar_translation 对左右相机有所区分，这里近似恢复
+    # cam0 -> 当前 camera 的平移，并组合到 LiDAR->camera 外参中。
+    # 第一阶段主要使用 lidar2img；该外参字段更多是为了后续 Dataset 兼容。
+    cam0_to_cam = np.eye(4, dtype=np.float64)
+    cam0_to_cam[:3, 3] = np.linalg.inv(cam_intrinsic) @ proj[:3, 3]
+    lidar_to_cam = cam0_to_cam @ lidar_to_cam0
+
+    # sensor2lidar means camera -> LiDAR.
+    sensor2lidar = np.linalg.inv(lidar_to_cam)
     sensor2lidar_quat = rotation_matrix_to_quaternion_wxyz(sensor2lidar[:3, :3])
 
     return {
         'data_path': image_path,
-        'type': 'CAM_FRONT',
+        'type': cam_type,
         'cam_intrinsic': cam_intrinsic.tolist(),
         'lidar2img': lidar2img.tolist(),
         'sensor2lidar_rotation': sensor2lidar[:3, :3].tolist(),
@@ -312,8 +328,6 @@ def build_frame_info_from_cache(
         poses_lidar,
         calib,
         frame_idx,
-        his_ts,
-        fut_ts,
         cmd_thresh,
         check_files=False):
     """Build one Drive-OccWorld-light SemanticKITTI frame info."""
@@ -325,34 +339,59 @@ def build_frame_info_from_cache(
             f'token {token} maps to pose index {pose_idx}, '
             f'but poses.txt has only {len(poses_lidar)} lines.')
 
+    #* prev/next 只表示排序后 tokens 列表里的前后相邻帧。
+    # 例如 tokens = ['000000', '000001', '000002'] 时：
+    #   frame_idx=1 -> prev='000000', next='000002'。
+    # 边界帧没有前/后相邻帧时，用空字符串 '' 占位，和 nuScenes pkl 风格接近。
     prev_token = tokens[frame_idx - 1] if frame_idx > 0 else ''
     next_token = tokens[frame_idx + 1] if frame_idx + 1 < len(tokens) else ''
     scene_name = f'sequence-{sequence}'
     pose = poses_lidar[pose_idx]
-    cam_front = build_cam_front_info(sequence_dir, token, calib)
+    cam_front_left = build_cam_info(
+        sequence_dir, token, calib,
+        image_dir='image_2',
+        proj_key='P2',
+        cam_type='CAM_FRONT_LEFT')
+    cam_front_right = build_cam_info(
+        sequence_dir, token, calib,
+        image_dir='image_3',
+        proj_key='P3',
+        cam_type='CAM_FRONT_RIGHT')
+    cams = {
+        'CAM_FRONT_LEFT': cam_front_left,
+        'CAM_FRONT_RIGHT': cam_front_right,
+    }
 
     occ_path = osp.join(ann_file, sequence, f'{token}_1_1.npy')
-    voxel_path = occ_path
 
     if check_files:
-        if not osp.isfile(cam_front['data_path']):
-            raise FileNotFoundError(f'Missing image file: {cam_front["data_path"]}')
+        for cam_name, cam_info in cams.items():
+            if not osp.isfile(cam_info['data_path']):
+                raise FileNotFoundError(
+                    f'Missing {cam_name} image file: {cam_info["data_path"]}')
         if not osp.isfile(occ_path):
             raise FileNotFoundError(f'Missing occupancy file: {occ_path}')
 
-    gt_ego_his_trajs = build_history_trajs(
-        poses_lidar, token_pose_indices, frame_idx, his_ts)
-    #* 和 nuScenes v2 pkl 对齐的自车未来轨迹/指令字段：
-    # - gt_ego_fut_trajs: nuScenes 中常见 shape=(6, 2)，这里固定构造 6 步；
-    # - command: nuScenes Drive-OccWorld v2 中常见 shape=(5,)，这里固定构造 5 步。
+    #* ================== 5. Drive-OccWorld 第一阶段保留的未来轨迹/指令字段 ==================
+    # 这里只保留 Drive-OccWorld nuScenes v2 pkl 中也存在、且后续适配可能用到的字段：
+    # - gt_ego_fut_trajs: shape=(6, 2)，由 SemanticKITTI pose 差分得到的未来自车位移；
+    # - command: shape=(5,)，由未来累计位移粗略离散出的伪驾驶指令序列。
+    #
+    # 注意：
+    # - 这些不是第一阶段 image -> BEV -> future occupancy forecasting 的必要输入；
+    # - 但保留它们可以降低后续扩展 action condition / planning 时的 Dataset 适配成本；
+    # - 原先偏 OccWorld 风格的 gt_ego_his_trajs / gt_ego_fut_masks /
+    #   gt_ego_fut_cmd 已删除，避免把 OccWorld 数据协议混进 Drive-OccWorld 第一阶段。
+    #
+    # nuScenes Drive-OccWorld v2 中常见设定是：
+    # - gt_ego_fut_trajs 有 6 个未来轨迹 step；
+    # - command 有 5 个未来动作条件 step。
     # 第一阶段关闭 action condition 和 planning，这些字段暂不作为模型输入，
     # 但保持形状一致可降低后续 Dataset 适配成本。
-    gt_ego_fut_trajs, gt_ego_fut_masks = build_future_trajs(
+    gt_ego_fut_trajs, _ = build_future_trajs(
         poses_lidar, token_pose_indices, frame_idx, fut_ts=6)
     command = build_pseudo_command_sequence(
         gt_ego_fut_trajs, cmd_thresh, command_steps=5)
-    command_onehot = np.zeros(3, dtype=np.float32)
-    command_onehot[int(command[0])] = 1.0
 
     # 第一阶段不使用 action condition，但保留一个轻量 can_bus 占位：
     # 后续若复用 BEVFormer 旧代码中读取 can_bus 的接口，可以先避免 KeyError。
@@ -361,45 +400,53 @@ def build_frame_info_from_cache(
 
     return {
         #* ================== 1. 基础时序字段 ==================
-        'token': token,
-        'scene_token': scene_name,
-        'scene_name': scene_name,
-        'location': 'semantickitti',
-        'frame_idx': int(frame_idx),
-        'timestamp': int(pose_idx),
-        'prev': prev_token,
-        'next': next_token,
+        'token': token,                         # str，当前帧 id，例如 '000000'
+        'scene_token': scene_name,              # str，场景/序列 id，这里为 'sequence-00' 等
+        'scene_name': scene_name,               # str，场景/序列名；和 scene_token 保持一致
+        'location': 'semantickitti',            # str，占位地图名；nuScenes 中对应 boston/singapore 等
+        'frame_idx': int(frame_idx),            # int，当前帧在本次 tokens 列表中的索引
+        'timestamp': int(pose_idx),             # int，SemanticKITTI 无真实时间戳，这里用 pose 行号占位
+        'prev': prev_token,                     # str，上一帧 token；首帧为空字符串 ''
+        'next': next_token,                     # str，下一帧 token；尾帧为空字符串 ''
 
-        #* ================== 2. 单目图像与相机标定 ==================
-        'cams': {'CAM_FRONT': cam_front},
-        'img_filename': [cam_front['data_path']],
-        'lidar2img': [cam_front['lidar2img']],
+        #* ================== 2. 前视双目图像与相机标定 ==================
+        # cams: dict，包含两个相机：
+        #   - CAM_FRONT_LEFT:  SemanticKITTI image_2 / P2；
+        #   - CAM_FRONT_RIGHT: SemanticKITTI image_3 / P3。
+        # 每个 cam_info 内部主要字段：
+        #   data_path: str，图像路径；
+        #   type: str，相机名；
+        #   cam_intrinsic: list，shape=(3, 3)，相机内参；
+        #   lidar2img: list，shape=(3, 4)，LiDAR 点投影到图像平面的矩阵；
+        #   sensor2lidar_rotation: list，shape=(3, 3)，camera -> LiDAR 旋转；
+        #   sensor2lidar_translation: list，shape=(3,)，camera -> LiDAR 平移；
+        #   sensor2ego_rotation: list，len=4，wxyz 四元数；第一阶段 ego 近似等于 LiDAR；
+        #   sensor2ego_translation: list，shape=(3,)。
+        'cams': cams,
+        'img_filename': [cam['data_path'] for cam in cams.values()],  # list[str]，长度=2，左右相机图像路径
+        'lidar2img': [cam['lidar2img'] for cam in cams.values()],     # list，长度=2，每个元素 shape=(3, 4)
 
         #* ================== 3. occupancy 标签路径 ==================
-        'occ_path': occ_path,
-        'voxel_path': voxel_path,
-        'lidar_path': osp.join(sequence_dir, 'velodyne', f'{token}.bin'),
+        'occ_path': occ_path,                                         # str，dense occupancy 标签 .npy 路径
+        'lidar_path': osp.join(sequence_dir, 'velodyne', f'{token}.bin'),  # str，原始 LiDAR bin 路径
 
         #* ================== 4. ego/LiDAR 位姿 ==================
         # 第一阶段把 LiDAR 坐标系直接作为 ego 坐标系。
-        'lidar2ego_translation': [0.0, 0.0, 0.0],
-        'lidar2ego_rotation': [1.0, 0.0, 0.0, 0.0],
-        'ego2global_translation': pose[:3, 3].astype(np.float64).tolist(),
-        'ego2global_rotation': rotation_matrix_to_quaternion_wxyz(pose[:3, :3]),
-        'can_bus': can_bus,
+        'lidar2ego_translation': [0.0, 0.0, 0.0],                     # list[float]，shape=(3,)，LiDAR->ego 平移
+        'lidar2ego_rotation': [1.0, 0.0, 0.0, 0.0],                   # list[float]，len=4，LiDAR->ego 单位四元数 wxyz
+        'ego2global_translation': pose[:3, 3].astype(np.float64).tolist(),  # list[float]，shape=(3,)，当前帧全局位置
+        'ego2global_rotation': rotation_matrix_to_quaternion_wxyz(pose[:3, :3]),  # list[float]，len=4，当前帧全局朝向 wxyz
+        'can_bus': can_bus,                                           # np.ndarray，shape=(18,)，占位；前 3 维写入全局平移
 
-        #* ================== 5. 轨迹/指令调试字段，第一阶段可不使用 ==================
-        'gt_ego_his_trajs': gt_ego_his_trajs,
-        'gt_ego_fut_trajs': gt_ego_fut_trajs,
-        'gt_ego_fut_masks': gt_ego_fut_masks,
-        'gt_ego_fut_cmd': command_onehot,
-        'command': command,
-        'fut_valid_flag': bool(frame_idx + fut_ts < len(tokens)),
+        #* ================== 5. Drive-OccWorld 对齐字段，第一阶段可不使用 ==================
+        'gt_ego_fut_trajs': gt_ego_fut_trajs,                         # np.ndarray，shape=(6, 2)，未来 6 步自车 xy 位移
+        'command': command,                                           # np.ndarray，shape=(5,)，伪驾驶指令；0右/1左/2直行
+        'fut_valid_flag': bool(frame_idx + 6 < len(tokens)),          # bool，未来 6 帧是否都在当前 sequence 内
 
         #* ================== 6. 占位字段：后续 dataset 可按需忽略 ==================
-        'sweeps': [],
-        'gt_boxes': np.zeros((0, 7), dtype=np.float32),
-        'gt_names': np.asarray([], dtype=object),
+        'sweeps': [],                                                 # list，历史 LiDAR sweep 占位；第一阶段不用
+        'gt_boxes': np.zeros((0, 7), dtype=np.float32),               # np.ndarray，shape=(0, 7)，3D box 占位
+        'gt_names': np.asarray([], dtype=object),                     # np.ndarray，shape=(0,)，类别名占位
     }
 
 
@@ -411,10 +458,13 @@ def print_summary(infos):
     info = infos[0]
     print('First frame summary:')
     print(f"  token: {info['token']}")
-    print(f"  image: {info['cams']['CAM_FRONT']['data_path']}")
+    print(f"  cameras: {list(info['cams'].keys())}")
+    print(f"  left image: {info['cams']['CAM_FRONT_LEFT']['data_path']}")
+    print(f"  right image: {info['cams']['CAM_FRONT_RIGHT']['data_path']}")
     print(f"  occ_path: {info['occ_path']}")
-    print(f"  lidar2img shape: {np.asarray(info['cams']['CAM_FRONT']['lidar2img']).shape}")
-    print(f"  cam_intrinsic shape: {np.asarray(info['cams']['CAM_FRONT']['cam_intrinsic']).shape}")
+    print(f"  lidar2img shape: {np.asarray(info['lidar2img']).shape}")
+    print(f"  left cam_intrinsic shape: "
+          f"{np.asarray(info['cams']['CAM_FRONT_LEFT']['cam_intrinsic']).shape}")
     print(f"  ego2global_translation: {info['ego2global_translation']}")
     print(f"  gt_ego_fut_trajs shape: {info['gt_ego_fut_trajs'].shape}")
     print(f"  command shape: {np.asarray(info['command']).shape}, "
@@ -466,27 +516,17 @@ def main():
             poses_lidar=poses_lidar,
             calib=calib,
             frame_idx=frame_idx,
-            his_ts=args.his_ts,
-            fut_ts=args.fut_ts,
             cmd_thresh=args.cmd_thresh,
             check_files=args.check_files))
 
     data = {
         'infos': infos,
         'metadata': {
-            'dataset': 'SemanticKITTI',
-            'style': 'Drive-OccWorld-light',
-            'version': 'small_sample_v1',
             'data_root': data_root,
             'ann_file': ann_file,
             'sequence': sequence,
             'start_frame_idx': int(start),
             'num_frames': int(len(infos)),
-            'camera': 'image_2/CAM_FRONT',
-            'note': (
-                'First-stage PKL for monocular image-to-BEV future occupancy '
-                'forecasting. No action condition or planning fields are required.'
-            ),
         },
     }
 
