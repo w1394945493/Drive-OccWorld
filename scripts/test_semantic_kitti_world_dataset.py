@@ -3,12 +3,12 @@
 
 示例：
     python scripts/test_semantic_kitti_world_dataset.py \
-        --config projects/configs/kitti/semantic_kitti_world_dataset.py \
+        --config projects/configs/kitti/semantic_kitti_drive_occworld.py \
         --split train \
         --index 0
 
     python scripts/test_semantic_kitti_world_dataset.py \
-        --config projects/configs/kitti/semantic_kitti_world_dataset.py \
+        --config projects/configs/kitti/semantic_kitti_drive_occworld.py \
         --split val \
         --index 0
 """
@@ -29,7 +29,7 @@ def parse_args():
         description='检查 SemanticKITTIWorldDataset 是否能正常读取样本。')
     parser.add_argument(
         '--config',
-        default='projects/configs/kitti/semantic_kitti_world_dataset.py',
+        default='projects/configs/kitti/semantic_kitti_drive_occworld.py',
         help='数据集配置文件路径。')
     parser.add_argument(
         '--split',

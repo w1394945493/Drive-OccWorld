@@ -200,7 +200,7 @@ class WorldHeadTemplate(BaseModule):
         # set evaluation configurations.
         self.eval_within_grid = eval_within_grid
         self._init_layers()
-        
+
         if self.sem_norm and not self.turn_on_flow: # occ pred_head
             sem_raymarching_branch = []
             for _ in range(self.num_pred_fcs):
@@ -276,7 +276,7 @@ class WorldHeadTemplate(BaseModule):
 
 
     @auto_fp16(apply_to=('prev_features'))
-    def _get_next_bev_features(self, prev_features, img_metas, target_frame_index, 
+    def _get_next_bev_features(self, prev_features, img_metas, target_frame_index,
                                action_condition_dict, cond_norm_dict, tgt_points, ref_points, bev_h, bev_w):
         """ Forward function for each frame.
 
@@ -312,7 +312,7 @@ class WorldHeadTemplate(BaseModule):
         action_condition = None
         plan_traj = action_condition_dict['plan_traj']
         command, vel_steering = action_condition_dict['command'][:, target_frame_index], action_condition_dict['vel_steering'][:, target_frame_index]
-        if self.use_can_bus:
+        if self.use_can_bus: # * use_can_bus
             #* 当前配置 use_can_bus=True：这里是 can_bus 进入模型作为 action condition 的核心位置。
             #* 注意它不是只用于 BEV 对齐；这里会直接影响 WorldDecoder 对未来 occupancy 的生成。
             #   * Can-bus information.
@@ -449,8 +449,8 @@ class WorldHeadTemplate(BaseModule):
                 ref_points,  # ref_points config for cross-attention.
                 bev_h, bev_w,):
         f"""Forward function: a wrapper function for self._get_next_bev_features
-        
-        From previous multi-frame BEV features (mlvl_feats) predict 
+
+        From previous multi-frame BEV features (mlvl_feats) predict
         the next-frame of point cloud.
         Args:
             mlvl_feats (Tensor): BEV features from previous frames input, with
@@ -471,7 +471,7 @@ class WorldHeadTemplate(BaseModule):
         assert bev_h * bev_w == tgt_points.shape[1]
 
         next_bev_feat, bev_sem_pred = self._get_next_bev_features(
-            prev_feats, img_metas, target_frame_index, action_condition_dict, 
+            prev_feats, img_metas, target_frame_index, action_condition_dict,
             cond_norm_dict, tgt_points, ref_points, bev_h, bev_w)
         return next_bev_feat, bev_sem_pred
 
