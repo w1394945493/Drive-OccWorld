@@ -80,6 +80,31 @@ def find_latest_checkpoint(work_dir):
     return candidates[-1][-1]
 
 
+def sync_total_epochs_to_runner(cfg, cfg_options=None):
+    """Sync cfg.total_epochs to cfg.runner.max_epochs when appropriate.
+
+    #! 修复原因：
+    #! 当前 config 中同时保留了 OpenMMLab 常见的 total_epochs 字段和
+    #! EpochBasedRunner 真正使用的 runner.max_epochs 字段。命令行调试时如果只写：
+    #!   --cfg-options total_epochs=4
+    #! runner.max_epochs 仍会保持配置文件中的默认值，导致需要每次同时写：
+    #!   total_epochs=4 runner.max_epochs=4
+    #!
+    #! 这里在用户没有显式覆盖 runner.max_epochs 时，自动把 total_epochs 同步到
+    #! runner.max_epochs，避免重复配置；如果用户显式写了 runner.max_epochs，
+    #! 则尊重用户设置。
+    """
+    if cfg_options is not None and 'runner.max_epochs' in cfg_options:
+        return
+    if 'total_epochs' not in cfg:
+        return
+    if 'runner' not in cfg:
+        return
+    if cfg.runner.get('type', None) != 'EpochBasedRunner':
+        return
+    cfg.runner.max_epochs = cfg.total_epochs
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
@@ -159,6 +184,7 @@ def main():
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    sync_total_epochs_to_runner(cfg, args.cfg_options)
     # import modules from string list.
     if cfg.get('custom_imports', None):
         from mmcv.utils import import_modules_from_strings
