@@ -993,6 +993,11 @@ class Drive_OccWorld(BEVFormer):
             test_output.update(vpq=vpq)
         else:
             # test_output.update(vpq=0.1)
+            # todo: 曾导致多卡评估额外卡住/出错的问题点：
+            # todo: 原来即使 turn_on_flow=False，也返回 vpq=0.1 占位。
+            # todo: custom_multi_gpu_test() 看到 result 里有 vpq，就会继续走
+            # todo: VPQ collect 分支，导致当前 SemanticKITTI occupancy-only 实验
+            # todo: 多一次完全无意义的分布式 pkl 收集。
             #! 修复原因：
             #! SemanticKITTI 第一阶段配置 turn_on_flow=False，不预测 flow / instance，
             #! 因此 VPQ 没有实际意义。原来的占位 vpq=0.1 会让多卡评估

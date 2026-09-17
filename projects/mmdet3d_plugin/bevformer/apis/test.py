@@ -151,6 +151,11 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
             # if 'plan_metric' in result.keys():
             #     for key in plan_metric.keys():
             #         plan_metric[key].append(result['plan_metric'][key])
+            # todo: 曾导致多卡评估链路复杂化的问题点之一：
+            # todo: SemanticKITTI 第一阶段没有 flow / planning，但如果这里继续收集
+            # todo: vpq / plan_metric，后面就会额外触发多次 collect_results_cpu()。
+            # todo: 多卡下同一个 tmpdir 反复写 part_*.pkl，容易造成 epoch1 评估后
+            # todo: 卡住、part_1.pkl 缺失或 EOFError。
             #! 当前 SemanticKITTI 第一阶段关闭 turn_on_flow / turn_on_plan，
             #! 只评估 occupancy forecasting。因此 VPQ 和 planning metric
             #! 分支暂时不走，先注释保留原逻辑，避免无意义的多卡 collect。
@@ -169,6 +174,12 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
     #   hist_for_iou / current / future / future_time_weighting / per_frame。
     # 如果没有 vpq / plan_metric，说明 flow 和 planning 分支都没有开启。
     #
+    # todo: 曾导致“第一个 epoch 评估后长时间不进入第二个 epoch”的核心问题点：
+    # todo: 原 Drive-OccWorld 多任务评估会对多个指标分别 collect，一轮 eval 内
+    # todo: 多次复用 .eval_hook/part_0.pkl、part_1.pkl。多卡进程读写节奏稍有
+    # todo: 错位，就可能在 collect_results_cpu() 或后续 DDP 同步处卡住。
+    # todo: SemanticKITTI 当前只需要 occupancy，所以这里改为 occupancy-only
+    # todo: 一次性打包收集，绕开原多任务评估的脆弱路径。
     #! 修复原因：
     #! 原始实现会对每个 metric 分别调用一次 collect_results_cpu()，
     #! 即同一个 tmpdir 下反复写/读 part_0.pkl、part_1.pkl。
@@ -247,6 +258,10 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
     #! - 分别 collect occupancy 多个 hist；
     #! - collect flow/instance VPQ；
     #! - collect planning metric。
+    # todo: 这里整体注释保留，是因为它正是之前多卡 eval 琐碎问题的主要来源：
+    # todo: 多个 if 分支分别调用 collect_results_cpu()，导致同名 part_*.pkl
+    # todo: 在不同指标之间反复覆盖；再叠加 VPQ 占位和 planning 分支，会让
+    # todo: 当前 occupancy-only 实验走到完全不需要的同步路径。
     #! 当前 SemanticKITTI 第一阶段已在 occ_only 分支中一次性打包收集
     #! occupancy 指标，因此这里暂时不走，先整体注释保留，后续如果重新开启
     #! flow/planning 或恢复 nuScenes 多任务评估，可再按需要恢复/重构。

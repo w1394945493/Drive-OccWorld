@@ -51,7 +51,7 @@ log_interval = 1
 eval_interval = 1
 checkpoint_interval = 1
 max_keep_ckpts = 1
-learning_rate = 1e-4
+learning_rate = 2e-4
 
 # * ================== 快速调试样本数开关 ==================
 # 默认 None 表示使用完整 train/val split。

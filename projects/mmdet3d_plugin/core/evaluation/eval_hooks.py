@@ -48,6 +48,10 @@ class CustomDistEvalHook(BaseDistEvalHook):
         super().before_train_epoch(runner)
         # if dist.is_available() and dist.is_initialized():
         #     dist.barrier()
+        # todo: 曾导致“评估表格已经打印，但迟迟不进入下一 epoch”的问题点：
+        # todo: 在 before_train_epoch 里额外 barrier 太靠近 runner/hook 调度边界，
+        # todo: 某些 rank 可能还没走到这里，另一些 rank 已经在等待，容易死锁。
+        # todo: 因此不要在 epoch 开始前额外同步，只在 _do_evaluate() 结束处同步。
         #! 这里曾尝试在每个 epoch 开始前额外同步所有 rank，但实际多卡
         #! 训练中可能出现某些 rank 尚未进入 before_train_epoch，而另一些
         #! rank 已经在此处等待，从而导致评估指标已打印但迟迟不进入下一
@@ -98,6 +102,11 @@ class CustomDistEvalHook(BaseDistEvalHook):
 
             if getattr(self.dataloader.dataset,
                        'suppress_eval_log_buffer', False):
+                # todo: 曾导致误判“第 2 个 epoch 卡住”的日志问题：
+                # todo: Dataset.evaluate() 已经打印 compact table，但 TextLoggerHook
+                # todo: 还会把 eval_results 作为普通训练日志再打印一次，显示成
+                # todo: Epoch [1][5/10]、time=0、data_time=0、memory 异常等。
+                # todo: 这不是新一轮训练，而是评估指标的二次日志输出。
                 #! SemanticKITTIWorldDataset.evaluate() 已经主动打印了
                 #! compact forecasting table。若继续保留 log_buffer.ready=True，
                 #! MMCV TextLoggerHook 会把同一批 eval_results 再打印成
@@ -107,6 +116,10 @@ class CustomDistEvalHook(BaseDistEvalHook):
                 runner.log_buffer.clear()
 
         #! 修复原因：
+        # todo: 必要同步点：
+        # todo: custom_multi_gpu_test() 返回后，只有 rank0 会继续执行 evaluate()
+        # todo: 和 compact table 打印；其他 rank 可能更早返回。这里保留一次
+        # todo: eval 结束同步，避免 rank0 还在评估时其他 rank 已进入训练。
         #! 分布式评估时，custom_multi_gpu_test() 返回后只有 rank0 会继续执行
         #! dataset.evaluate()、打印表格和写 logger；其他 rank 会更早返回并可能进入
         #! 下一轮训练。若 rank0 仍在评估/写日志，而其他 rank 已经开始新的 DDP

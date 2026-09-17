@@ -280,8 +280,14 @@ def main():
     dash_line = '-' * 60 + '\n'
     logger.info('Environment info:\n' + dash_line + env_info + '\n' +
                 dash_line)
-    meta['env_info'] = env_info
-    meta['config'] = cfg.pretty_text
+    # meta['env_info'] = env_info
+    # meta['config'] = cfg.pretty_text
+    #! 日志精简：
+    #! MMCV TextLoggerHook 会把 runner.meta 写入 .log.json 的第一行。
+    #! 如果这里保存 env_info 和完整 cfg.pretty_text，json 文件开头会出现
+    #! 一大段环境信息和完整配置，可读性很差且对训练曲线分析没有必要。
+    #! 普通 .log 里上面已经 logger.info 打印了 Environment info，下面也会
+    #! 打印 Config，因此这里不再把它们塞进 meta / .log.json。
 
     # log some basic info
     logger.info(f'Distributed training: {distributed}')
