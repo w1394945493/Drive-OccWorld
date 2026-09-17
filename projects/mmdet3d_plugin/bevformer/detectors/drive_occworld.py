@@ -172,9 +172,21 @@ class Drive_OccWorld(BEVFormer):
         """Extract features of images."""
         B = img.size(0)
         if img is not None:
-            if img.dim() == 5 and img.size(0) == 1:
-                img.squeeze_()
-            elif img.dim() == 5 and img.size(0) > 1:
+            # 原实现：
+            # if img.dim() == 5 and img.size(0) == 1:
+            #     img.squeeze_()
+            # elif img.dim() == 5 and img.size(0) > 1:
+            #     B, N, C, H, W = img.size()
+            #     img = img.reshape(B * N, C, H, W)
+            #
+            # 修改原因：
+            # 原 nuScenes 输入通常是 B=1、N_cam=6，squeeze_() 后仍是
+            # [6, C, H, W]，可以送入 ResNet。但 SemanticKITTI 第一阶段
+            # 单目输入是 B=1、N_cam=1，squeeze_() 会同时删掉 batch 和
+            # camera 两个维度，变成 [C, H, W]，导致 ResNet/BatchNorm 报
+            # “expected 4D input”。因此这里对所有 5D 图像统一 reshape 成
+            # [B*N_cam, C, H, W]，既兼容 nuScenes 多相机，也兼容 KITTI 单目。
+            if img.dim() == 5:
                 B, N, C, H, W = img.size()
                 img = img.reshape(B * N, C, H, W)
             if self.use_grid_mask and self.grid_mask_image:
