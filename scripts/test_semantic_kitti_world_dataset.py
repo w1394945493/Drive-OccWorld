@@ -95,6 +95,9 @@ def main():
     print(f'实际使用相机 camera_names: {dataset.camera_names}')
     print(f'历史帧数量 history_queue_length: {dataset.history_queue_length}')
     print(f'未来帧数量 future_queue_length: {dataset.future_queue_length}')
+    print(f'图像 pad_shape: {dataset.pad_shape}')
+    print(f'图像 size_divisor: {dataset.size_divisor}')
+    print(f'图像归一化 img_norm_cfg: {dataset.img_norm_cfg}')
     print(f'pkl 原始样本数 raw infos length: {len(dataset.data_infos)}')
     print(f'过滤边界后的有效样本数 valid dataset length: {len(dataset)}')
 
@@ -116,7 +119,10 @@ def main():
     else:
         print(
             f'图像队列 img: shape={img.shape}, dtype={img.dtype} '
-            '[T_input, N_cam, H, W, C]')
+            '[T_input, N_cam, C, H, W]')
+        print(
+            f'  图像数值范围: min={float(img.min()):.3f}, '
+            f'max={float(img.max()):.3f}, mean={float(img.mean()):.3f}')
 
     img_metas = data.get('img_metas', None)
     if img_metas is None:
@@ -126,6 +132,9 @@ def main():
         if img_metas:
             print(f"  第一帧 meta token: {img_metas[0].get('token')}")
             print(f"  当前帧 meta token: {img_metas[-1].get('token')}")
+            print(f"  当前帧 ori_shape: {img_metas[-1].get('ori_shape')}")
+            print(f"  当前帧 img_shape: {img_metas[-1].get('img_shape')}")
+            print(f"  当前帧 pad_shape: {img_metas[-1].get('pad_shape')}")
             print(
                 '  当前帧 ref_lidar_to_cur_lidar shape: '
                 f"{np.asarray(img_metas[-1].get('ref_lidar_to_cur_lidar')).shape}")

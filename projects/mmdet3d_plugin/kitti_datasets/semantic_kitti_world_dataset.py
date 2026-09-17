@@ -34,8 +34,9 @@ class SemanticKITTIWorldDataset(Dataset):
         不单独提供 right-only 模式，避免无必要的配置分支。
 
     输出约定：
-        - img: 若 pipeline 中包含 LoadMultiViewImageFromFiles，则由 pipeline 加载；
-        - img_metas: 由 CustomCollect3D 收集；
+        - img: shape = [history + current, num_cam, C, H, W]，
+          Dataset 内部完成读取、normalize、pad 和 HWC->CHW；
+        - img_metas: 历史帧 + 当前帧的几何与图像 meta；
         - segmentation: shape = [history + current + future, H, W, D]，
           直接由 occ_path 读取并 stack，供 Drive-OccWorld 第一阶段 occupancy loss 使用。
 
@@ -62,6 +63,9 @@ class SemanticKITTIWorldDataset(Dataset):
                  load_occ=True,
                  load_img=True,
                  to_float32=True,
+                 img_norm_cfg=None,
+                 pad_shape=(384, 1248),
+                 size_divisor=32,
                  test_mode=False):
         super().__init__()
         if use_camera not in self.CAMERA_GROUPS:
@@ -79,6 +83,21 @@ class SemanticKITTIWorldDataset(Dataset):
         self.load_occ = load_occ
         self.load_img = load_img
         self.to_float32 = to_float32
+        #* ================== 图像预处理配置 ==================
+        # 第一阶段先采用确定性预处理：
+        #   1. mmcv.imread 读取 BGR 图像；
+        #   2. 按 Drive-OccWorld / BEVFormer 常用 Caffe 风格做 normalize；
+        #   3. 只在右侧和下侧 pad 到固定尺寸，不做 resize/crop/flip。
+        # 因为没有改变像素坐标尺度和原点，所以 lidar2img / cam_intrinsic 不需要更新。
+        # 如果后续改成 resize/crop，需要同步更新 cam_intrinsic / lidar2img。
+        if img_norm_cfg is None:
+            img_norm_cfg = dict(
+                mean=[103.530, 116.280, 123.675],
+                std=[1.0, 1.0, 1.0],
+                to_rgb=False)
+        self.img_norm_cfg = img_norm_cfg
+        self.pad_shape = tuple(pad_shape) if pad_shape is not None else None
+        self.size_divisor = size_divisor
         self.test_mode = test_mode
         self.pipeline = Compose(pipeline) if pipeline is not None else None
 
@@ -220,27 +239,79 @@ class SemanticKITTIWorldDataset(Dataset):
         )
         return input_dict
 
-    def _load_images(self, frame_inputs):
-        """Load history/current images into shape [T, N, H, W, C].
+    def _pad_image(self, img):
+        """Pad one image on right/bottom and return padded image + shapes."""
+        ori_shape = img.shape
+        h, w = img.shape[:2]
 
-        T = history_queue_length + 1，N = 1(left) 或 2(stereo)。
-        这里先保持 HWC 格式，便于测试脚本直观看 shape；后续接模型训练时，
-        可以再在 pipeline/format bundle 中转成 [T, N, C, H, W] tensor。
+        if self.pad_shape is not None:
+            target_h, target_w = self.pad_shape
+            if h > target_h or w > target_w:
+                raise ValueError(
+                    f'Image shape {(h, w)} is larger than pad_shape '
+                    f'{self.pad_shape}. Use a larger pad_shape or add resize.')
+        elif self.size_divisor is not None:
+            target_h = int(np.ceil(h / self.size_divisor) * self.size_divisor)
+            target_w = int(np.ceil(w / self.size_divisor) * self.size_divisor)
+        else:
+            target_h, target_w = h, w
+
+        pad_shape = (target_h, target_w, img.shape[2])
+        if (target_h, target_w) == (h, w):
+            return img, ori_shape, pad_shape
+
+        padded = np.zeros(pad_shape, dtype=img.dtype)
+        padded[:h, :w, :] = img
+        return padded, ori_shape, pad_shape
+
+    def _normalize_image(self, img):
+        """Normalize BGR image according to img_norm_cfg."""
+        mean = np.asarray(self.img_norm_cfg['mean'], dtype=np.float32)
+        std = np.asarray(self.img_norm_cfg['std'], dtype=np.float32)
+        if self.img_norm_cfg.get('to_rgb', False):
+            img = img[..., ::-1]
+        return (img - mean) / std
+
+    def _load_images(self, frame_inputs):
+        """Load and preprocess history/current images.
+
+        Returns:
+            img: np.ndarray, shape = [T, N, C, H, W]
+                T = history_queue_length + 1，N = 1(left) 或 2(stereo)。
+            shape_metas: list[list[dict]]
+                每个输入时刻、每个相机的 ori/img/pad shape，用于写入 img_metas。
         """
         frame_imgs = []
+        shape_metas = []
         for frame_input in frame_inputs:
             cam_imgs = []
+            cam_shape_metas = []
             for img_path in frame_input['img_filename']:
                 img = mmcv.imread(img_path, flag='color')
                 if img is None:
                     raise FileNotFoundError(f'Cannot read image: {img_path}')
                 if self.to_float32:
                     img = img.astype(np.float32)
+                #* 对齐 Drive-OccWorld 原 pipeline 顺序：
+                # NormalizeMultiviewImage -> PadMultiViewImage。
+                # 即先对真实图像区域做 normalize，再把右侧/下侧 pad 为 0。
+                img = self._normalize_image(img)
+                img, ori_shape, pad_shape = self._pad_image(img)
+                # HWC -> CHW，对齐 Drive-OccWorld/BEVFormer 模型输入习惯。
+                img = img.transpose(2, 0, 1).copy()
                 cam_imgs.append(img)
+                cam_shape_metas.append(dict(
+                    ori_shape=ori_shape,
+                    # 当前阶段没有 resize/crop，normalize 不改变图像尺寸，
+                    # 所以 img_shape 仍是 pad 前的真实图像大小。
+                    img_shape=ori_shape,
+                    pad_shape=pad_shape,
+                ))
             frame_imgs.append(np.stack(cam_imgs, axis=0))
-        return np.stack(frame_imgs, axis=0)
+            shape_metas.append(cam_shape_metas)
+        return np.stack(frame_imgs, axis=0), shape_metas
 
-    def _build_img_metas(self, input_frame_inputs, current_input):
+    def _build_img_metas(self, input_frame_inputs, current_input, shape_metas=None):
         """Build meta list for history + current image frames.
 
         Drive-OccWorld/BEVFormer 会使用 ref_lidar_to_cur_lidar /
@@ -252,17 +323,31 @@ class SemanticKITTIWorldDataset(Dataset):
         global2ref_lidar = np.linalg.inv(ref_lidar2global)
 
         metas = []
-        for frame_input in input_frame_inputs:
+        for meta_idx, frame_input in enumerate(input_frame_inputs):
             info = self.data_infos[self.token2idx[frame_input['token']]]
             cur_lidar2global = self._lidar_to_global(info)
             cur_lidar_to_ref_lidar = global2ref_lidar @ cur_lidar2global
             ref_lidar_to_cur_lidar = np.linalg.inv(cur_lidar_to_ref_lidar)
 
             meta = copy.deepcopy(frame_input)
+            if shape_metas is None:
+                ori_shape = None
+                img_shape = None
+                pad_shape = None
+            else:
+                # 多相机场景下保持 list[tuple]，单目时也是长度为 1 的 list，
+                # 这样和 img_filename / lidar2img 的多相机结构一致。
+                ori_shape = [cam_meta['ori_shape']
+                             for cam_meta in shape_metas[meta_idx]]
+                img_shape = [cam_meta['img_shape']
+                             for cam_meta in shape_metas[meta_idx]]
+                pad_shape = [cam_meta['pad_shape']
+                             for cam_meta in shape_metas[meta_idx]]
             meta.update(
-                img_shape=None,
-                ori_shape=None,
-                pad_shape=None,
+                img_shape=img_shape,
+                ori_shape=ori_shape,
+                pad_shape=pad_shape,
+                img_norm_cfg=copy.deepcopy(self.img_norm_cfg),
                 cur_lidar_to_ref_lidar=cur_lidar_to_ref_lidar,
                 ref_lidar_to_cur_lidar=ref_lidar_to_cur_lidar,
                 total_cur2ref_lidar_transform=cur_lidar_to_ref_lidar,
@@ -302,8 +387,12 @@ class SemanticKITTIWorldDataset(Dataset):
         current_info = self.data_infos[raw_index]
         input_frame_inputs = frame_inputs[:current_pos + 1]
         current_input = frame_inputs[current_pos]
-        img = self._load_images(input_frame_inputs) if self.load_img else None
-        img_metas = self._build_img_metas(input_frame_inputs, current_input)
+        if self.load_img:
+            img, shape_metas = self._load_images(input_frame_inputs)
+        else:
+            img, shape_metas = None, None
+        img_metas = self._build_img_metas(
+            input_frame_inputs, current_input, shape_metas=shape_metas)
 
         return dict(
             frame_inputs=frame_inputs,
