@@ -403,6 +403,46 @@ class SemanticKITTIWorldDataset(Dataset):
             metas.append(meta)
         return metas
 
+    def _add_future_transforms_to_current_meta(
+            self, img_metas, window_indices, current_pos):
+        """Add future<->reference lidar transforms to current-frame meta.
+
+        #! 修复原因：
+        #! Drive-OccWorld.future_pred() 在预测未来 BEV 时会调用
+        #! _align_bev_coordnates()，并从当前参考帧 img_meta 中读取：
+        #!   - future2ref_lidar_transform[future_frame_index]
+        #!   - ref2future_lidar_transform[future_frame_index]
+        #! 原 nuScenes Dataset 会在 union2one/queue 合并阶段预先写入这些字段；
+        #! SemanticKITTI 第一阶段 Dataset 目前只构造了历史/当前帧相对参考帧
+        #! 的变换，所以这里基于完整时序窗口在线补齐未来帧到参考帧的变换。
+        #!
+        #! 注意 future_pred() 的 future_frame_index 从 1 开始，因此这里第 0
+        #! 个元素放 identity，表示 current/ref -> current/ref；第 1..N 个
+        #! 元素分别对应 t+1, t+2, ... 的未来帧。
+        """
+        ref_info = self.data_infos[window_indices[current_pos]]
+        ref_lidar2global = self._lidar_to_global(ref_info)
+        global2ref_lidar = np.linalg.inv(ref_lidar2global)
+
+        future2ref_lidar_transform = [np.eye(4, dtype=np.float64)]
+        ref2future_lidar_transform = [np.eye(4, dtype=np.float64)]
+
+        for frame_idx in window_indices[current_pos + 1:]:
+            future_info = self.data_infos[frame_idx]
+            future_lidar2global = self._lidar_to_global(future_info)
+            future2ref = global2ref_lidar @ future_lidar2global
+            ref2future = np.linalg.inv(future2ref)
+            future2ref_lidar_transform.append(future2ref)
+            ref2future_lidar_transform.append(ref2future)
+
+        # 写到当前参考帧 meta 上。Drive-OccWorld.forward_train() 会在当前帧
+        # img_metas = [each[num_frames-1] for each in img_metas] 后保留这个 meta。
+        img_metas[-1]['future2ref_lidar_transform'] = np.stack(
+            future2ref_lidar_transform, axis=0)
+        img_metas[-1]['ref2future_lidar_transform'] = np.stack(
+            ref2future_lidar_transform, axis=0)
+        return img_metas
+
     @staticmethod
     def _load_occ(occ_path):
         """Load dense occupancy label from converter-produced occ_path."""
@@ -501,6 +541,8 @@ class SemanticKITTIWorldDataset(Dataset):
             img, shape_metas = None, None
         img_metas = self._build_img_metas(
             input_frame_inputs, current_input, shape_metas=shape_metas)
+        img_metas = self._add_future_transforms_to_current_meta(
+            img_metas, window_indices, current_pos)
         compat_fields = self._build_stage1_drive_occworld_compat_fields(
             current_info)
 

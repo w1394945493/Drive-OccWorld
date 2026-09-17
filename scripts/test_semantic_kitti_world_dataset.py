@@ -251,6 +251,9 @@ def main():
             print(
                 '  当前帧 ref_lidar_to_cur_lidar shape: '
                 f"{np.asarray(img_metas[-1].get('ref_lidar_to_cur_lidar')).shape}")
+            print(
+                '  当前帧 future2ref_lidar_transform shape: '
+                f"{np.asarray(img_metas[-1].get('future2ref_lidar_transform')).shape}")
 
     segmentation = data.get('segmentation', None)
     if segmentation is None:

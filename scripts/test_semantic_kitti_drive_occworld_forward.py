@@ -132,6 +132,9 @@ def print_batch_summary(batch):
             '  当前帧 can_bus[-1] 类型/值: '
             f"{type(img_metas[0][-1].get('can_bus')[-1]).__name__}/"
             f"{img_metas[0][-1].get('can_bus')[-1]}")
+        print(
+            '  当前帧 future2ref_lidar_transform shape: '
+            f"{np.asarray(img_metas[0][-1].get('future2ref_lidar_transform')).shape}")
     print(f"current_token: {batch.get('current_token')}")
     print(f"window_tokens[0]: {batch.get('window_tokens', [''])[0]}")
 
