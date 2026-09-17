@@ -25,6 +25,21 @@ import time
 import os.path as osp
 
 
+def _patch_mmddp_for_torch2(model):
+    """Patch MMCV MMDistributedDataParallel for newer PyTorch.
+
+    #! 修复原因：
+    #! torch 2.x + 旧版 MMCV 组合下，MMDistributedDataParallel.forward()
+    #! 可能访问缺失的 _use_replicated_tensor_module 属性，导致多卡 test/eval
+    #! 在真正进入模型 forward 前报 AttributeError。
+    #! 这里只给 wrapper 补默认 False 属性，使 MMCV 走普通 self.module 分支。
+    """
+    if isinstance(model, MMDistributedDataParallel) and not hasattr(
+            model, '_use_replicated_tensor_module'):
+        model._use_replicated_tensor_module = False
+    return model
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='MMDet test (and eval) a model')
@@ -253,6 +268,7 @@ def main():
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
+        model = _patch_mmddp_for_torch2(model)
         outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
                                         args.gpu_collect)
 

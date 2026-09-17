@@ -25,6 +25,28 @@ import os.path as osp
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from projects.mmdet3d_plugin.core.evaluation.eval_hooks import CustomDistEvalHook
 from projects.mmdet3d_plugin.datasets import custom_build_dataset
+
+
+def _patch_mmddp_for_torch2(model):
+    """Patch MMCV MMDistributedDataParallel for newer PyTorch.
+
+    #! 修复原因：
+    #! 当前环境 torch 2.1.1 + 旧版 MMCV 的组合下，
+    #! mmcv.parallel.MMDistributedDataParallel._run_ddp_forward() 会访问
+    #! self._use_replicated_tensor_module。
+    #! 但这个属性在当前 wrapper 实例中并不存在，多卡评估阶段会报：
+    #! AttributeError: 'MMDistributedDataParallel' object has no attribute
+    #! '_use_replicated_tensor_module'
+    #!
+    #! 这里仅给 DDP wrapper 补一个默认 False 的兼容属性，不改变模型结构、
+    #! forward 逻辑或训练损失；作用等价于让 MMCV 走 self.module 分支。
+    """
+    if isinstance(model, MMDistributedDataParallel) and not hasattr(
+            model, '_use_replicated_tensor_module'):
+        model._use_replicated_tensor_module = False
+    return model
+
+
 def custom_train_detector(model,
                    dataset,
                    cfg,
@@ -77,12 +99,14 @@ def custom_train_detector(model,
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False,
             find_unused_parameters=find_unused_parameters)
+        model = _patch_mmddp_for_torch2(model)
         if eval_model is not None:
             eval_model = MMDistributedDataParallel(
                 eval_model.cuda(),
                 device_ids=[torch.cuda.current_device()],
                 broadcast_buffers=False,
                 find_unused_parameters=find_unused_parameters)
+            eval_model = _patch_mmddp_for_torch2(eval_model)
     else:
         model = MMDataParallel(
             model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
@@ -197,4 +221,3 @@ def custom_train_detector(model,
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
-
