@@ -146,11 +146,14 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
                 iou_future_time_weighting_metric.append(result['hist_for_iou_future_time_weighting'])
             if 'hist_for_iou_per_frame' in result.keys():
                 iou_per_frame_metric.append(result['hist_for_iou_per_frame'])
-            if 'vpq' in result.keys():
-                vpq_metric.append(result['vpq'])
-            if 'plan_metric' in result.keys():
-                for key in plan_metric.keys():
-                    plan_metric[key].append(result['plan_metric'][key])
+            # if 'vpq' in result.keys():
+            #     vpq_metric.append(result['vpq'])
+            # if 'plan_metric' in result.keys():
+            #     for key in plan_metric.keys():
+            #         plan_metric[key].append(result['plan_metric'][key])
+            #! 当前 SemanticKITTI 第一阶段关闭 turn_on_flow / turn_on_plan，
+            #! 只评估 occupancy forecasting。因此 VPQ 和 planning metric
+            #! 分支暂时不走，先注释保留原逻辑，避免无意义的多卡 collect。
 
             batch_size = 1
 
@@ -161,51 +164,92 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
     # collect lists from multi-GPUs
     res = {}
 
-    if 'hist_for_iou' in result.keys():
-        iou_metric = [sum(iou_metric)]
-        iou_metric = collect_results_cpu(iou_metric, len(dataset), tmpdir)
-        res['hist_for_iou'] = iou_metric
+    #* ================== SemanticKITTI / occupancy-only 快速分支 ==================
+    # 当前 SemanticKITTI 第一阶段只评估 occupancy forecasting：
+    #   hist_for_iou / current / future / future_time_weighting / per_frame。
+    # 如果没有 vpq / plan_metric，说明 flow 和 planning 分支都没有开启。
+    #
+    #! 修复原因：
+    #! 原始实现会对每个 metric 分别调用一次 collect_results_cpu()，
+    #! 即同一个 tmpdir 下反复写/读 part_0.pkl、part_1.pkl。
+    #! 多卡情况下这很容易引发文件覆盖、EOFError、rank 同步卡住等琐碎问题。
+    #! 这里把所有 occupancy 指标打包成一个 dict，只做一次跨卡收集。
+    #! Dataset.evaluate() 已支持 list[dict]，因此 rank0 返回每张卡的汇总 dict
+    #! 后，可以继续正常计算总 IoU / mIoU。
+    occ_only = (
+        'hist_for_iou_per_frame' in result.keys()
+        and 'vpq' not in result.keys()
+        and 'plan_metric' not in result.keys()
+    )
+    if occ_only:
+        local_res = {}
+        if len(iou_metric) > 0:
+            local_res['hist_for_iou'] = sum(iou_metric)
+        if len(iou_current_metric) > 0:
+            local_res['hist_for_iou_current'] = sum(iou_current_metric)
+        if len(iou_future_metric) > 0:
+            local_res['hist_for_iou_future'] = sum(iou_future_metric)
+        if len(iou_future_time_weighting_metric) > 0:
+            local_res['hist_for_iou_future_time_weighting'] = sum(
+                iou_future_time_weighting_metric)
+        if len(iou_per_frame_metric) > 0:
+            local_res['hist_for_iou_per_frame'] = _sum_per_frame_hist(
+                iou_per_frame_metric)
 
-    if 'hist_for_iou_current' in result.keys():
-        iou_current_metric = [sum(iou_current_metric)]
-        iou_current_metric = collect_results_cpu(iou_current_metric, len(dataset), tmpdir)
-        res['hist_for_iou_current'] = iou_current_metric
+        return collect_results_cpu([local_res], len(dataset), tmpdir)
 
-    if 'hist_for_iou_future' in result.keys():
-        iou_future_metric = [sum(iou_future_metric)]
-        iou_future_metric = collect_results_cpu(iou_future_metric, len(dataset), tmpdir)
-        res['hist_for_iou_future'] = iou_future_metric
-
-    if 'hist_for_iou_future_time_weighting' in result.keys():
-        iou_future_time_weighting_metric = [sum(iou_future_time_weighting_metric)]
-        iou_future_time_weighting_metric = collect_results_cpu(iou_future_time_weighting_metric, len(dataset), tmpdir)
-        res['hist_for_iou_future_time_weighting'] = iou_future_time_weighting_metric
-
-    # *============================================================#
-    if 'hist_for_iou_per_frame' in result.keys():
-        # 每个样本返回的是 [step0_hist, step1_hist, ...]；
-        # 先在当前 rank 内按 step 累加，再交给 collect_results_cpu 汇总各 rank。
-        iou_per_frame_metric = [_sum_per_frame_hist(iou_per_frame_metric)]
-        iou_per_frame_metric = collect_results_cpu(
-            iou_per_frame_metric, len(dataset), tmpdir)
-        res['hist_for_iou_per_frame'] = iou_per_frame_metric
-
-    if 'vpq' in result.keys():
-        res['vpq_len'] = len(dataset)   # 5569
-        vpq_metric = [sum(vpq_metric)]  # [一张卡上所有样本的和]
-        vpq_metric = collect_results_cpu(vpq_metric, len(dataset), tmpdir)  # [每张 卡上所有样本的和]
-        res['vpq_metric'] = vpq_metric
-
-    if 'plan_metric' in result.keys():
-        res['data_len'] = len(dataset)
-        plan_metric = {key:[sum(plan_metric[key])] for key in plan_metric.keys()}
-        plan_metric = {key:collect_results_cpu(plan_metric[key], len(dataset), tmpdir) for key in plan_metric.keys()}
-        res['plan_metric'] = plan_metric
-    # v2
-    if model.module.turn_on_plan:
-        planning_result = model.module.planning_metric_v2.compute()
-        model.module.planning_metric_v2.reset()
-        res['planning_results_computed'] = planning_result
+    # if 'hist_for_iou' in result.keys():
+    #     iou_metric = [sum(iou_metric)]
+    #     iou_metric = collect_results_cpu(iou_metric, len(dataset), tmpdir)
+    #     res['hist_for_iou'] = iou_metric
+    #
+    # if 'hist_for_iou_current' in result.keys():
+    #     iou_current_metric = [sum(iou_current_metric)]
+    #     iou_current_metric = collect_results_cpu(iou_current_metric, len(dataset), tmpdir)
+    #     res['hist_for_iou_current'] = iou_current_metric
+    #
+    # if 'hist_for_iou_future' in result.keys():
+    #     iou_future_metric = [sum(iou_future_metric)]
+    #     iou_future_metric = collect_results_cpu(iou_future_metric, len(dataset), tmpdir)
+    #     res['hist_for_iou_future'] = iou_future_metric
+    #
+    # if 'hist_for_iou_future_time_weighting' in result.keys():
+    #     iou_future_time_weighting_metric = [sum(iou_future_time_weighting_metric)]
+    #     iou_future_time_weighting_metric = collect_results_cpu(iou_future_time_weighting_metric, len(dataset), tmpdir)
+    #     res['hist_for_iou_future_time_weighting'] = iou_future_time_weighting_metric
+    #
+    # # *============================================================#
+    # if 'hist_for_iou_per_frame' in result.keys():
+    #     # 每个样本返回的是 [step0_hist, step1_hist, ...]；
+    #     # 先在当前 rank 内按 step 累加，再交给 collect_results_cpu 汇总各 rank。
+    #     iou_per_frame_metric = [_sum_per_frame_hist(iou_per_frame_metric)]
+    #     iou_per_frame_metric = collect_results_cpu(
+    #         iou_per_frame_metric, len(dataset), tmpdir)
+    #     res['hist_for_iou_per_frame'] = iou_per_frame_metric
+    #
+    # if 'vpq' in result.keys():
+    #     res['vpq_len'] = len(dataset)   # 5569
+    #     vpq_metric = [sum(vpq_metric)]  # [一张卡上所有样本的和]
+    #     vpq_metric = collect_results_cpu(vpq_metric, len(dataset), tmpdir)  # [每张 卡上所有样本的和]
+    #     res['vpq_metric'] = vpq_metric
+    #
+    # if 'plan_metric' in result.keys():
+    #     res['data_len'] = len(dataset)
+    #     plan_metric = {key:[sum(plan_metric[key])] for key in plan_metric.keys()}
+    #     plan_metric = {key:collect_results_cpu(plan_metric[key], len(dataset), tmpdir) for key in plan_metric.keys()}
+    #     res['plan_metric'] = plan_metric
+    # # v2
+    # if model.module.turn_on_plan:
+    #     planning_result = model.module.planning_metric_v2.compute()
+    #     model.module.planning_metric_v2.reset()
+    #     res['planning_results_computed'] = planning_result
+    #! 上面是原 Drive-OccWorld 多任务评估遗留逻辑：
+    #! - 分别 collect occupancy 多个 hist；
+    #! - collect flow/instance VPQ；
+    #! - collect planning metric。
+    #! 当前 SemanticKITTI 第一阶段已在 occ_only 分支中一次性打包收集
+    #! occupancy 指标，因此这里暂时不走，先整体注释保留，后续如果重新开启
+    #! flow/planning 或恢复 nuScenes 多任务评估，可再按需要恢复/重构。
 
     return res
 
