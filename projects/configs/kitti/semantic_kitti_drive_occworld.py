@@ -47,7 +47,7 @@ ann_root = "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/data/semantic_
 samples_per_gpu = 1
 workers_per_gpu = 4
 max_epochs = 24
-log_interval = 50
+log_interval = 1
 eval_interval = 1
 checkpoint_interval = 1
 max_keep_ckpts = 1
@@ -67,7 +67,7 @@ val_max_samples = None
 # - history_queue_length: 输入历史帧数量；
 # - future_queue_length : 需要加载的未来 occupancy 标注数量。
 history_queue_length = 2
-future_queue_length = 6
+future_queue_length = 4
 
 # * ================== 相机输入模式 ==================
 # 可选：

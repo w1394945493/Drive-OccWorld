@@ -63,7 +63,8 @@ python tools/train.py \
   data.val.max_samples=5 \
   data.workers_per_gpu=0 \
   checkpoint_config.interval=1 \
-  evaluation.interval=1
+  evaluation.interval=1 \
+
 
 # 多卡测试流程
 CUDA_VISIBLE_DEVICES=0,1 \
