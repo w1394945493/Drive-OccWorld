@@ -245,89 +245,140 @@ class Drive_OccWorld(BEVFormer):
         Return:
             ref_to_history_list (torch.Tensor): with shape as [bs, num_prev_frames, 4, 4]
         """
-        ref_num_frames = 1
-        history_num_frames = num_frames - ref_num_frames
+        ref_num_frames = 1  # 当前参考帧数量固定为 1，即 memory queue 最后会包含当前 ref_bev。
+        history_num_frames = num_frames - ref_num_frames  # history BEV 数量；num_frames 通常等于 memory_queue_len。
+
         # history
-        ref_to_history_list = []
-        for img_metas in prev_img_metas:
-            img_metas_len = len(img_metas)
-            cur_ref_to_prev = [img_metas[i]['ref_lidar_to_cur_lidar'] for i in range(img_metas_len-history_num_frames, img_metas_len)]   # [-3,-2,-1]
-            ref_to_history_list.append(cur_ref_to_prev)
-        ref_to_history_list = tensor.new_tensor(np.array(ref_to_history_list))
-        # ref
-        ref_to_ref_list = []
-        for img_metas in ref_img_metas:
-            cur_ref_to_prev = [img_metas[i]['ref_lidar_to_cur_lidar'] for i in range(ref_num_frames)]
-            ref_to_ref_list.append(cur_ref_to_prev)
-        ref_to_ref_list = tensor.new_tensor(np.array(ref_to_ref_list))
+        ref_to_history_list = []  # 收集 batch 内每个样本的 ref/current -> history BEV 坐标变换。
+        for img_metas in prev_img_metas:  # 遍历 batch；img_metas 是该样本所有历史帧 meta 列表。
+            img_metas_len = len(img_metas)  # 该样本可用历史帧数量，通常等于输入历史帧数。
+            # 只取最后 history_num_frames 个历史帧，和 prev_bev_input 中保留的历史 BEV 对齐。
+            # 例：history_num_frames=3 时对应 [-3,-2,-1]；history_num_frames=0 时为空列表。
+            #* 注意字段名 ref_lidar_to_cur_lidar 中的 cur_lidar 指“该 meta 对应帧”，
+            #* 在这里该 meta 来自历史帧，因此变换方向是：当前参考帧 -> 历史帧。
+            cur_ref_to_prev = [img_metas[i]['ref_lidar_to_cur_lidar']  # 4x4: 当前参考帧 ref/current lidar -> 该历史帧 lidar。
+                               for i in range(img_metas_len - history_num_frames, img_metas_len)]
+            ref_to_history_list.append(cur_ref_to_prev)  # 当前样本追加到 batch list 中。
+        ref_to_history_list = tensor.new_tensor(np.array(ref_to_history_list))  # shape: [B, history_num_frames, 4, 4]；可能第二维为 0。
+
+        # ref 当前参考帧 ref -> 当前参考帧 ref
+        ref_to_ref_list = []  # 收集 ref/current -> ref/current 的变换，一般是 identity。(应是单位矩阵)
+        for img_metas in ref_img_metas:  # 遍历 batch；ref_img_metas 每个样本只包含当前参考帧 meta。
+            cur_ref_to_prev = [img_metas[i]['ref_lidar_to_cur_lidar']  # 4x4: ref/current lidar -> ref/current lidar，通常为单位阵。
+                               for i in range(ref_num_frames)]  # 当前参考帧自身的变换列表，长度 ref_num_frames=1。
+            ref_to_ref_list.append(cur_ref_to_prev)  # 当前样本追加到 batch list 中。
+        ref_to_ref_list = tensor.new_tensor(np.array(ref_to_ref_list))  # shape: [B, 1, 4, 4]；device/dtype 跟随 tensor。
+
+
         # concat
-        if ref_to_history_list.shape[1] == 0:   # not use history
-            ref_to_history_list = ref_to_ref_list
+        if ref_to_history_list.shape[1] == 0:   # not use history；memory_queue_len=1 时 history_num_frames=0。
+            ref_to_history_list = ref_to_ref_list  # 只使用当前 ref_bev，最终 shape [B, 1, 4, 4]。
         else:
-            ref_to_history_list = torch.cat([ref_to_history_list, ref_to_ref_list], dim=1)
-        return ref_to_history_list
+            ref_to_history_list = torch.cat([ref_to_history_list, ref_to_ref_list], dim=1)  # [history transforms, ref transform]，shape [B, memory_queue_len, 4, 4]。
+        return ref_to_history_list  # 返回 ref/current -> memory queue 各帧 lidar 坐标系的 4x4 变换。
 
     def _align_bev_coordnates(self, frame_idx, ref_to_history_list, img_metas, plan_traj):
         """Align the bev_coordinates of frame_idx to each of history_frames.
 
         Args:
-            frame_idx: the index of target frame.
+            frame_idx: the index of target future frame.
             ref_to_history_list (torch.Tensor): a tensor with shape as [bs, num_prev_frames, 4, 4]
-                indicating the transformation metric from reference to each history frames.
+                indicating the transformation matrix from reference/current frame to each BEV memory frame.
             img_metas: a list of batch_size items.
                 In each item, there is one img_meta (reference frame)
                 whose {future2ref_lidar_transform} & {ref2future_lidar_transform} are for
                 transformation alignment.
+            plan_traj: accumulated or step-wise ego trajectory condition used by Drive-OccWorld.
+
+        #* 核心目的：
+        #*   预测未来第 frame_idx 帧 BEV 时，future BEV query 位于未来自车坐标系；
+        #*   prev_bev_input/memory_queue 中的 BEV 位于历史/当前各自坐标系。
+        #*   因此这里要把 future BEV 网格点变换到每个 memory BEV 坐标系，
+        #*   得到 aligned_bev_grids，供 WorldDecoder cross-attention/deformable attention
+        #*   在历史/当前 BEV memory 的正确位置采样特征。
         """
-        bs, num_frame = ref_to_history_list.shape[:2]
-        translation_xy = torch.cumsum(plan_traj, dim=1)[:, -1, :2].float()
+        bs, num_frame = ref_to_history_list.shape[:2]  # bs: batch size；num_frame: memory queue 中 BEV 帧数。
+        translation_xy = torch.cumsum(plan_traj, dim=1)[:, -1, :2].float()  # 当前参考帧到目标未来帧的累计 x/y 位移。
 
         # 1. get future2ref and ref2future_matrix of frame_idx.
+        # future2ref: 目标未来帧 lidar 坐标 -> 当前参考帧 ref lidar 坐标。
+        # 原 nuScenes/离线 SemanticKITTI Dataset 会在当前参考帧 img_meta 中预先写入这些未来位姿变换。
         future2ref = [img_meta['future2ref_lidar_transform'][frame_idx] for img_meta in img_metas]
-        future2ref = ref_to_history_list.new_tensor(np.array(future2ref))
-        # use translation_xy
-        if self.future_pred_head.use_plan_traj:
-            future2ref = future2ref.transpose(-1, -2)
-            future2ref[:, :2, 3] = translation_xy
-            future2ref = future2ref.transpose(-1, -2)
-            future2ref = future2ref.detach().clone()
+        future2ref = ref_to_history_list.new_tensor(np.array(future2ref))  # shape: [B, 4, 4]，device/dtype 跟随 ref_to_history_list。
 
-        ref2future = [img_meta['ref2future_lidar_transform'][frame_idx] for img_meta in img_metas]
-        ref2future = ref_to_history_list.new_tensor(np.array(ref2future))
         # use translation_xy
         if self.future_pred_head.use_plan_traj:
+            # 如果启用 plan_traj，则用规划/GT 轨迹里的累计 x/y 位移覆盖 future2ref 的平移部分。
+            # 注意这里先 transpose，是因为当前代码里的 4x4 矩阵按 row-vector 形式使用：
+            #   aligned_bev_coords = aligned_bev_coords @ future_to_history_list
+            # 因此平移项实际位于 transpose 后的 [:2, 3]。
+            future2ref = future2ref.transpose(-1, -2)
+            future2ref[:, :2, 3] = translation_xy  # 用 plan_traj 累计位移替代 Dataset 中的 x/y 平移。
+            future2ref = future2ref.transpose(-1, -2)
+            future2ref = future2ref.detach().clone()  # 这里作为几何对齐条件使用，不让梯度回传到 plan_traj。
+
+        # ref2future: 当前参考帧 ref lidar 坐标 -> 目标未来帧 lidar 坐标。
+        # 主要返回给外部，用于更新 ref_to_history_list / 后续 future memory 对齐。
+        ref2future = [img_meta['ref2future_lidar_transform'][frame_idx] for img_meta in img_metas]
+        ref2future = ref_to_history_list.new_tensor(np.array(ref2future))  # shape: [B, 4, 4]。
+
+        # use translation_xy
+        if self.future_pred_head.use_plan_traj:
+            # future2ref 平移被 plan_traj 覆盖后，ref2future 需要同步更新为其逆向平移。
+            # 这里保持原实现的 row-vector 矩阵约定，先 transpose 后修改平移项。
             ref2future = ref2future.transpose(-1, -2)
-            rot = ref2future[:, :3, :3]
-            translation_xyz = future2ref[:, 3, :3].unsqueeze(2)     # cur2ref
-            translation_xyz = -(rot @ translation_xyz).squeeze(2)   # ref2cur
-            ref2future[:, :3, 3] = translation_xyz
+            rot = ref2future[:, :3, :3]  # ref -> future 的旋转部分。
+            translation_xyz = future2ref[:, 3, :3].unsqueeze(2)     # future -> ref 的平移，记作 cur2ref。
+            translation_xyz = -(rot @ translation_xyz).squeeze(2)   # 根据逆变换关系得到 ref -> future 平移。
+            ref2future[:, :3, 3] = translation_xyz  # 写回 ref2future 平移项。
             ref2future = ref2future.transpose(-1, -2)
-            ref2future = ref2future.detach().clone()
+            ref2future = ref2future.detach().clone()  # 几何条件不参与反传。
 
         # 2. compute the transformation matrix from current frame to all previous frames.
-        future2ref = future2ref.unsqueeze(1).repeat(1, num_frame, 1, 1).contiguous()
+        # 将 future -> ref 扩展到每个 memory BEV 帧。
+        future2ref = future2ref.unsqueeze(1).repeat(1, num_frame, 1, 1).contiguous()  # [B, num_frame, 4, 4]。
+        # 组合得到 future -> history/current memory：
+        #   future -> ref/current  再  ref/current -> each memory frame。
+        # future_to_history_list: [B, num_frame, 4, 4]。
         future_to_history_list = torch.matmul(future2ref, ref_to_history_list)
 
         # 3. compute coordinates of future frame.
-        bev_grids = e2e_predictor_utils.get_bev_grids(
-            self.bev_h, self.bev_w, bs * num_frame)
-        bev_grids = bev_grids.view(bs, num_frame, -1, 2)
-        bev_coords = e2e_predictor_utils.bev_grids_to_coordinates(
-            bev_grids, self.point_cloud_range)
+        # 生成目标未来 BEV 的标准 grid，范围通常是 [-1, 1]，shape 初始为 [B*num_frame, H*W, 2]。
+        bev_grids = e2e_predictor_utils.get_bev_grids(self.bev_h, self.bev_w, bs * num_frame)
+        bev_grids = bev_grids.view(bs, num_frame, -1, 2)  # [B, num_frame, H*W, 2]。
+        # 将归一化 grid 坐标转成实际 BEV/点云坐标，例如米制 x/y 坐标。
+        bev_coords = e2e_predictor_utils.bev_grids_to_coordinates(bev_grids, self.point_cloud_range)
 
         # 4. align target coordinates of future frame to each of previous frames.
-        aligned_bev_coords = torch.cat([
-            bev_coords, torch.ones_like(bev_coords[..., :2])], -1)
+        # 给 BEV x/y 坐标补齐 z/齐次坐标，变成 [x, y, 1, 1] 风格，便于乘 4x4 矩阵。
+        # 注意这里保持原实现：用 ones_like(bev_coords[..., :2]) 一次补两个维度。
+        aligned_bev_coords = torch.cat([bev_coords, torch.ones_like(bev_coords[..., :2])], -1)
+        # 将 future BEV 中每个 query 的实际坐标变换到每个 memory BEV 坐标系。
+        # aligned_bev_coords: [B, num_frame, H*W, 4] @ [B, num_frame, 4, 4]
+        #                   -> [B, num_frame, H*W, 4]
         aligned_bev_coords = torch.matmul(aligned_bev_coords, future_to_history_list)
-        aligned_bev_coords = aligned_bev_coords[..., :2]
+        aligned_bev_coords = aligned_bev_coords[..., :2]  # 只保留变换后的 x/y 坐标。
+        # 将实际 x/y 坐标再转回 BEV grid 坐标，便于 attention/grid_sample 使用。
         aligned_bev_grids, _ = e2e_predictor_utils.bev_coords_to_grids(
             aligned_bev_coords, self.bev_h, self.bev_w, self.point_cloud_range)
-        aligned_bev_grids = (aligned_bev_grids + 1) / 2.  # range of [0, 1]
+        aligned_bev_grids = (aligned_bev_grids + 1) / 2.  # 原 grid 范围 [-1,1]，这里转成 [0,1]。
         # b, h*w, num_frame, 2
+        # WorldDecoder 期望 ref_points shape 类似 [B, H*W, num_frame, 2]：
+        # 对每个 future query，给出它在每个 memory BEV 中应采样的位置。
         aligned_bev_grids = aligned_bev_grids.permute(0, 2, 1, 3).contiguous()
 
         # 5. get target bev_grids at target future frame.
+        # tgt_grids 是目标 future BEV 自身的 query grid，shape [B, H*W, 2]。
+        # 由于每个 memory 帧使用同一套 target future grid，这里取最后一个 num_frame 位置即可。
         tgt_grids = bev_grids[:, -1].contiguous()
+        # 返回：
+        # - tgt_grids: future BEV query 自身坐标，shape [B, H*W, 2]；
+        # - aligned_bev_grids: future query 对齐到各 memory BEV 后的采样坐标，
+        #   shape [B, H*W, memory_queue_len, 2]，数值范围约为 [0,1]；
+        # - ref2future: ref/current -> future，用于更新下一步 memory 的位姿关系，
+        #   shape [B, 4, 4]；
+        # - future_to_history_list.transpose: 按后续 ConditionalNorm/ego-motion norm 约定返回，
+        #   shape [B, memory_queue_len, 4, 4]。
         return tgt_grids, aligned_bev_grids, ref2future, future_to_history_list.transpose(-1, -2)
 
 
@@ -413,6 +464,7 @@ class Drive_OccWorld(BEVFormer):
         # 后续每个 future query 都要根据 future pose/action condition 对齐到历史 BEV memory。
         ref_img_metas = [[each[num_frames-1]] for each in prev_img_metas]
         prev_img_metas = [[each[i] for i in range(num_frames-1)] for each in prev_img_metas]
+        # ** (1) 收集当前帧到历史/当前 memory 帧的坐标变换；得到 aligned_bev_grids，供 WorldDecoder cross-attention/deformable attention
         ref_to_history_list = self._get_history_ref_to_previous_transform(
             prev_bev_input, prev_bev_input.shape[1], prev_img_metas, ref_img_metas)
 
@@ -445,26 +497,47 @@ class Drive_OccWorld(BEVFormer):
             #* 把 can_bus 当作 action condition，用来控制该未来帧的 occupancy 预测。
 
             # ====================================================================#
-            # 1. obtain the coordinates of future BEV query to previous frames.
+            # ** (2) 再结合未来运动，把未来 BEV query 对齐到 memory BEV；
+            # * 把 future BEV 网格点变换到每个 memory BEV 坐标系，
             tgt_grids, aligned_prev_grids, ref2future, future2history = self._align_bev_coordnates(
                 future_frame_index, ref_to_history_list, img_metas, plan_traj)
             cond_norm_dict['future2history'] = future2history
 
 
+            # * =========================================================
+            # * 预测未来帧BEV特征
             # 2. transform for generating freespace of future frame.
+            #* tgt_grids 和 aligned_prev_grids 的区别：
+            #* - tgt_grids 是“要生成的未来 BEV query 自己在哪里”；
+            #* - aligned_prev_grids 是“这些未来 query 应该去历史/当前 BEV memory 的哪里采样特征”。
             # pred_feat: inter_num, bs, bev_h * bev_w, c
             if future_frame_index in valid_frames:  # compute loss if it is a valid frame.
                 pred_feat, bev_sem_pred = future_pred_head(
-                    prev_bev_input, img_metas, future_frame_index, action_condition_dict, cond_norm_dict,
-                    tgt_points=tgt_grids, bev_h=self.bev_h, bev_w=self.bev_w, ref_points=aligned_prev_grids)
-                next_bev_feats.append(pred_feat)
-                next_bev_sem.append(bev_sem_pred)
+                    prev_bev_input,  # memory queue BEV 特征，[B, memory_queue_len, H*W, C]。
+                    img_metas,  # 当前参考帧 meta；提供 future_can_bus / 位姿等条件信息。
+                    future_frame_index,  # 当前正在预测的未来步编号，1 表示 t+1，2 表示 t+2。
+                    action_condition_dict,  # 动作条件字典，如 command、vel_steering、plan_traj。
+                    cond_norm_dict,  # 条件归一化字典，如 future2history / occ_gts。
+                    tgt_points=tgt_grids,  # 目标坐标：future BEV query 在未来帧自身 BEV 坐标系中的规则网格位置，[B, H*W, 2]。
+                    bev_h=self.bev_h,  # BEV 网格高度 H。
+                    bev_w=self.bev_w,  # BEV 网格宽度 W。
+                    ref_points=aligned_prev_grids)  # 采样坐标：同一批 future query 映射到各 memory BEV 后的位置，用于从 prev_bev_input 取特征，[B, H*W, memory_queue_len, 2]。
+
+                next_bev_feats.append(pred_feat)  # 保存当前 future step 的 BEV feature；pred_feat shape [inter_num, B, H*W, C]。
+                next_bev_sem.append(bev_sem_pred)  # 保存 sem_norm/render 分支输出，用于后续 loss_sem_norm。
             else:
                 with torch.no_grad():
                     pred_feat, bev_sem_pred = future_pred_head(
-                        prev_bev_input, img_metas, future_frame_index, action_condition_dict, cond_norm_dict,
-                        tgt_points=tgt_grids, bev_h=self.bev_h, bev_w=self.bev_w, ref_points=aligned_prev_grids)
-                    next_bev_feats.append(pred_feat)
+                        prev_bev_input,  # memory queue BEV 特征，[B, memory_queue_len, H*W, C]。
+                        img_metas,  # 当前参考帧 meta；提供 future_can_bus / 位姿等条件信息。
+                        future_frame_index,  # 当前正在预测的未来步编号。
+                        action_condition_dict,  # 动作条件字典，如 command、vel_steering、plan_traj。
+                        cond_norm_dict,  # 条件归一化字典，如 future2history / occ_gts。
+                        tgt_points=tgt_grids,  # 目标坐标：future BEV query 在未来帧自身 BEV 坐标系中的规则网格位置，[B, H*W, 2]。
+                        bev_h=self.bev_h,  # BEV 网格高度 H。
+                        bev_w=self.bev_w,  # BEV 网格宽度 W。
+                        ref_points=aligned_prev_grids)  # 采样坐标：同一批 future query 映射到各 memory BEV 后的位置，用于从 prev_bev_input 取特征，[B, H*W, memory_queue_len, 2]。
+                    next_bev_feats.append(pred_feat)  # 非监督帧只用于自回归 rollout，不保留梯度。
 
 
             # 3. Planning based on semantic occupancy.
@@ -526,7 +599,7 @@ class Drive_OccWorld(BEVFormer):
 
             # 4. update pred_feat to prev_bev_input and update ref_to_history_list.
             memory_feat = pred_feat[-1]
-            
+
             # *===============================================================================#
             #* 可选截断自回归 future BEV 的跨步梯度：detach 当前 step 的 BEV 后再作为下一步 memory。
             #* 例如 interval=2 时，t+2 自身 loss 仍可回传至更早步骤，但 t+3/t+4 不会越过 t+2 回传。
@@ -534,8 +607,8 @@ class Drive_OccWorld(BEVFormer):
                     and self.future_bev_detach_interval > 0
                     and future_frame_index % self.future_bev_detach_interval == 0):
                 memory_feat = memory_feat.detach()
-            
-            
+
+
             prev_bev_input = torch.cat([prev_bev_input, memory_feat.unsqueeze(1)], 1)
             prev_bev_input = prev_bev_input[:, 1:, ...].contiguous()
             # update ref2future to ref_to_history_list.
@@ -803,7 +876,7 @@ class Drive_OccWorld(BEVFormer):
                 occ_gts = F.interpolate(occ_gts.unsqueeze(1), size=(self.bev_h, self.bev_w, self.future_pred_head.prev_render_neck.pred_height), mode='nearest').transpose(0,1)  # resize 到 BEV/head 使用的空间尺寸。
             else:
                 occ_gts = None  # 默认路径：ConditionalNorm 不使用 GT occupancy，只使用预测/特征自身。
-            
+
             cond_norm_dict = {'occ_gts': occ_gts}  # 传给 future_pred_head.prev_render_neck 使用。
             # D3. prepare action condition dict.
             action_condition_dict = {'command':command, 'vel_steering': vel_steering} # command:(1 5) vel_steering:(1 5 4)
@@ -832,7 +905,7 @@ class Drive_OccWorld(BEVFormer):
         if self.turn_on_flow: # False
             losses_flow = self.compute_flow_loss(next_bev_preds_flow, flow)
             losses.update(losses_flow)
-        
+
         # E3. Compute loss for plan regression.
         if self.turn_on_plan: # False
             if 'v1' in self.plan_head_type: # used for fine-grained_MMO when sem_occupancy distinguish categories in MMO

@@ -239,9 +239,10 @@ model = dict(
         # - command 来自 Dataset 构造的 pseudo command；
         # 这样既能跑通原 WorldDecoder 的 action-condition 接口，也不依赖真实 CAN bus。
         use_can_bus=False, # semantickitti无can bus
-        use_plan_traj=True,
-        use_command=True,
-        
+        # use_plan_traj=True,
+        # use_command=True,
+        use_plan_traj=False,
+        use_command=False,
         use_vel_steering=False,
         use_vel=False,
         use_steering=False,

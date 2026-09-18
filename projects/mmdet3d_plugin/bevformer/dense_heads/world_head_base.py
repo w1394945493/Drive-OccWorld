@@ -440,30 +440,45 @@ class WorldHeadTemplate(BaseModule):
 
     @auto_fp16(apply_to=('mlvl_feats'))
     def forward(self,
-                prev_feats,
-                img_metas,
-                target_frame_index,
-                action_condition_dict,
-                cond_norm_dict,
-                tgt_points,  # tgt_points config for self-attention.
-                ref_points,  # ref_points config for cross-attention.
-                bev_h, bev_w,):
+                prev_feats,  # memory queue BEV 特征，[B, memory_queue_len, H*W, C]。
+                img_metas,  # 当前参考帧 meta；可提供 future_can_bus / future pose 等信息。
+                target_frame_index,  # 当前要预测的未来步编号，1 表示 t+1，2 表示 t+2。
+                action_condition_dict,  # 动作条件字典；包含 command / vel_steering / plan_traj。
+                cond_norm_dict,  # 条件归一化字典；包含 future2history / occ_gts 等。
+                tgt_points,  # 目标坐标：future BEV query 在未来帧自身 BEV 坐标系中的位置，[B, H*W, 2]。
+                ref_points,  # 采样坐标：future query 映射到各 memory BEV 后的位置，[B, H*W, memory_queue_len, 2]。
+                bev_h, bev_w,):  # BEV 网格尺寸 H/W。
         f"""Forward function: a wrapper function for self._get_next_bev_features
 
-        From previous multi-frame BEV features (mlvl_feats) predict
-        the next-frame of point cloud.
+        #* ================== WorldHeadBase.forward：预测一个未来步的 BEV feature ==================
+        # 该函数由 Drive_OccWorld.future_pred() 在自回归循环中逐步调用：
+        #   prev_feats + future query 坐标 + action condition
+        #       -> WorldDecoder
+        #       -> target_frame_index 对应的 future BEV feature。
+        #
+        # tgt_points 和 ref_points 的区别：
+        #   - tgt_points: future BEV query 在“未来帧自身坐标系”中的规则网格位置；
+        #   - ref_points: 同一批 future query 映射到“历史/当前 BEV memory”后的采样位置，
+        #     用于 WorldDecoder 的 temporal cross-attention / deformable attention。
+        #
         Args:
-            mlvl_feats (Tensor): BEV features from previous frames input, with
+            prev_feats (Tensor): BEV features from previous frames input, with
                 shape of (bs, num_frames, bev_h * bev_w, embed_dim).
             img_metas: information of reference frame inputs.
                 key "future_can_bus": can_bus information of future frames,
                     Note, 0 represents the reference frame.
-            tgt_points (Tensor): query point coordinates in target frame coordinates.
-            ref_points (Tensor): query point coordinates in previous frame coordinates.
+            target_frame_index: the future frame index to predict.
+            action_condition_dict: dict of action/planning conditions.
+            cond_norm_dict: dict for semantic-/motion-conditional normalization.
+            tgt_points (Tensor): query point coordinates in target future frame coordinates,
+                shape [B, H*W, 2].
+            ref_points (Tensor): query point coordinates aligned to previous/memory BEV
+                coordinates, shape [B, H*W, memory_queue_len, 2].
+            bev_h, bev_w: spatial shape of BEV query map.
         Returns:
-            A dict with:
-                next_bev_feature (Tensor): prediction of BEV features of next frame.
-                next_bev_pred (Tensor): prediction of next BEV occupancy (Freespace).
+            next_bev_feature (Tensor): predicted BEV features of target future frame,
+                shape [num_decoder_layers, B, H*W, C] when return_intermediate=True.
+            bev_sem_pred: auxiliary semantic rendering output from ConditionalNorm branch.
         """
         bs, num_frames, bev_grids_num, bev_dims = prev_feats.shape
         assert bev_dims == self.embed_dims
