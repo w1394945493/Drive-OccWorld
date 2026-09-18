@@ -65,20 +65,6 @@ python tools/train.py \
   checkpoint_config.interval=1 \
   evaluation.interval=1
 
-CUDA_VISIBLE_DEVICES=4 \
-PYTHONPATH="$(pwd)" \
-python tools/train.py \
-  projects/configs/kitti/semantic_kitti_drive_occworld_debug.py \
-  --work-dir out/semantic_kitti_drive_occworld_epoch_debug_r50 \
-  --cfg-options \
-  total_epochs=2 \
-  runner.max_epochs=2 \
-  data.train.max_samples=20 \
-  data.val.max_samples=5 \
-  data.workers_per_gpu=0 \
-  checkpoint_config.interval=1 \
-  evaluation.interval=1
-
 # 多卡测试流程
 CUDA_VISIBLE_DEVICES=0,1 \
 PYTHONPATH="$(pwd)" \
@@ -95,7 +81,15 @@ torchrun --nproc_per_node=2 --master_port=29501 \
   checkpoint_config.interval=1 \
   evaluation.interval=1
 
-
+# 可视化
+PYTHONPATH="$(pwd)" \
+python scripts/vis_semantic_kitti_drive_occworld.py \
+  --config projects/configs/kitti/semantic_kitti_drive_occworld.py \
+  --checkpoint /c20250502/wangyushen/Outputs/drive_occworld/semkitti/train/epoch_24.pth \
+  --split val \
+  --index 0 \
+  --out-dir out/semantic_kitti_drive_occworld_vis \
+  --save-npy
 
 # =====================================================================#
 #  火山服务器训练

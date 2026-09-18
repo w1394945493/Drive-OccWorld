@@ -67,7 +67,7 @@ val_max_samples = None
 # - history_queue_length: 输入历史帧数量；
 # - future_queue_length : 需要加载的未来 occupancy 标注数量。
 history_queue_length = 2
-future_queue_length = 4
+future_queue_length = 6
 
 # * ================== 相机输入模式 ==================
 # 可选：
@@ -143,11 +143,13 @@ only_generate_dataset = False
 supervise_all_future = True
 
 memory_queue_len = 1
+
 #* 自回归 future BEV 显存优化实验开关。
 #* 默认 0 表示不 detach，保持原 Drive-OccWorld 完整多步反传；
 #* 若设置为 2，则训练时每 2 个 future step 截断一次跨步梯度，
 #* 用于降低 current->t+1->t+2->t+3->t+4 长链路计算图显存。
 future_bev_detach_interval = 2
+
 future_pred_frame_num_train = future_queue_length
 future_pred_frame_num_test = future_queue_length
 

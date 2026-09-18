@@ -54,21 +54,5 @@
             "console": "integratedTerminal"
         },
         
-        {
-            "name": "kitti r50 train",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "tools/train.py",
-            "args": [
-                "projects/configs/kitti/semantic_kitti_drive_occworld_debug.py",
-                "--work-dir",
-                "out/kitti_debug_r50",
-            ],
-            "env": {
-                "CUDA_VISIBLE_DEVICES": "4",
-                "PYTHONPATH": "${workspaceFolder}"
-            },
-            "console": "integratedTerminal"
-        },
     ]
 }
