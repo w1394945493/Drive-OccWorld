@@ -180,9 +180,9 @@ class BEVFormer(MVXTwoStageDetector):
                 if not img_metas[0]['prev_bev_exists']:
                     prev_bev = None
 
-                img_feats = [each_scale[:, i] for each_scale in img_feats_list] # stages*[B,Ncams,C,H,W]  某一帧的feat
+                img_feats = [each_scale[:, i] for each_scale in img_feats_list] # 4:(1 1 256 48 156) (1 1 256 24 78) (1 1 256 12 39) (1 1 256 6 20) # stages*[B,Ncams,C,H,W]  某一帧的feat
                 prev_bev = self.pts_bbox_head(
-                    img_feats, img_metas, prev_bev, only_bev=True)
+                    img_feats, img_metas, prev_bev, only_bev=True) # (1 16384 256)
                 prev_bev_list.append(prev_bev)
 
             if i < drop_prev_index:

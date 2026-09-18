@@ -38,10 +38,10 @@ class WorldBEVFormerHead(BEVFormerHead):
         assert only_bev
         bs, num_cam, _, _, _ = mlvl_feats[0].shape
         dtype = mlvl_feats[0].dtype
-        bev_queries = self.bev_embedding.weight.to(dtype)
+        bev_queries = self.bev_embedding.weight.to(dtype) # (16384 256)
         bev_mask = torch.zeros((bs, self.bev_h, self.bev_w),
-                               device=bev_queries.device).to(dtype)
-        bev_pos = self.positional_encoding(bev_mask).to(dtype)
+                               device=bev_queries.device).to(dtype) # (1 128 128)
+        bev_pos = self.positional_encoding(bev_mask).to(dtype) # (1 256 128 128)
 
         return self.transformer.get_bev_features(
             mlvl_feats,

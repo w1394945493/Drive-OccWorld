@@ -741,7 +741,7 @@ class Drive_OccWorld(BEVFormer):
         #* obtain_history_bev 继承自 BEVFormer，历史帧只用于构造 temporal BEV，不是本文主要创新点。
         # B1. Forward previous frames.
         # prev_img: [B, queue_length, num_cam, C, H, W]，例如 B=1、queue_length=2、num_cam=6。
-        prev_img = img[:, :-1, ...]
+        prev_img = img[:, :-1, ...] # (1 2 1 3 384 1248)
         prev_img_metas = copy.deepcopy(img_metas)
         # B2. Randomly grid-mask prev_bev.
         prev_bev, prev_bev_list = self.obtain_history_bev(prev_img, prev_img_metas, drop_prev_index=drop_prev_index) # (1 40000 256)
@@ -772,7 +772,7 @@ class Drive_OccWorld(BEVFormer):
         img = img[:, -1, ...] # (1 6 3 992 1760)
         img_metas = [each[num_frames-1] for each in img_metas]
         if self.turn_on_plan:
-            # 仅当 turn_on_plan=True 时启用：先根据当前 occupancy/command 预测参考帧规划结果，
+            # 仅当 turn_on_plan=True 时启用： 先根据当前 occupancy/command 预测参考帧规划结果，
             # ref_pose_pred/ref_pose_loss 会继续参与未来预测和 planning loss。
             ref_sample_traj = sample_traj[:, :, 0]
             ref_real_traj = sdc_planning[:, 0]
