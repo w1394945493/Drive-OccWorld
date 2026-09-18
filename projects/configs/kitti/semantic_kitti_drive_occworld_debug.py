@@ -154,6 +154,10 @@ only_generate_dataset = False
 supervise_all_future = True
 
 memory_queue_len = 1
+# todo: 自回归 future BEV 显存优化实验开关。
+# todo: 默认 0 表示不 detach，保持原 Drive-OccWorld 完整多步反传；
+# todo: 若设置为 2，则训练时每 2 个 future step 截断一次跨步梯度。
+future_bev_detach_interval = 0
 future_pred_frame_num_train = future_queue_length
 future_pred_frame_num_test = future_queue_length
 
@@ -179,6 +183,7 @@ model = dict(
     video_test_mode=True,
     only_generate_dataset=only_generate_dataset,
     supervise_all_future=supervise_all_future,
+    future_bev_detach_interval=future_bev_detach_interval,
 
     point_cloud_range=point_cloud_range,
     bev_h=bev_h_,

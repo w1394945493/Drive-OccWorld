@@ -37,6 +37,10 @@ class Drive_OccWorld(BEVFormer):
 
                  # Memory Queue configurations.
                  memory_queue_len=1,
+                 #* 显存优化实验开关，默认 0 表示保持原 Drive-OccWorld 自回归训练方式。
+                 #* 若设置为 N>0，则训练时每 N 个 future step 将预测 BEV
+                 #* 放回 memory_queue 前 detach，截断跨未来步反向传播链路。
+                 future_bev_detach_interval=0,
 
                  # Augmentations.
                  # A1. randomly drop current image (to enhance temporal feature.)
@@ -100,6 +104,11 @@ class Drive_OccWorld(BEVFormer):
 
         # memory queue
         self.memory_queue_len = memory_queue_len
+        #* Truncated BPTT for autoregressive future BEV rollout.
+        #* 默认 0 不做 detach，不影响原 nuScenes/Drive-OccWorld 行为；
+        #* SemanticKITTI 显存优化实验可设置为 2，形成
+        #* current -> t+1 -> t+2.detach() -> t+3 -> t+4.detach() 的局部反传链。
+        self.future_bev_detach_interval = future_bev_detach_interval
 
 
         self.future_pred_frame_num = future_pred_frame_num
@@ -517,7 +526,14 @@ class Drive_OccWorld(BEVFormer):
 
 
             # 4. update pred_feat to prev_bev_input and update ref_to_history_list.
-            prev_bev_input = torch.cat([prev_bev_input, pred_feat[-1].unsqueeze(1)], 1)
+            memory_feat = pred_feat[-1]
+            #* 可选截断自回归 future BEV 的跨步梯度：detach 当前 step 的 BEV 后再作为下一步 memory。
+            #* 例如 interval=2 时，t+2 自身 loss 仍可回传至更早步骤，但 t+3/t+4 不会越过 t+2 回传。
+            if (self.training and self.future_bev_detach_interval is not None
+                    and self.future_bev_detach_interval > 0
+                    and future_frame_index % self.future_bev_detach_interval == 0):
+                memory_feat = memory_feat.detach()
+            prev_bev_input = torch.cat([prev_bev_input, memory_feat.unsqueeze(1)], 1)
             prev_bev_input = prev_bev_input[:, 1:, ...].contiguous()
             # update ref2future to ref_to_history_list.
             ref_to_history_list = torch.cat([ref_to_history_list, ref2future.unsqueeze(1)], 1)

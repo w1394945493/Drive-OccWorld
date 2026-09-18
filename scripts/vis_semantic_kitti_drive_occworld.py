@@ -6,10 +6,11 @@
     2. 构建 Dataset / Model；
     3. 可选加载 checkpoint；
     4. 对指定样本执行一次 occupancy forecasting 推理；
-    5. 保存预测/GT occupancy 的 BEV top-down PNG 和原始 .npy。
+    5. 保存预测/GT occupancy 的 BEV top-down 并列对比 PNG 和原始 .npy。
 
 说明：
     - 本脚本不弹出 GUI，matplotlib 使用 Agg 后端，适合服务器环境。
+    - 默认仅保存各时间步的 pred-gt 并列对比图，避免输出过多单独图片。
     - 为了拿到 raw occupancy prediction，本脚本复现 drive_occworld.py 中
       forward_test() 的主要 occupancy 前向链路，并在 evaluate_occ() 之前截取
       next_bev_preds。
@@ -323,20 +324,6 @@ def colorize_bev(bev, empty_idx=0):
     return out
 
 
-def save_bev_png(bev, path, title=None, empty_idx=0):
-    rgb = colorize_bev(bev, empty_idx=empty_idx)
-    os.makedirs(osp.dirname(path), exist_ok=True)
-    plt.figure(figsize=(6, 6))
-    # transpose + origin lower 让 x/y 看起来更接近 BEV 坐标系。
-    plt.imshow(np.transpose(rgb, (1, 0, 2)), origin='lower')
-    if title is not None:
-        plt.title(title)
-    plt.axis('off')
-    plt.tight_layout(pad=0)
-    plt.savefig(path, dpi=160, bbox_inches='tight', pad_inches=0)
-    plt.close()
-
-
 def save_pair_png(pred_bev, gt_bev, path, step_name, empty_idx=0):
     pred_rgb = colorize_bev(pred_bev, empty_idx=empty_idx)
     gt_rgb = colorize_bev(gt_bev, empty_idx=empty_idx)
@@ -413,16 +400,8 @@ def main():
         pred_bev = voxel_to_bev(pred_np[step_idx], empty_idx=args.empty_idx)
         gt_bev = voxel_to_bev(gt_np[step_idx], empty_idx=args.empty_idx)
 
-        save_bev_png(
-            pred_bev,
-            osp.join(out_dir, f'{step_idx:02d}_{step_name}_pred.png'),
-            title=f'Pred {step_name}',
-            empty_idx=args.empty_idx)
-        save_bev_png(
-            gt_bev,
-            osp.join(out_dir, f'{step_idx:02d}_{step_name}_gt.png'),
-            title=f'GT {step_name}',
-            empty_idx=args.empty_idx)
+        #* 仅保存 pred-gt 并列对比图。
+        #* 单独 pred.png / gt.png 容易造成输出文件过多，当前调试主要看对比效果。
         save_pair_png(
             pred_bev,
             gt_bev,
