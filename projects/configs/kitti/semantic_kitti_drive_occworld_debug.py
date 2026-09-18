@@ -45,9 +45,9 @@ ann_root = "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/data/semantic_
 # - learning_rate: AdamW 基础学习率；img_backbone 会在 optimizer.paramwise_cfg
 #   中乘以 lr_mult=0.1。
 samples_per_gpu = 1
-workers_per_gpu = 2
+workers_per_gpu = 0
 max_epochs = 24
-log_interval = 50
+log_interval = 1
 eval_interval = 1
 checkpoint_interval = 1
 max_keep_ckpts = 1
@@ -141,16 +141,16 @@ empty_idx = 0
 turn_on_flow = False
 turn_on_plan = False
 only_generate_dataset = False
-#* True：除当前帧外，对所有 future step 都计算 occupancy loss；False：训练时随机监督一个 future step，以节省显存。
+# * True：除当前帧外，对所有 future step 都计算 occupancy loss；False：训练时随机监督一个 future step，以节省显存。
 supervise_all_future = True
 
-#* Future BEV 预测使用的 memory queue 长度；设为 1 表示每一步只保留最新的 BEV 作为下一步预测的 memory。
-memory_queue_len = 1
+# * Future BEV 预测使用的 memory queue 长度；设为 1 表示每一步只保留最新的 BEV 作为下一步预测的 memory。
+memory_queue_len = 1  # memory_queue_len=1 时，WorldDecoder 的 memory 只包含当前 ref_bev
 
-#* 自回归 future BEV 显存优化实验开关。
-#* 默认 0 表示不 detach，保持原 Drive-OccWorld 完整多步反传；
-#* 若设置为 2，则训练时每 2 个 future step 截断一次跨步梯度，
-#* 用于降低 current->t+1->t+2->t+3->t+4 长链路计算图显存。
+# * 自回归 future BEV 显存优化实验开关。
+# * 默认 0 表示不 detach，保持原 Drive-OccWorld 完整多步反传；
+# * 若设置为 2，则训练时每 2 个 future step 截断一次跨步梯度，
+# * 用于降低 current->t+1->t+2->t+3->t+4 长链路计算图显存。
 future_bev_detach_interval = 0
 
 future_pred_frame_num_train = future_queue_length
@@ -239,10 +239,10 @@ model = dict(
         # - command 来自 Dataset 构造的 pseudo command；
         # 这样既能跑通原 WorldDecoder 的 action-condition 接口，也不依赖真实 CAN bus。
         use_can_bus=False, # semantickitti无can bus
-        # use_plan_traj=True,
-        # use_command=True,
-        use_plan_traj=False,
-        use_command=False,
+        use_plan_traj=True,
+        use_command=True,
+        # use_plan_traj=False,
+        # use_command=False,
         use_vel_steering=False,
         use_vel=False,
         use_steering=False,

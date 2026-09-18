@@ -59,7 +59,7 @@
             "request": "launch",
             "program": "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/train.py",
             "args": [
-                "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/kitti/semantic_kitti_drive_occworld.py",
+                "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/kitti/semantic_kitti_drive_occworld_debug.py",
                 "--work-dir",
                 "out/kitti/train",
             ],

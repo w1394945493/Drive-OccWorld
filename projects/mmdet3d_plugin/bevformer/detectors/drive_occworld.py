@@ -246,7 +246,7 @@ class Drive_OccWorld(BEVFormer):
             ref_to_history_list (torch.Tensor): with shape as [bs, num_prev_frames, 4, 4]
         """
         ref_num_frames = 1  # 当前参考帧数量固定为 1，即 memory queue 最后会包含当前 ref_bev。
-        history_num_frames = num_frames - ref_num_frames  # history BEV 数量；num_frames 通常等于 memory_queue_len。
+        history_num_frames = num_frames - ref_num_frames  # history BEV 数量；num_frames 通常等于 memory_queue_len。memory_queue_len=1时，实际没有用到历史帧
 
         # history
         ref_to_history_list = []  # 收集 batch 内每个样本的 ref/current -> history BEV 坐标变换。
@@ -462,8 +462,8 @@ class Drive_OccWorld(BEVFormer):
 
         #* ================== 4.2 建立历史帧到参考帧的坐标变换 ==================
         # 后续每个 future query 都要根据 future pose/action condition 对齐到历史 BEV memory。
-        ref_img_metas = [[each[num_frames-1]] for each in prev_img_metas]
-        prev_img_metas = [[each[i] for i in range(num_frames-1)] for each in prev_img_metas]
+        ref_img_metas = [[each[num_frames-1]] for each in prev_img_metas] # 取当前帧meta 这里将历史帧+当前帧拆为历史帧、当前帧
+        prev_img_metas = [[each[i] for i in range(num_frames-1)] for each in prev_img_metas] # 取历史帧meta prev_img_metas一开始包含历史+当前
         # ** (1) 收集当前帧到历史/当前 memory 帧的坐标变换；得到 aligned_bev_grids，供 WorldDecoder cross-attention/deformable attention
         ref_to_history_list = self._get_history_ref_to_previous_transform(
             prev_bev_input, prev_bev_input.shape[1], prev_img_metas, ref_img_metas)
@@ -813,7 +813,7 @@ class Drive_OccWorld(BEVFormer):
         if np.random.rand() < self.random_drop_image_rate:
             img[:, -1:, ...] = torch.zeros_like(img[:, -1:, ...])
         # A2. Randomly drop previous image inputs.
-        num_frames = img.size(1)
+        num_frames = img.size(1) # 过去帧数量
         if np.random.rand() < self.random_drop_prev_rate:
             random_drop_prev_v2_end_idx = (
                 self.random_drop_prev_end_idx if self.random_drop_prev_end_idx is not None
@@ -863,15 +863,15 @@ class Drive_OccWorld(BEVFormer):
         if not self.only_train_cur_frame:  # 默认 False，说明不仅训练当前帧，还训练未来帧预测。
             # * supervise_all_future:
             if self.supervise_all_future:  # 默认 True，对所有未来帧都计算 occupancy loss。
-                valid_frames.extend(list(range(1, self.future_pred_frame_num + 1)))  # 加入 1..future_pred_frame_num，默认 1..4。
+                valid_frames.extend(list(range(1, self.future_pred_frame_num + 1)))  # 加入 1..future_pred_frame_num，默认 1..4。[0 1 2 3 4]
             else:  # randomly select one future frame for computing loss to save memory cost.
                 train_frame = np.random.choice(np.arange(1, self.future_pred_frame_num + 1), 1)[0]  # 随机抽一个未来帧省显存。
                 valid_frames.append(train_frame)  # 只监督当前帧 + 抽中的未来帧。
 
             prev_bev_list = torch.stack(prev_bev_list, dim=1) # (1 2 40000 256) 历史BEV特征
-            prev_bev_list = torch.cat([prev_bev_list, ref_bev.unsqueeze(1)], dim=1)[:, -self.memory_queue_len:, ...] # (1 40000 256) 将历史和当前bev特征拼接
+            prev_bev_list = torch.cat([prev_bev_list, ref_bev.unsqueeze(1)], dim=1)[:, -self.memory_queue_len:, ...] # (1 40000 256) 将历史和当前bev特征拼接 # (1 1 65536 256) memory queue 长度；设为 1 表示每一步只保留最新的 BEV 作为下一步预测的 memory。
             # D2. prepare conditional-normalization dict.
-            if self.future_pred_head.prev_render_neck.sem_norm and self.future_pred_head.prev_render_neck.sem_gt_train and self.training_epoch < 12:
+            if self.future_pred_head.prev_render_neck.sem_norm and self.future_pred_head.prev_render_neck.sem_gt_train and self.training_epoch < 12: # False
                 occ_gts = segmentation[0][self.future_pred_head.history_queue_length+1-self.memory_queue_len:-1]  # 取与 memory_queue 对齐的 GT occ。
                 occ_gts = F.interpolate(occ_gts.unsqueeze(1), size=(self.bev_h, self.bev_w, self.future_pred_head.prev_render_neck.pred_height), mode='nearest').transpose(0,1)  # resize 到 BEV/head 使用的空间尺寸。
             else:

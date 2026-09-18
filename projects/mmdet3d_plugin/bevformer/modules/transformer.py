@@ -121,10 +121,12 @@ class PerceptionTransformer(BaseModule):
         bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1) # HW,B,C
         bev_pos = bev_pos.flatten(2).permute(2, 0, 1)   # HW,B,C
 
+        # ===========================================================#
         # Unified alignment method for both nuPlan and nuScenes.
         # obtain rotation angle and shift with ego motion
         delta_global = np.array([each['can_bus'][:3] for each in kwargs['img_metas']])  # total_len,3  -4帧为0,其余帧为global下的delta_xyz 
         lidar2global_rotation = np.array([each['lidar2global_rotation'] for each in kwargs['img_metas']])
+        
         delta_lidar = []
         for i in range(bs):
             delta_lidar.append(np.linalg.inv(lidar2global_rotation[i]) @ delta_global[i])
@@ -143,8 +145,10 @@ class PerceptionTransformer(BaseModule):
             if self.rotate_prev_bev:
                 rotated_prev_bev = []
                 for i in range(bs):
+                    # ========================================================#
                     # num_prev_bev = prev_bev.size(1)
                     rotation_angle = kwargs['img_metas'][i]['can_bus'][-1]
+                    
                     tmp_prev_bev = prev_bev[:, i].reshape(
                         bev_h, bev_w, -1).permute(2, 0, 1)
                     tmp_prev_bev = rotate(tmp_prev_bev, rotation_angle,
@@ -154,6 +158,7 @@ class PerceptionTransformer(BaseModule):
                     rotated_prev_bev.append(tmp_prev_bev[:, 0])
                 prev_bev = torch.stack(rotated_prev_bev, 1)
 
+        # ===============================================================#
         # add can bus signals
         can_bus = bev_queries.new_tensor(
             [each['can_bus'] for each in kwargs['img_metas']])  # [:, :]
