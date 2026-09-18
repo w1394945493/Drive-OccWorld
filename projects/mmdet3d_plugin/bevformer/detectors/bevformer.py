@@ -156,18 +156,41 @@ class BEVFormer(MVXTwoStageDetector):
             return self.forward_test(**kwargs)
 
     def _obtain_frozen_history_bev(self, imgs_queue, img_metas_list, drop_prev_index):
-        """Obtain history BEV features iteratively. To save GPU memory, gradients are not calculated.
-            imgs_queue = B,L,Ncams,C,H,W  -4,-3,-2三帧
+        """Obtain history BEV features iteratively.
+
+        #* ================== Frozen history BEV：历史帧只前向，不反传 ==================
+        # 这部分用于处理较早的历史帧。为了节省显存，图像 backbone/FPN 和
+        # BEVFormer encoder 都放在 torch.no_grad() 中执行。
+        #
+        # 注意：no_grad 并不表示模型“不使用历史帧”。这些历史帧仍然会被编码成
+        # prev_bev，并作为后续历史帧/当前帧 BEV encoder 的 temporal memory。
+        # 只是 loss 不会沿这些历史帧的图像分支反向传播。
+        #
+        # imgs_queue: [B, L, Ncam, C, H, W]
+        #   B    : batch size；
+        #   L    : frozen history 的帧数，例如原 nuScenes 设置中可能是 -4/-3/-2；
+        #   Ncam : 相机数量；
+        #   C/H/W: 图像通道和尺寸。
         """
         is_training = self.training
         if is_training:
+            #* [无梯度] 临时切到 eval 模式，保持原 BEVFormer 处理历史帧的做法：
+            #* frozen history 仅用于生成 prev_bev，不更新 BN/dropout 状态，也不保留梯度。
             self.eval()
 
+        #* [无梯度] frozen history 的图像 backbone/FPN 特征提取不参与反向传播。
         with torch.no_grad():
             prev_bev = None
             bs, len_queue, num_cams, C, H, W = imgs_queue.shape
+            # 将时间维 L 合并到 batch 维，便于一次性提取所有历史帧的图像特征。
+            # [B, L, Ncam, C, H, W] -> [B*L, Ncam, C, H, W]
             imgs_queue = imgs_queue.reshape(bs * len_queue, num_cams, C, H, W)
+            # extract_feat 只需要一个 meta 列表；这里用 frozen history 最后一帧的 meta
+            # 作为占位/参考，真正逐帧送入 pts_bbox_head 时会重新取 each[i]。
             img_metas = [meta[len_queue - 1] for meta in img_metas_list]
+            # 一次性提取所有 frozen history 帧的多尺度图像特征。
+            # img_feats_list: num_levels 个特征图；
+            # 每个尺度 shape 约为 [B, L, Ncam, C_feat, H_feat, W_feat]。
             img_feats_list = self.extract_feat( # stages*[B,Lin,Ncams,C,H,W]
                 img=imgs_queue,
                 len_queue=len_queue,
@@ -175,23 +198,39 @@ class BEVFormer(MVXTwoStageDetector):
 
         prev_bev_list = []
         for i in range(len_queue):
+            #* [无梯度] frozen history 的 BEVFormer encoder 也不参与反向传播。
+            #* 因此 loss 不会通过这些较早历史帧回传到 BEV encoder / backbone。
             with torch.no_grad():
+                # 逐帧取出当前历史帧的 meta 和多尺度图像特征。
                 img_metas = [each[i] for each in img_metas_list]
                 if not img_metas[0]['prev_bev_exists']:
+                    # 场景首帧或跨 scene 时不能继承上一帧 BEV，需要重置 temporal memory。
                     prev_bev = None
 
+                # 当前第 i 个历史帧的多尺度特征：
+                # list[num_levels]，每个元素 shape 约为 [B, Ncam, C_feat, H_feat, W_feat]。
                 img_feats = [each_scale[:, i] for each_scale in img_feats_list] # 4:(1 1 256 48 156) (1 1 256 24 78) (1 1 256 12 39) (1 1 256 6 20) # stages*[B,Ncams,C,H,W]  某一帧的feat
+                # only_bev=True 表示只走 BEVFormer encoder，输出 BEV embedding，
+                # 不走检测 decoder/box head。
+                # prev_bev 会作为 temporal self-attention 的历史 BEV 输入。
                 prev_bev = self.pts_bbox_head(
                     img_feats, img_metas, prev_bev, only_bev=True) # (1 16384 256)
+                # 保存每一帧生成的 BEV，后续 Drive-OccWorld 会从中构造 memory_queue。
                 prev_bev_list.append(prev_bev)
 
             if i < drop_prev_index:
+                # 数据增强/随机丢历史 BEV 时使用：在指定位置之前重置 prev_bev，
+                # 迫使后续帧不依赖更早历史。
                 prev_bev = None
 
         if len(prev_bev_list) > self.memory_queue_len - 1:
+            # 只保留最近 memory_queue_len - 1 个历史 BEV。
+            # 之后会再拼接当前参考帧 ref_bev，组成长度为 memory_queue_len 的 memory queue。
             prev_bev_list = prev_bev_list[-(self.memory_queue_len-1):]
 
         if is_training:
+            #* [恢复梯度环境] 处理完 frozen history 后恢复训练模式，
+            #* 保证当前帧/可反传历史帧正常训练。
             self.train()
 
         return prev_bev, prev_bev_list
@@ -199,11 +238,32 @@ class BEVFormer(MVXTwoStageDetector):
     def _obtain_backwarded_history_bev(
             self, imgs_queue, prev_bev, prev_bev_list, backward_img_metas_list, backwarded_start_idx, backwarded_end_idx):
         """Obtain history BEV features iteratively, with gradients computed.
+
+        #* ================== Backwarded history BEV：最近历史帧允许部分反传 ==================
+        # 这部分处理 frozen history 之后、当前帧之前的最近若干历史帧。
+        # 由 backwarded_start_idx/backwarded_end_idx 指定切片范围。
+        #
+        # 设计目的：
+        # - 更早历史帧全部 no_grad，节省显存；
+        # - 最近 backwarded_prev_frame_num 帧的 BEVFormer encoder 保留梯度，
+        #   让模型能学习更近历史帧到当前帧的 temporal BEV 建模。
+        #
+        # 注意当前实现里：
+        # - 图像 backbone/FPN 的特征提取仍在 torch.no_grad() 中；
+        # - 但 pts_bbox_head(..., only_bev=True) 不在 no_grad 中，
+        #   因此 BEVFormer encoder 这一段可以反向传播。
         """
+        # 取需要保留 BEV encoder 梯度的最近历史帧。
+        # 例如历史帧为 [-4,-3,-2,-1]，backwarded_start_idx=3、
+        # backwarded_end_idx=4 时，这里只取 -1 帧。
         backward_prev_img = imgs_queue[:, backwarded_start_idx:backwarded_end_idx, ...]
         bs, len_queue, num_cams, C, H, W = backward_prev_img.shape
+        # [B, L_back, Ncam, C, H, W] -> [B*L_back, Ncam, C, H, W]
         backward_prev_img = backward_prev_img.reshape(bs * len_queue, num_cams, C, H, W)
+        # 作为 extract_feat 的 meta 输入；后面逐帧送入 BEV encoder 时会使用 cur_backward_img_metas。
         backward_img_metas = [meta[backwarded_start_idx] for meta in backward_img_metas_list]
+        #* [无梯度] backwarded history 的图像 backbone/FPN 仍不保留梯度，用于控制显存。
+        #* 因此这部分不会更新 img_backbone / img_neck。
         self.eval()
         with torch.no_grad():
             backward_img_feats_list = self.extract_feat(
@@ -211,33 +271,70 @@ class BEVFormer(MVXTwoStageDetector):
                 img_metas=backward_img_metas,
                 len_queue=len_queue)
         self.train()
+        #* [有梯度] 从这里开始恢复 train 模式，下面的 pts_bbox_head(..., only_bev=True)
+        #* 不在 torch.no_grad() 中，因此最近历史帧的 BEVFormer encoder 可以反传。
         for idx, prev_idx in enumerate(range(backwarded_start_idx, backwarded_end_idx)):
+            # prev_idx 是原 history 序列中的帧下标；
+            # idx 是 backwarded 子序列内部的下标，用于从 backward_img_feats_list 取特征。
             cur_backward_img_metas = [each[prev_idx] for each in backward_img_metas_list]
 
             if not cur_backward_img_metas[0]['prev_bev_exists']:
+                # 跨 scene 或没有有效上一帧时，重置 temporal memory。
                 prev_bev = None
 
+            # 当前 backwarded history 帧的多尺度图像特征。
             img_feats = [each_scale[:, idx] for each_scale in backward_img_feats_list]
+            #* [有梯度] 这里不包 torch.no_grad()：
+            #* 因此最近历史帧的 BEVFormer encoder 可以参与反向传播。
+            #* [梯度截断] 但由于 img_feats 是 no_grad 提取的，
+            #* 梯度不会继续传回图像 backbone/FPN。
             prev_bev = self.pts_bbox_head(
                 img_feats, cur_backward_img_metas, prev_bev, only_bev=True)
             prev_bev_list.append(prev_bev)
 
         if len(prev_bev_list) > self.memory_queue_len - 1:
+            # 同样只保留最近 memory_queue_len - 1 个历史 BEV。
             prev_bev_list = prev_bev_list[-(self.memory_queue_len-1):]
 
         return prev_bev, prev_bev_list
 
     def obtain_history_bev(self, img, img_metas, drop_prev_index=-1):
-        num_frames = img.shape[1]   # 只有history 没有当前帧
-        backward_prev_frame_num = self.backwarded_prev_frame_num if self.training else 0    # 1
-        backward_prev_start_idx = num_frames - backward_prev_frame_num                      # 4-1=3
-        backward_prev_end_idx = backward_prev_start_idx + backward_prev_frame_num           # 3+1=4
-        # Frozen part.
-        prev_img = img[:, :backward_prev_start_idx, ...]    # B,L,Ncams,C,H,W  -4,-3,-2三帧
+        #* ================== 历史帧 BEV 构建入口 ==================
+        # img 只包含历史帧，不包含当前参考帧。
+        # 例如总输入 queue 为 [-2, -1, current] 时，传入这里的是 [-2, -1]。
+        # shape: [B, num_history_frames, Ncam, C, H, W]
+        num_frames = img.shape[1]
+
+        #* [梯度策略] 训练阶段可让最近若干历史帧走 backwarded history 分支；
+        #* 测试阶段固定为 0，即全部历史帧只前向、不反传。
+        backward_prev_frame_num = self.backwarded_prev_frame_num if self.training else 0
+
+        # 将历史帧切成两段：
+        #*   [0, backward_prev_start_idx)                     -> frozen history，无梯度；
+        #*   [backward_prev_start_idx, backward_prev_end_idx) -> backwarded history，BEV encoder 有梯度。
+        #
+        # 例：num_frames=4，历史帧为 [-4,-3,-2,-1]，
+        #     backward_prev_frame_num=1 时：
+        #       backward_prev_start_idx = 4 - 1 = 3
+        #       backward_prev_end_idx   = 3 + 1 = 4
+        #     因此：
+        #       frozen history     = img[:, :3]  -> [-4,-3,-2]
+        #       backwarded history = img[:, 3:4] -> [-1]
+        backward_prev_start_idx = num_frames - backward_prev_frame_num
+        backward_prev_end_idx = backward_prev_start_idx + backward_prev_frame_num
+
+        #* ================== 1. Frozen part：较早历史帧，只前向不反传 ==================
+        #* [无梯度] 该分支中 backbone/FPN 和 BEVFormer encoder 都不反传。
+        prev_img = img[:, :backward_prev_start_idx, ...]
         prev_img_metas = copy.deepcopy(img_metas)
-        # prev_bev: bs, bev_h * bev_w, c
+        # prev_bev: 最后一帧 frozen history 的 BEV，shape [B, bev_h*bev_w, C]。
+        # prev_bev_list: 最近 memory_queue_len-1 个历史 BEV，用于后续拼接当前 ref_bev。
         prev_bev, prev_bev_list = self._obtain_frozen_history_bev(prev_img, prev_img_metas, drop_prev_index=drop_prev_index)
-        # Backwarded part.
+
+        #* ================== 2. Backwarded part：最近历史帧，BEV encoder 可反传 ==================
+        #* [部分有梯度] 该分支中 backbone/FPN 不反传，BEVFormer encoder 反传。
+        # 如果 backward_prev_frame_num=0，则跳过该分支，所有历史帧都走 frozen/no_grad。
+        # 如果大于 0，则最近若干历史帧会在 BEV encoder 部分保留梯度。
         if backward_prev_frame_num > 0:
             prev_bev, prev_bev_list = self._obtain_backwarded_history_bev(
                 img, prev_bev, copy.deepcopy(img_metas),
