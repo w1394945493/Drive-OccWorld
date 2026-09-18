@@ -922,8 +922,28 @@ class Drive_OccWorld(BEVFormer):
 
             cond_norm_dict = {'occ_gts': occ_gts}  # 传给 future_pred_head.prev_render_neck 使用。
             # D3. prepare action condition dict.
+            #* command:
+            #* - nuScenes 原始链路中表示未来高层驾驶指令，如 right/left/forward；
+            #* - SemanticKITTI 没有真实 command；这里的 command 对应
+            #*   tools/semantickitti_converter.py 写入 pkl 的 info['command'] 字段；
+            #* - converter 会根据同一帧 info['gt_ego_fut_trajs'] 的未来累计横向位移
+            #*   粗略离散出伪 command：
+            #*     0 = Right, 1 = Left, 2 = Forward；
+            #*   并复制成 shape=(5,) 的未来指令序列，collate 后为 [B, 5]。
+            #* 当前配置若 future_pred_head.use_command=True，WorldDecoder 会把它作为动作条件。
             action_condition_dict = {'command':command, 'vel_steering': vel_steering} # command:(1 5) vel_steering:(1 5 4)
             # D4. prepare planning dict.
+            #* gt_traj / sdc_planning:
+            #* - 这里的 sdc_planning 对应 converter pkl 中的 info['gt_ego_fut_trajs']
+            #*   经 SemanticKITTI Dataset 转换后的字段；
+            #* - converter 先从 poses.txt 构造每帧 lidar->global pose；
+            #* - 再把未来 occupancy 关键帧的 LiDAR 原点变到当前 ref LiDAR 坐标系；
+            #* - 对相邻未来位置做差，写入 info['gt_ego_fut_trajs']，shape=(6, 2)；
+            #* - SemanticKITTI Dataset 进一步补齐 dyaw=0，得到 sdc_planning，
+            #*   shape=[future_steps, 3]，collate 后为 [B, future_steps, 3]。
+            #* future_pred() 中会用 sdc_planning[:, :future_frame_index, :2]
+            #* 构造 plan_traj，经 cumsum 得到 ref/current -> 目标未来帧的累计位移，
+            #* 用于未来 BEV query 与 memory BEV 的几何对齐。
             plan_dict = {'sem_occupancy': sem_occupancy, 'sample_traj': sample_traj, 'gt_traj': sdc_planning, 'ref_pose_pred': ref_pose_pred} # sem_occupancy: None sample_traj:(1 1800 5 3) sdc_planning:(1 5 3) ref_pose_pred: None
 
             # D5. predict future occ in auto-regressive manner
@@ -1040,12 +1060,27 @@ class Drive_OccWorld(BEVFormer):
         # D2. prepare conditional-normalization dict
         cond_norm_dict = {'occ_gts': None}
         # D3. prepare action condition dict
+        #* command:
+        #* - nuScenes 原始链路中表示未来高层驾驶指令；
+        #* - SemanticKITTI 中的 command 对应 tools/semantickitti_converter.py
+        #*   写入 pkl 的 info['command'] 字段；
+        #* - converter 根据同一帧 info['gt_ego_fut_trajs'] 的未来累计横向位移
+        #*   离散得到伪 command，
+        #*   0=Right, 1=Left, 2=Forward，shape=(5,)，collate 后为 [B,5]。
         action_condition_dict = {'command':command, 'vel_steering': vel_steering}
         # D4. prepare planning dict
         # ref_pose_pred 是第 0 步规划结果 ref/current -> t+1。
         # sample_traj 仍保留完整未来候选序列 [B, sample_num, future_step, 3]，
         # future_pred() 会从 future_frame_index=1 开始逐步取 sample_traj[:, :, i]，
         # 继续预测 t+i -> t+i+1，并把结果追加到 next_pose_preds。
+        #* gt_traj / sdc_planning:
+        #* - 这里的 sdc_planning 对应 converter pkl 中的 info['gt_ego_fut_trajs']
+        #*   经 SemanticKITTI Dataset 转换后的字段；
+        #* - converter 根据未来 occupancy 关键帧 pose 差分生成
+        #*   info['gt_ego_fut_trajs']，Dataset 再补齐 dyaw=0 得到 sdc_planning；
+        #* - 当前 shape 通常为 [B, 5, 3]；
+        #* - future_pred() 会使用其前 future_frame_index 步 xy 位移，
+        #*   通过 cumsum 得到目标未来帧相对当前 ref 的累计位移。
         plan_dict = {'sem_occupancy': None, 'sample_traj': sample_traj, 'gt_traj': sdc_planning, 'ref_pose_pred': ref_pose_pred}
 
         # D5. predict future occ in auto-regressive manner
