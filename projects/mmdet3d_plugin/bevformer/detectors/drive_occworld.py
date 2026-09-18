@@ -849,6 +849,7 @@ class Drive_OccWorld(BEVFormer):
             # 预测当前帧的BEV特征，轨迹
             ref_bev, ref_pose_pred, ref_pose_loss = self.obtain_ref_bev_with_plan(img, img_metas, prev_bev, ref_sample_traj, ref_sem_occupancy, ref_command, ref_real_traj)
         else:
+            # 历史BEV特征：目前仅用于构建当前时序BEV特征
             ref_bev = self.obtain_ref_bev(img, img_metas, prev_bev) # (1 40000 256)
             sem_occupancy, ref_pose_pred, ref_pose_loss = None, None, None
 
