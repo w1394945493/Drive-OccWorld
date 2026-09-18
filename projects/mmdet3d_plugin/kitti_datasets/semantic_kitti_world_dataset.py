@@ -398,8 +398,23 @@ class SemanticKITTIWorldDataset(Dataset):
             info = self.data_infos[self.token2idx[frame_input['token']]]
             cur_lidar2global = self._lidar_to_global(info)
             global2cur_lidar = np.linalg.inv(cur_lidar2global)
-            cur_lidar_to_ref_lidar = global2ref_lidar @ cur_lidar2global
-            ref_lidar_to_cur_lidar = np.linalg.inv(cur_lidar_to_ref_lidar)
+
+            #*(0918) SemanticKITTI converter 中保存的是标准 column-vector pose。
+            #* 因此这里先按常规几何定义计算 column-vector 形式的相对变换：
+            #*   cur_lidar_to_ref_lidar_col: 当前/历史帧 lidar -> ref/current lidar；
+            #*   ref_lidar_to_cur_lidar_col: ref/current lidar -> 当前/历史帧 lidar。
+            #*   p_global = T_global_lidar @ p_lidar。
+            cur_lidar_to_ref_lidar_col = global2ref_lidar @ cur_lidar2global
+            ref_lidar_to_cur_lidar_col = np.linalg.inv(
+                cur_lidar_to_ref_lidar_col)
+
+            #*(0918) 转成 Drive-OccWorld 使用的 row-vector 右乘矩阵格式。
+            #* 原 nuScenes Dataset 也是转成 row-vector 形式保存，后续使用方式是：
+            #*   aligned_bev_coords = aligned_bev_coords @ transform
+            #* 如果不转置，平移项位于最后一列，但 row-vector 右乘期望平移在最后一行，
+            #* 会导致历史 BEV / memory BEV 坐标对齐不正确。
+            cur_lidar_to_ref_lidar = cur_lidar_to_ref_lidar_col.T
+            ref_lidar_to_cur_lidar = ref_lidar_to_cur_lidar_col.T
 
             meta = copy.deepcopy(frame_input)
             if shape_metas is None:
@@ -466,8 +481,18 @@ class SemanticKITTIWorldDataset(Dataset):
         for frame_idx in window_indices[current_pos + 1:]:
             future_info = self.data_infos[frame_idx]
             future_lidar2global = self._lidar_to_global(future_info)
-            future2ref = global2ref_lidar @ future_lidar2global
-            ref2future = np.linalg.inv(future2ref)
+            #*(0918) 先按标准 column-vector 约定计算未来帧和当前参考帧的相对位姿。
+            #*   future2ref_col: future lidar -> ref/current lidar；
+            #*   ref2future_col: ref/current lidar -> future lidar。
+            future2ref_col = global2ref_lidar @ future_lidar2global
+            ref2future_col = np.linalg.inv(future2ref_col)
+
+            #*(0918) 转成 Drive-OccWorld 使用的 row-vector 右乘矩阵格式。
+            #* _align_bev_coordnates() 中实际使用：
+            #*   [x, y, z, 1] @ future2ref @ ref_to_history
+            #* 因此这里和历史帧变换保持一致，把 column-vector 矩阵转置后保存。
+            future2ref = future2ref_col.T
+            ref2future = ref2future_col.T
             future2ref_lidar_transform.append(future2ref)
             ref2future_lidar_transform.append(ref2future)
 
