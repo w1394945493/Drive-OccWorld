@@ -8,7 +8,9 @@
 
 与 nuScenes Drive-OccWorld 原始数据的区别：
     - 使用 SemanticKITTI 前视双目相机 image_2 / image_3；
-    - 不生成 CAN bus / action condition / planning / sample_traj；
+    - 不生成真实 CAN bus / action condition / planning / sample_traj；
+    - 但会根据相邻 occupancy 关键帧 pose 差分，构造一个轻量 pseudo can_bus，
+      用于兼容 BEVFormer 中历史 BEV shift / rotate_prev_bev / can_bus_mlp 接口；
     - 不依赖 nuScenes SDK；
     - 只保留 future occupancy forecasting 第一阶段必需字段。
 
@@ -164,6 +166,79 @@ def rotation_matrix_to_quaternion_wxyz(rot):
     quat = np.asarray([w, x, y, z], dtype=np.float64)
     quat /= np.linalg.norm(quat) + 1e-12
     return quat.tolist()
+
+
+def yaw_from_rotation_matrix(rot):
+    """Extract approximate z-yaw from a 3x3 pose rotation matrix."""
+    #* SemanticKITTI poses_lidar 是 LiDAR/ego -> global 的 4x4 位姿。
+    #* 这里从旋转矩阵中提取 global xy 平面上的航向角 yaw，后续用于构造
+    #* 相邻 occupancy 关键帧之间的 yaw delta，近似 BEVFormer can_bus[-1]。
+    rot = np.asarray(rot, dtype=np.float64)
+    return float(np.arctan2(rot[1, 0], rot[0, 0]))
+
+
+def wrap_to_pi(angle):
+    """Wrap angle in radians to [-pi, pi)."""
+    #* 相邻帧 yaw 做差后需要归一化，避免跨越 -pi/pi 时出现接近 2*pi 的假大转角。
+    return float((angle + np.pi) % (2 * np.pi) - np.pi)
+
+
+def build_pseudo_can_bus_from_adjacent_pose(
+        poses_lidar, token_pose_indices, frame_idx):
+    """Build a pseudo 18-D can_bus vector from adjacent occupancy keyframe poses.
+
+    #* ================== SemanticKITTI pseudo can_bus 构造 ==================
+    # SemanticKITTI 没有 nuScenes CAN bus，因此无法提供真实底盘状态
+    # 如车辆速度、加速度、方向盘转角等。
+    #
+    # 但 BEVFormer PerceptionTransformer 里仍会用 img_meta['can_bus']：
+    # 1) can_bus[:3]：计算历史 BEV 到当前 BEV 的平移 shift；
+    # 2) can_bus[-1]：rotate_prev_bev 时旋转历史 BEV；
+    # 3) 完整 18 维 can_bus：经 can_bus_mlp 作为 BEV query 的运动条件。
+    #
+    # 因此这里用“当前 occupancy 关键帧”和“上一个 occupancy 关键帧”的 pose 差分
+    # 构造 pseudo can_bus。注意这里的上一帧不是原始图像序列中紧邻的上一张图，
+    # 而是 tokens[frame_idx - 1]，即上一个有 occupancy 标签的关键帧。
+    #
+    # 这样和 Dataset 中 history/current/future 的时间组织保持一致：
+    # 例如 000000 -> 000005 -> 000010，can_bus 表示 000005 到 000010 的运动，
+    # 而不是 000009 到 000010 的更短间隔运动。
+    """
+    cur_pose_idx = token_pose_indices[frame_idx]
+    cur_pose = poses_lidar[cur_pose_idx]
+
+    if frame_idx > 0:
+        prev_pose_idx = token_pose_indices[frame_idx - 1]
+        prev_pose = poses_lidar[prev_pose_idx]
+        delta_global = cur_pose[:3, 3] - prev_pose[:3, 3]
+        yaw_prev = yaw_from_rotation_matrix(prev_pose[:3, :3])
+        yaw_cur = yaw_from_rotation_matrix(cur_pose[:3, :3])
+        delta_yaw = wrap_to_pi(yaw_cur - yaw_prev)
+    else:
+        #* scene 首个 occupancy 关键帧没有上一关键帧，历史 BEV 不存在或应视作无运动。
+        delta_global = np.zeros(3, dtype=np.float64)
+        delta_yaw = 0.0
+
+    can_bus = np.zeros(18, dtype=np.float32)
+
+    #* can_bus[:3]：帧间 global delta_xyz，用于 transformer.py 中 BEV shift。
+    can_bus[:3] = delta_global.astype(np.float32)
+
+    #* can_bus[3:7]：当前帧朝向四元数，作为完整 can_bus_mlp 的弱位姿条件。
+    #* BEVFormer 显式 shift/rotate 主要使用 [:3] 和 [-1]；这里填当前朝向
+    #* 是为了比全 0 占位更接近 nuScenes can_bus 的“含姿态信息”结构。
+    can_bus[3:7] = np.asarray(
+        rotation_matrix_to_quaternion_wxyz(cur_pose[:3, :3]),
+        dtype=np.float32)
+
+    #* can_bus[-2]：相邻关键帧 yaw delta，弧度制，保留给 can_bus_mlp 使用。
+    can_bus[-2] = np.float32(delta_yaw)
+
+    #* can_bus[-1]：相邻关键帧 yaw delta，角度制。
+    #* torchvision.transforms.functional.rotate() 接收 degree，BEVFormer 原代码
+    #* 直接把 can_bus[-1] 当作 rotate_prev_bev 的旋转角。
+    can_bus[-1] = np.float32(np.degrees(delta_yaw))
+    return can_bus
 
 
 def list_frame_tokens(ann_file, sequence):
@@ -410,10 +485,22 @@ def build_frame_info_from_cache(
     command = build_pseudo_command_sequence(
         gt_ego_fut_trajs, cmd_thresh, command_steps=5)
 
-    # 第一阶段不使用 action condition，但保留一个轻量 can_bus 占位：
-    # 后续若复用 BEVFormer 旧代码中读取 can_bus 的接口，可以先避免 KeyError。
-    can_bus = np.zeros(18, dtype=np.float32)
-    can_bus[:3] = pose[:3, 3].astype(np.float32)
+    #* ================== 6. pseudo can_bus：由相邻 occupancy 关键帧 pose 差分近似 ==================
+    #* 原代码如下：它只把 can_bus[:3] 写成“当前帧绝对全局位置”。
+    #* 这只能避免 KeyError，但不符合 BEVFormer PerceptionTransformer 的使用方式：
+    #*   - can_bus[:3] 会被当作相邻帧 global delta，用来计算 BEV shift；
+    #*   - can_bus[-1] 会被当作相邻帧 yaw delta degree，用来 rotate_prev_bev；
+    #*   - 完整 18 维 can_bus 会经过 can_bus_mlp，加到 BEV query 上。
+    #* 如果继续使用绝对全局位置，shift 可能被错误放大，历史 BEV 对齐会不可靠。
+    #*
+    #* 原占位实现保留在这里便于对照：
+    # can_bus = np.zeros(18, dtype=np.float32)
+    # can_bus[:3] = pose[:3, 3].astype(np.float32)
+    #*
+    #* 新实现：用当前 occupancy 关键帧与上一个 occupancy 关键帧的 pose 差分，
+    #* 近似构造 BEVFormer 需要的相邻帧运动信息。
+    can_bus = build_pseudo_can_bus_from_adjacent_pose(
+        poses_lidar, token_pose_indices, frame_idx)
 
     return {
         #* ================== 1. 基础时序字段 ==================
@@ -453,7 +540,7 @@ def build_frame_info_from_cache(
         'lidar2ego_rotation': [1.0, 0.0, 0.0, 0.0],                   # list[float]，len=4，LiDAR->ego 单位四元数 wxyz
         'ego2global_translation': pose[:3, 3].astype(np.float64).tolist(),  # list[float]，shape=(3,)，当前帧全局位置
         'ego2global_rotation': rotation_matrix_to_quaternion_wxyz(pose[:3, :3]),  # list[float]，len=4，当前帧全局朝向 wxyz
-        'can_bus': can_bus,                                           # np.ndarray，shape=(18,)，占位；前 3 维写入全局平移
+        'can_bus': can_bus,                                           # np.ndarray，shape=(18,)，pseudo CAN bus；[:3] 为相邻 occupancy 关键帧 global delta，[-1] 为 yaw delta degree
 
         #* ================== 5. Drive-OccWorld 对齐字段，第一阶段可不使用 ==================
         'gt_ego_fut_trajs': gt_ego_fut_trajs,                         # np.ndarray，shape=(6, 2)，未来 6 步自车 xy 位移

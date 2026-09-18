@@ -124,6 +124,11 @@ class PerceptionTransformer(BaseModule):
         # ===========================================================#
         # Unified alignment method for both nuPlan and nuScenes.
         # obtain rotation angle and shift with ego motion
+        #* （1）can_bus 用途一：计算 BEV temporal self-attention 的 shift。
+        #* 这里期望 img_meta['can_bus'][:3] 表示当前帧相对参考/上一帧的 global delta_xyz，
+        #* 再通过 lidar2global_rotation 转到当前 LiDAR 坐标系，得到 BEV 平面 x/y shift。
+        #* 注意：SemanticKITTI 没有真实 CAN bus；如果这里填的是绝对全局位置而不是帧间 delta，
+        #* shift_x/shift_y 会被错误放大，可能导致历史 BEV 对齐错误。
         delta_global = np.array([each['can_bus'][:3] for each in kwargs['img_metas']])  # total_len,3  -4帧为0,其余帧为global下的delta_xyz 
         lidar2global_rotation = np.array([each['lidar2global_rotation'] for each in kwargs['img_metas']])
         
@@ -147,6 +152,10 @@ class PerceptionTransformer(BaseModule):
                 for i in range(bs):
                     # ========================================================#
                     # num_prev_bev = prev_bev.size(1)
+                    #* （2）can_bus 用途二：旋转历史 BEV。
+                    #* img_meta['can_bus'][-1] 被当作当前帧相对历史/上一帧的 yaw 角变化，
+                    #* 用于 rotate_prev_bev，将 prev_bev 旋转到当前 BEV 坐标系附近。
+                    #* SemanticKITTI 若没有可靠 yaw delta，建议关闭 rotate_prev_bev 或正确构造该字段。
                     rotation_angle = kwargs['img_metas'][i]['can_bus'][-1]
                     
                     tmp_prev_bev = prev_bev[:, i].reshape(
@@ -160,6 +169,10 @@ class PerceptionTransformer(BaseModule):
 
         # ===============================================================#
         # add can bus signals
+        #* （3）can_bus 用途三：作为 BEV query 的运动/位姿条件。
+        #* 18 维 can_bus 会经过 can_bus_mlp 投影到 embed_dims，并加到 bev_queries 上；
+        #* self.use_can_bus=True 时生效，用于让 BEV encoder 感知自车运动状态。
+        #* SemanticKITTI 第一阶段如果 can_bus 只是占位或不准确，可能应设置 use_can_bus=False。
         can_bus = bev_queries.new_tensor(
             [each['can_bus'] for each in kwargs['img_metas']])  # [:, :]
         can_bus = self.can_bus_mlp(can_bus)[None, :, :]
