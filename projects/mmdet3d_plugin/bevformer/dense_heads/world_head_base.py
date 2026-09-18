@@ -325,7 +325,9 @@ class WorldHeadTemplate(BaseModule):
             if self.use_fourier:
                 cur_can_bus = self.fourier_embed_canbus(cur_can_bus)
             action_condition = cur_can_bus  #* can_bus 成为 action_condition 的第一部分。
-
+        
+        # ==========================================#
+        # semantickitti暂时使用"plan_traj"和"command"
         elif self.use_plan_traj:
             #  * Plan Traj
             cur_can_bus = plan_traj[:, -1, :2].float() # bs, 2
@@ -345,7 +347,7 @@ class WorldHeadTemplate(BaseModule):
             else:
                 action_condition = torch.cat([action_condition, command], dim=-1)
 
-        if self.use_vel_steering:
+        if self.use_vel_steering: # False
             # vel_steering: bs,4  (vx, vy, v_yaw, steering)
             # fourier embed
             if self.use_fourier:
@@ -355,7 +357,7 @@ class WorldHeadTemplate(BaseModule):
             else:
                 action_condition = torch.cat([action_condition, vel_steering], dim=-1)
 
-        if self.use_vel:
+        if self.use_vel: # False
             #* 当前配置 use_vel=True：从 vel_steering 中取 vx/vy，与 can_bus/command 拼接控制未来 occupancy。
             # vel_steering: bs,4  (vx, vy, v_yaw, steering)
             vel = vel_steering[:, :self.vel_dims]

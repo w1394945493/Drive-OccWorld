@@ -45,7 +45,7 @@ ann_root = "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/data/semantic_
 # - learning_rate: AdamW 基础学习率；img_backbone 会在 optimizer.paramwise_cfg
 #   中乘以 lr_mult=0.1。
 samples_per_gpu = 1
-workers_per_gpu = 2
+workers_per_gpu = 4
 max_epochs = 24
 log_interval = 50
 eval_interval = 1
@@ -99,12 +99,12 @@ point_cloud_range = [0.0, -25.6, -2.0, 51.2, 25.6, 4.4]
 voxel_size = [0.2, 0.2, 0.2]
 occ_size = [256, 256, 32]
 
-bev_h_ = 256
-bev_w_ = 256
-pred_height = 32
-# bev_h_ = 128
-# bev_w_ = 128
-# pred_height = 16
+# bev_h_ = 256
+# bev_w_ = 256
+# pred_height = 32
+bev_h_ = 128
+bev_w_ = 128
+pred_height = 16
 
 
 # SemanticKITTI 常用 20 类编码为 0..19，255 为 ignore。
@@ -239,7 +239,8 @@ model = dict(
         # - command 来自 Dataset 构造的 pseudo command；
         # 这样既能跑通原 WorldDecoder 的 action-condition 接口，也不依赖真实 CAN bus。
         use_can_bus=False, # semantickitti无can bus
-        use_plan_traj=True,
+        
+        use_plan_traj=True, # 动作条件包含： 未来轨迹和指令
         use_command=True,
         
         use_vel_steering=False,
