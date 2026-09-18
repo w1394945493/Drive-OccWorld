@@ -527,12 +527,16 @@ class Drive_OccWorld(BEVFormer):
 
             # 4. update pred_feat to prev_bev_input and update ref_to_history_list.
             memory_feat = pred_feat[-1]
+            
+            # *===============================================================================#
             #* 可选截断自回归 future BEV 的跨步梯度：detach 当前 step 的 BEV 后再作为下一步 memory。
             #* 例如 interval=2 时，t+2 自身 loss 仍可回传至更早步骤，但 t+3/t+4 不会越过 t+2 回传。
             if (self.training and self.future_bev_detach_interval is not None
                     and self.future_bev_detach_interval > 0
                     and future_frame_index % self.future_bev_detach_interval == 0):
                 memory_feat = memory_feat.detach()
+            
+            
             prev_bev_input = torch.cat([prev_bev_input, memory_feat.unsqueeze(1)], 1)
             prev_bev_input = prev_bev_input[:, 1:, ...].contiguous()
             # update ref2future to ref_to_history_list.

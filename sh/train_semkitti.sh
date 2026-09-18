@@ -8,4 +8,4 @@ torchrun \
     /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/train.py \
     /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/kitti/semantic_kitti_drive_occworld.py \
     --launcher pytorch \
-    --work-dir /c20250502/wangyushen/Outputs/drive_occworld/semkitti/train
+    --work-dir /c20250502/wangyushen/Outputs/drive_occworld/semkitti/train2

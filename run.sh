@@ -54,7 +54,7 @@ python scripts/test_semantic_kitti_drive_occworld_forward.py \
 CUDA_VISIBLE_DEVICES=4 \
 PYTHONPATH="$(pwd)" \
 python tools/train.py \
-  projects/configs/kitti/semantic_kitti_drive_occworld.py \
+  /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/kitti/semantic_kitti_drive_occworld.py \
   --work-dir out/semantic_kitti_drive_occworld_epoch_debug \
   --cfg-options \
   total_epochs=2 \

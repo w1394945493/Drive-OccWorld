@@ -45,9 +45,9 @@ ann_root = "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/data/semantic_
 # - learning_rate: AdamW 基础学习率；img_backbone 会在 optimizer.paramwise_cfg
 #   中乘以 lr_mult=0.1。
 samples_per_gpu = 1
-workers_per_gpu = 4
+workers_per_gpu = 2
 max_epochs = 24
-log_interval = 1
+log_interval = 50
 eval_interval = 1
 checkpoint_interval = 1
 max_keep_ckpts = 1
@@ -98,12 +98,13 @@ img_norm_cfg = dict(
 point_cloud_range = [0.0, -25.6, -2.0, 51.2, 25.6, 4.4]
 voxel_size = [0.2, 0.2, 0.2]
 occ_size = [256, 256, 32]
-# bev_h_ = 256
-# bev_w_ = 256
-# pred_height = 32
-bev_h_ = 128
-bev_w_ = 128
-pred_height = 16
+
+bev_h_ = 256
+bev_w_ = 256
+pred_height = 32
+# bev_h_ = 128
+# bev_w_ = 128
+# pred_height = 16
 
 
 # SemanticKITTI 常用 20 类编码为 0..19，255 为 ignore。
@@ -150,7 +151,7 @@ memory_queue_len = 1
 #* 默认 0 表示不 detach，保持原 Drive-OccWorld 完整多步反传；
 #* 若设置为 2，则训练时每 2 个 future step 截断一次跨步梯度，
 #* 用于降低 current->t+1->t+2->t+3->t+4 长链路计算图显存。
-future_bev_detach_interval = 2
+future_bev_detach_interval = 0
 
 future_pred_frame_num_train = future_queue_length
 future_pred_frame_num_test = future_queue_length
