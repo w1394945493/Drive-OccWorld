@@ -399,14 +399,14 @@ class Drive_OccWorld(BEVFormer):
         # prev_bev_input 是 memory_queue，最后一帧是当前参考 BEV；后续会被逐帧预测结果滚动更新。
         # prev_bev_input: B,memory_queue_len,HW,C
         ref_bev = prev_bev_input[:, -1].unsqueeze(0).repeat(
-                len(self.future_pred_head.bev_pred_head), 1, 1, 1).contiguous()
+                len(self.future_pred_head.bev_pred_head), 1, 1, 1).contiguous() # (3 1 65536 256) 65536=256x256
 
         next_bev_feats, next_bev_sem, next_pose_loss = [ref_bev], [], []
         # next_pose_preds 初始就是参考帧规划出的第一步轨迹：
         # ref_pose_pred: ref/current -> t+1，对应 sample_traj[:, :, 0]。
         # 后续 for future_frame_index in range(1, ...) 会继续 append t+1->t+2,
         # t+2->t+3, ... 的逐步规划结果。
-        next_pose_preds = plan_dict['ref_pose_pred'] # B,Lout,2
+        next_pose_preds = plan_dict['ref_pose_pred'] # B,Lout,2 None
 
 
         #* ================== 4.2 建立历史帧到参考帧的坐标变换 ==================
@@ -435,15 +435,16 @@ class Drive_OccWorld(BEVFormer):
             #     ...
             # 同时 WorldHead 也用相同的 future_frame_index 预测对应未来时刻的 BEV/Occ。
             if (not self.turn_on_plan) or (self.turn_on_plan and self.training and self.training_epoch < 12):   # use GT planning during training
-                plan_traj = plan_dict['gt_traj'][:, :future_frame_index, :2]
+                plan_traj = plan_dict['gt_traj'][:, :future_frame_index, :2] # (1 1 2)
             else:
                 plan_traj = next_pose_preds
-            action_condition_dict['plan_traj'] = plan_traj
+            action_condition_dict['plan_traj'] = plan_traj # (1 1 2)
             #* can_bus/action condition 关键链路：
             #* future_frame_index 会作为 target_frame_index 传入 WorldHeadBase，
             #* 之后按这个时间步读取 img_meta['future_can_bus'][future_frame_index]，
             #* 把 can_bus 当作 action condition，用来控制该未来帧的 occupancy 预测。
 
+            # ====================================================================#
             # 1. obtain the coordinates of future BEV query to previous frames.
             tgt_grids, aligned_prev_grids, ref2future, future2history = self._align_bev_coordnates(
                 future_frame_index, ref_to_history_list, img_metas, plan_traj)
@@ -453,8 +454,6 @@ class Drive_OccWorld(BEVFormer):
             # 2. transform for generating freespace of future frame.
             # pred_feat: inter_num, bs, bev_h * bev_w, c
             if future_frame_index in valid_frames:  # compute loss if it is a valid frame.
-                #* 这里进入 WorldHeadV1/WorldHeadBase._get_next_bev_features：
-                #* prev_bev_input 提供 memory_queue，action_condition_dict 提供 can_bus/command/velocity 等控制条件。
                 pred_feat, bev_sem_pred = future_pred_head(
                     prev_bev_input, img_metas, future_frame_index, action_condition_dict, cond_norm_dict,
                     tgt_points=tgt_grids, bev_h=self.bev_h, bev_w=self.bev_w, ref_points=aligned_prev_grids)
@@ -751,28 +750,13 @@ class Drive_OccWorld(BEVFormer):
         else:
             drop_prev_index = -1
 
-
-        #* ================== 2. 历史帧图像 -> 历史 BEV ==================
-        #* 对应论文 3.2 的 History Encoder W_E：
-        #* 使用 BEVFormer visual BEV encoder，把历史多相机图像编码为历史 BEV embeddings。
-        # 将 queue 中当前帧之前的多相机图像送入 backbone/FPN/BEVFormer encoder，
-        # 得到 prev_bev 和 prev_bev_list，作为当前 BEV 与未来预测的 temporal memory。
-        #* 默认分支：当前配置 queue_length=2，因此 prev_img 包含 2 帧历史图像；
-        #* obtain_history_bev 继承自 BEVFormer，历史帧只用于构造 temporal BEV，不是本文主要创新点。
-        # B1. Forward previous frames.
-        # prev_img: [B, queue_length, num_cam, C, H, W]，例如 B=1、queue_length=2、num_cam=6。
         prev_img = img[:, :-1, ...] # (1 2 1 3 384 1248)
         prev_img_metas = copy.deepcopy(img_metas)
         # B2. Randomly grid-mask prev_bev.
         prev_bev, prev_bev_list = self.obtain_history_bev(prev_img, prev_img_metas, drop_prev_index=drop_prev_index) # (1 40000 256)
-        # prev_bev: 最后一帧历史图像编码出的 BEV feature，shape=[B, bev_h*bev_w, C]，默认 [B, 40000, 256]。
-        # prev_bev_list: 保留给未来预测 memory_queue 的历史 BEV 列表，每个元素 shape 同 prev_bev。
-        #* 注意：父类会把 prev_bev_list 裁剪到 memory_queue_len-1；若 memory_queue_len=1，
-        #* 这里理论上会得到空列表，后面 torch.stack(prev_bev_list) 需要实际配置/运行时留意。
+
         # B2. Randomly grid-mask prev_bev.
         if self.grid_mask_prev and prev_bev is not None:
-            # 默认配置 grid_mask_prev=False，因此通常不走这个分支。
-            # 若打开，则只对最后一帧历史 BEV 做 GridMask，不改变输出 shape。
             b, n, c = prev_bev.shape
             assert n == self.bev_h * self.bev_w
             prev_bev = prev_bev.view(b, self.bev_h, self.bev_w, c)
@@ -780,31 +764,18 @@ class Drive_OccWorld(BEVFormer):
             prev_bev = self.grid_mask(prev_bev)
             prev_bev = prev_bev.view(b, c, n).permute(0, 2, 1).contiguous()
 
-
-        #* ================== 3. 当前帧图像 -> 当前参考 BEV ==================
-        #* 仍属于论文 3.2 History Encoder W_E 的当前帧编码部分：
-        #* 当前 BEV ref_bev 会作为 WM 的最新 memory，并作为未来世界模型的起点。
-        # 当前帧作为 reference frame；pts_bbox_head 在这里只保留 BEVFormer encoder，
-        # 不再走检测 decoder/box head。
-        #* 默认分支：当前配置 turn_on_plan=False，因此跳过 obtain_ref_bev_with_plan，
-        #* 直接调用 obtain_ref_bev，输出当前参考帧 BEV feature。
-        # img: [B, num_cam, C, H, W]，取 queue 中最后一帧作为当前参考帧。
         img = img[:, -1, ...] # (1 6 3 992 1760)
         img_metas = [each[num_frames-1] for each in img_metas]
         if self.turn_on_plan:
-            # 仅当 turn_on_plan=True 时启用： 先根据当前 occupancy/command 预测参考帧规划结果，
-            # ref_pose_pred/ref_pose_loss 会继续参与未来预测和 planning loss。
             ref_sample_traj = sample_traj[:, :, 0]
             ref_real_traj = sdc_planning[:, 0]
             ref_command = command[:, 0]
             sem_occupancy = segmentation[0][self.future_pred_head.history_queue_length:].unsqueeze(0)   # using GT occupancy to calculate sample_traj cost during training
             sem_occupancy = F.interpolate(sem_occupancy, size=(self.bev_h, self.bev_w, self.future_pred_head.num_pred_height), mode='nearest')
             ref_sem_occupancy = sem_occupancy[:, 0]
+            # 预测当前帧的BEV特征，轨迹
             ref_bev, ref_pose_pred, ref_pose_loss = self.obtain_ref_bev_with_plan(img, img_metas, prev_bev, ref_sample_traj, ref_sem_occupancy, ref_command, ref_real_traj)
         else:
-            # 默认路径：BEVFormer encoder 将当前多视角图像 + prev_bev 融合为参考帧 BEV。
-            # ref_bev: 当前参考帧 BEV feature，shape=[B, bev_h*bev_w, C]，默认 [B, 40000, 256]。
-            # sem_occupancy/ref_pose_pred/ref_pose_loss 置空，表示本配置不训练 planning 分支。
             ref_bev = self.obtain_ref_bev(img, img_metas, prev_bev) # (1 40000 256)
             sem_occupancy, ref_pose_pred, ref_pose_loss = None, None, None
 
@@ -817,49 +788,30 @@ class Drive_OccWorld(BEVFormer):
         #* 继续预测 t+2/t+3/...，所以更远未来会依赖更近未来的预测结果。
         valid_frames = [0]  # 参与 loss 的预测帧编号；0 表示当前参考帧 occupancy。
         if not self.only_train_cur_frame:  # 默认 False，说明不仅训练当前帧，还训练未来帧预测。
+            # * supervise_all_future:
             if self.supervise_all_future:  # 默认 True，对所有未来帧都计算 occupancy loss。
                 valid_frames.extend(list(range(1, self.future_pred_frame_num + 1)))  # 加入 1..future_pred_frame_num，默认 1..4。
             else:  # randomly select one future frame for computing loss to save memory cost.
                 train_frame = np.random.choice(np.arange(1, self.future_pred_frame_num + 1), 1)[0]  # 随机抽一个未来帧省显存。
                 valid_frames.append(train_frame)  # 只监督当前帧 + 抽中的未来帧。
-            # D1. prepare memory_queue.
-            #* 对应论文 3.2 Memory Queue W_M：保存最近 memory_queue_len 帧 BEV embeddings。
-            # prev_bev_list: list([B, HW, C])，来自历史帧；stack 后变为 [B, num_hist_mem, HW, C]。
-            #* 注意：父类会保留 memory_queue_len-1 个历史 BEV；当前配置 memory_queue_len=1 时这里可能为空列表。
-            prev_bev_list = torch.stack(prev_bev_list, dim=1) # (1 2 40000 256)
-            # ref_bev.unsqueeze(1): [B, 1, HW, C]，把当前参考 BEV 拼到历史 BEV 后面。
-            # 末尾切片只保留最近 memory_queue_len 帧，作为 WorldHeadV1 的输入 memory。
-            # prev_bev_list 最终 shape: [B, memory_queue_len, bev_h*bev_w, C]。
-            prev_bev_list = torch.cat([prev_bev_list, ref_bev.unsqueeze(1)], dim=1)[:, -self.memory_queue_len:, ...] # (1 40000 256)
+
+            prev_bev_list = torch.stack(prev_bev_list, dim=1) # (1 2 40000 256) 历史BEV特征
+            prev_bev_list = torch.cat([prev_bev_list, ref_bev.unsqueeze(1)], dim=1)[:, -self.memory_queue_len:, ...] # (1 40000 256) 将历史和当前bev特征拼接
             # D2. prepare conditional-normalization dict.
-            #* 对应论文 Semantic-/Motion-Conditional Normalization 的条件输入。
-            #* occ_gts/future2history 会在 ConditionalNorm 中生成 gamma/beta，调制 BEV memory。
-            # ConditionalNorm 可选择用 GT occupancy 辅助渲染/归一化 BEV feature。
             if self.future_pred_head.prev_render_neck.sem_norm and self.future_pred_head.prev_render_neck.sem_gt_train and self.training_epoch < 12:
-                # 仅 sem_gt_train=True 且早期 epoch 时走这里；当前配置 sem_gt_train=False，默认不走。
                 occ_gts = segmentation[0][self.future_pred_head.history_queue_length+1-self.memory_queue_len:-1]  # 取与 memory_queue 对齐的 GT occ。
                 occ_gts = F.interpolate(occ_gts.unsqueeze(1), size=(self.bev_h, self.bev_w, self.future_pred_head.prev_render_neck.pred_height), mode='nearest').transpose(0,1)  # resize 到 BEV/head 使用的空间尺寸。
             else:
                 occ_gts = None  # 默认路径：ConditionalNorm 不使用 GT occupancy，只使用预测/特征自身。
+            
             cond_norm_dict = {'occ_gts': occ_gts}  # 传给 future_pred_head.prev_render_neck 使用。
             # D3. prepare action condition dict.
-            #* 对应论文 "Flexible action conditions can be injected into W_D"：
-            #* command/velocity/can_bus 等动作条件会在 WorldHeadBase 中融合成 action embedding。
-            # command: 高层驾驶命令；vel_steering: 自车速度/角速度/转向等动作条件。
-            # 当前配置 future_pred_head 使用 command 和 vel，不使用 steering；vel_steering 仍整体传入，由 head 内部按配置取字段。
             action_condition_dict = {'command':command, 'vel_steering': vel_steering} # command:(1 5) vel_steering:(1 5 4)
             # D4. prepare planning dict.
-            #* 对应论文中的 occupancy-based planner P 和 expected action condition a_{+t} 相关接口。
-            #* 当前配置 turn_on_plan=False，不训练 planner，但仍使用 GT sdc_planning 做未来对齐/条件。
-            # turn_on_plan=False 时 sem_occupancy/ref_pose_pred 为 None；future_pred() 默认使用 GT sdc_planning 作为未来位姿条件。
             plan_dict = {'sem_occupancy': sem_occupancy, 'sample_traj': sample_traj, 'gt_traj': sdc_planning, 'ref_pose_pred': ref_pose_pred} # sem_occupancy: None sample_traj:(1 1800 5 3) sdc_planning:(1 5 3) ref_pose_pred: None
 
             # D5. predict future occ in auto-regressive manner
             #* 对应论文 Future Forecasting with World Decoder：
-            #* W_D 根据 WM 中历史特征和动作条件，逐帧生成 future BEV embeddings。
-            # next_bev_preds: occupancy logits，后续 compute_occ_loss 会 reshape 成 [inter, frame*B, cls, H, W, D]。 当前输出shape: (5 3 1 1 40000 16 17)
-            # next_bev_sem: 中间 BEV semantic rendering 分支输出，用于 sem_norm loss。 list:4:(1 17 200 200 16)
-            # next_pose_preds/next_pose_loss: 仅 turn_on_plan=True 时有实际意义；当前配置基本为 None/空。
             next_bev_preds, next_bev_sem, next_pose_preds, next_pose_loss = self.future_pred(prev_bev_list, action_condition_dict, cond_norm_dict, plan_dict,
                                                                             valid_frames, img_metas, prev_img_metas, num_frames, occ_flow='occ')
 
@@ -880,6 +832,7 @@ class Drive_OccWorld(BEVFormer):
         if self.turn_on_flow: # False
             losses_flow = self.compute_flow_loss(next_bev_preds_flow, flow)
             losses.update(losses_flow)
+        
         # E3. Compute loss for plan regression.
         if self.turn_on_plan: # False
             if 'v1' in self.plan_head_type: # used for fine-grained_MMO when sem_occupancy distinguish categories in MMO
