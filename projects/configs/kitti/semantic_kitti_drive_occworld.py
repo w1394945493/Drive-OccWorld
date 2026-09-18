@@ -140,8 +140,10 @@ empty_idx = 0
 turn_on_flow = False
 turn_on_plan = False
 only_generate_dataset = False
+#* True：除当前帧外，对所有 future step 都计算 occupancy loss；False：训练时随机监督一个 future step，以节省显存。
 supervise_all_future = True
 
+#* Future BEV 预测使用的 memory queue 长度；设为 1 表示每一步只保留最新的 BEV 作为下一步预测的 memory。
 memory_queue_len = 1
 
 #* 自回归 future BEV 显存优化实验开关。
