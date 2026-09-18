@@ -302,6 +302,45 @@ class Drive_OccWorld(BEVFormer):
 
         # 1. get future2ref and ref2future_matrix of frame_idx.
         # future2ref: 目标未来帧 lidar 坐标 -> 当前参考帧 ref lidar 坐标。
+        # ref2future: 当前参考帧 ref lidar 坐标 -> 目标未来帧 lidar 坐标。
+        #
+        #* 重要：这里读取到的 4x4 矩阵使用 Drive-OccWorld 原始约定：
+        #*   row-vector 右乘形式，即 [x, y, z, 1] @ transform。
+        #*
+        #* 常见 4x4 位姿矩阵有两种写法：
+        #*   A. column-vector 左乘格式，常见于机器人/SLAM/标准几何推导：
+        #*      p_dst = T @ [x, y, z, 1]^T，平移在最后一列 T[:3, 3]。
+        #*      示例：
+        #*        [[r11, r12, r13, tx],
+        #*         [r21, r22, r23, ty],
+        #*         [r31, r32, r33, tz],
+        #*         [0,   0,   0,   1 ]]
+        #*   B. row-vector 右乘格式，本函数/原 Drive-OccWorld 使用：
+        #*      p_dst = [x, y, z, 1] @ T，平移在最后一行 T[3, :3]。
+        #*      示例：
+        #*        [[r11, r21, r31, 0],
+        #*         [r12, r22, r32, 0],
+        #*         [r13, r23, r33, 0],
+        #*         [tx,  ty,  tz,  1]]
+        #*
+        #* 如何判断是右乘格式：
+        #*   1) 看实际使用代码：下面是 aligned_bev_coords @ future_to_history_list，
+        #*      点坐标在左、矩阵在右，所以是 row-vector 右乘；
+        #*   2) 看平移项位置：row-vector 矩阵的平移在最后一行 transform[3, :3]，
+        #*      column-vector 矩阵的平移在最后一列 transform[:3, 3]；
+        #*   3) 看这里覆盖 plan_traj 时会先 transpose，再写 [:2, 3]，
+        #*      说明原矩阵中平移实际位于转置前的 [3, :2]，即 row-vector 格式。
+        #* 如何判断是左乘格式：
+        #*   1) 看实际使用代码：如果写成 transform @ point，或者 batch 中写成
+        #*      transform @ points[..., None]，点坐标在右、矩阵在左，就是 column-vector 左乘；
+        #*   2) 看平移项位置：标准左乘矩阵直接用 transform[:3, 3] 作为 tx/ty/tz；
+        #*   3) 看矩阵组合顺序：column-vector 中连续变换通常写成 T_dst_mid @ T_mid_src @ p_src，
+        #*      而 row-vector 中则通常写成 p_src @ T_src_mid @ T_mid_dst。
+        #* 原 nuScenes Dataset 在构造这些矩阵时会通过 .T 转成 row-vector 格式；
+        #* SemanticKITTI Dataset 适配层也需要做同样转换。
+        #* 因此 img_meta['future2ref_lidar_transform'][frame_idx] 虽然语义上是
+        #* future -> ref，但实际存储的是可被 row-vector 右乘直接使用的矩阵。
+        #
         # 原 nuScenes/离线 SemanticKITTI Dataset 会在当前参考帧 img_meta 中预先写入这些未来位姿变换。
         future2ref = [img_meta['future2ref_lidar_transform'][frame_idx] for img_meta in img_metas]
         future2ref = ref_to_history_list.new_tensor(np.array(future2ref))  # shape: [B, 4, 4]，device/dtype 跟随 ref_to_history_list。
@@ -318,7 +357,10 @@ class Drive_OccWorld(BEVFormer):
             future2ref = future2ref.detach().clone()  # 这里作为几何对齐条件使用，不让梯度回传到 plan_traj。
 
         # ref2future: 当前参考帧 ref lidar 坐标 -> 目标未来帧 lidar 坐标。
-        # 主要返回给外部，用于更新 ref_to_history_list / 后续 future memory 对齐。
+        #* 同样是 row-vector 右乘格式，主要返回给外部，用于更新 ref_to_history_list。
+        #* 自回归预测 t+1/t+2/... 时，当前预测出的 future BEV 会被加入 memory queue；
+        #* ref_to_history_list 也要同步追加 ref -> future 的相对位姿，
+        #* 这样下一步预测更远未来 BEV 时，才能把新 memory BEV 和目标 future query 对齐。
         ref2future = [img_meta['ref2future_lidar_transform'][frame_idx] for img_meta in img_metas]
         ref2future = ref_to_history_list.new_tensor(np.array(ref2future))  # shape: [B, 4, 4]。
 
