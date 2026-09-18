@@ -125,10 +125,21 @@ class PerceptionTransformer(BaseModule):
         # Unified alignment method for both nuPlan and nuScenes.
         # obtain rotation angle and shift with ego motion
         #* （1）can_bus 用途一：计算 BEV temporal self-attention 的 shift。
-        #* 这里期望 img_meta['can_bus'][:3] 表示当前帧相对参考/上一帧的 global delta_xyz，
+        #* 这里期望 img_meta['can_bus'][:3] 表示“当前帧相对上一帧”的 global delta_xyz，
         #* 再通过 lidar2global_rotation 转到当前 LiDAR 坐标系，得到 BEV 平面 x/y shift。
-        #* 注意：SemanticKITTI 没有真实 CAN bus；如果这里填的是绝对全局位置而不是帧间 delta，
-        #* shift_x/shift_y 会被错误放大，可能导致历史 BEV 对齐错误。
+        #*
+        #* 对 nuScenes：该字段通常来自原始 can_bus / ego pose 在 Dataset queue 中整理出的帧间位移。
+        #*
+        #* 对 SemanticKITTI：数据集没有真实 CAN bus。当前 tools/semantickitti_converter.py
+        #* 会根据“当前 occupancy 关键帧”和“上一个 occupancy 关键帧”的 poses.txt 位姿差分，
+        #* 构造 pseudo can_bus：
+        #*   - can_bus[:3] = 当前 occupancy 关键帧 - 上一个 occupancy 关键帧的 global delta_xyz；
+        #*   - 首个 occupancy 关键帧没有上一关键帧，因此 can_bus[:3] = 0。
+        #* 这里的“上一帧”不是原始图像序列中的上一张图，而是有 occupancy 标注的上一个 token，
+        #* 例如 000000 -> 000005 -> 000010 中，000010 使用 000005 -> 000010 的位移。
+        #*
+        #* 注意：如果误把 can_bus[:3] 写成绝对全局位置，shift_x/shift_y 会被错误放大，
+        #* 可能导致历史 BEV 对齐错误。
         delta_global = np.array([each['can_bus'][:3] for each in kwargs['img_metas']])  # total_len,3  -4帧为0,其余帧为global下的delta_xyz 
         lidar2global_rotation = np.array([each['lidar2global_rotation'] for each in kwargs['img_metas']])
         
@@ -153,9 +164,15 @@ class PerceptionTransformer(BaseModule):
                     # ========================================================#
                     # num_prev_bev = prev_bev.size(1)
                     #* （2）can_bus 用途二：旋转历史 BEV。
-                    #* img_meta['can_bus'][-1] 被当作当前帧相对历史/上一帧的 yaw 角变化，
-                    #* 用于 rotate_prev_bev，将 prev_bev 旋转到当前 BEV 坐标系附近。
-                    #* SemanticKITTI 若没有可靠 yaw delta，建议关闭 rotate_prev_bev 或正确构造该字段。
+                    #* img_meta['can_bus'][-1] 被当作当前帧相对上一帧的 yaw delta，单位是 degree。
+                    #* torchvision rotate() 接收角度制，因此这里直接使用 can_bus[-1]。
+                    #*
+                    #* 对 SemanticKITTI：tools/semantickitti_converter.py 会从 poses.txt 中提取
+                    #* 当前/上一 occupancy 关键帧的 yaw，并写入：
+                    #*   - can_bus[-2] = yaw delta，弧度制，主要留给 can_bus_mlp；
+                    #*   - can_bus[-1] = yaw delta，角度制，供 rotate_prev_bev 使用。
+                    #* 如果该字段仍是 0 或绝对 yaw，而不是相邻关键帧 yaw delta，
+                    #* 历史 BEV 的旋转补偿会不准确。
                     rotation_angle = kwargs['img_metas'][i]['can_bus'][-1]
                     
                     tmp_prev_bev = prev_bev[:, i].reshape(
@@ -172,7 +189,14 @@ class PerceptionTransformer(BaseModule):
         #* （3）can_bus 用途三：作为 BEV query 的运动/位姿条件。
         #* 18 维 can_bus 会经过 can_bus_mlp 投影到 embed_dims，并加到 bev_queries 上；
         #* self.use_can_bus=True 时生效，用于让 BEV encoder 感知自车运动状态。
-        #* SemanticKITTI 第一阶段如果 can_bus 只是占位或不准确，可能应设置 use_can_bus=False。
+        #*
+        #* 对 SemanticKITTI：这里使用的是 pseudo can_bus，不是真实车辆 CAN bus：
+        #*   - can_bus[:3]  由相邻 occupancy 关键帧 pose 差分得到 global delta_xyz；
+        #*   - can_bus[3:7] 写入当前帧 ego/LiDAR -> global 朝向四元数，作为弱姿态条件；
+        #*   - can_bus[-2] 写入 yaw delta rad；
+        #*   - can_bus[-1] 写入 yaw delta degree。
+        #* 这只能近似提供自车运动信息，不能等价替代真实速度、加速度、方向盘角等 CAN bus 信号。
+        #* 如果希望做完全无运动条件的 ablation，可在配置中设置 use_can_bus=False。
         can_bus = bev_queries.new_tensor(
             [each['can_bus'] for each in kwargs['img_metas']])  # [:, :]
         can_bus = self.can_bus_mlp(can_bus)[None, :, :]
