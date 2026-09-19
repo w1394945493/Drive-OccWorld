@@ -88,7 +88,7 @@ python scripts/vis_semantic_kitti_drive_occworld.py \
   --config projects/configs/kitti/semantic_kitti_drive_occworld.py \
   --checkpoint /c20250502/wangyushen/Outputs/drive_occworld/semkitti/train2/latest.pth \
   --split val \
-  --index 0 \
+  --indices 0 40 80 \
   --out-dir out/semantic_kitti_drive_occworld_vis \
   --save-npy
 
