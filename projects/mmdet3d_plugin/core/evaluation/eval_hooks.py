@@ -4,7 +4,9 @@
 # inherit EvalHook but BaseDistEvalHook.
 
 import bisect
+import json
 import os.path as osp
+import re
 
 import mmcv
 import torch.distributed as dist
@@ -62,6 +64,116 @@ class CustomDistEvalHook(BaseDistEvalHook):
         self._decide_interval(runner)
         super().before_train_iter(runner)
 
+    @staticmethod
+    def _json_safe_value(value):
+        """Convert common metric values to JSON-serializable Python scalars."""
+        if hasattr(value, 'item'):
+            try:
+                return value.item()
+            except ValueError:
+                pass
+        if isinstance(value, (list, tuple)):
+            return [CustomDistEvalHook._json_safe_value(v) for v in value]
+        if isinstance(value, dict):
+            return {
+                k: CustomDistEvalHook._json_safe_value(v)
+                for k, v in value.items()
+            }
+        return value
+
+    @staticmethod
+    def _format_eval_time_label(step_idx, interval=0.5):
+        """Format forecast step index as current / 0.5s / 1s / 2s.
+
+        #* Dataset.evaluate() 返回的 compact 指标名称是 step_i_mIoU /
+        #* step_i_IoU，其中：
+        #*   step_0 表示当前参考帧 current；
+        #*   step_1 表示第 1 个未来 occupancy 关键帧；
+        #*   step_2 表示第 2 个未来 occupancy 关键帧；以此类推。
+        #*
+        #* SemanticKITTI 当前 occupancy 关键帧按约 2Hz 组织，
+        #* 相邻关键帧间隔 interval=0.5s。因此保存 json 时将：
+        #*   step_0 -> current
+        #*   step_1 -> 0.5s
+        #*   step_2 -> 1s
+        #*   step_3 -> 1.5s
+        #*   step_4 -> 2s
+        #* 这样后续画曲线或对照论文表格时更直观。
+        """
+        if step_idx == 0:
+            return 'current'
+        seconds = step_idx * interval
+        if abs(seconds - round(seconds)) < 1e-8:
+            seconds = int(round(seconds))
+        return f'{seconds}s'
+
+    def _dump_eval_results_to_json(self, runner):
+        """Append compact eval metrics to the same .log.json used by MMCV.
+
+        #! 修复原因：
+        #! SemanticKITTIWorldDataset.evaluate() 已经会打印 compact table。
+        #! 为避免 TextLoggerHook 在终端二次打印 “Epoch [...], time=0,
+        #! memory=...” 形式的误导日志，后面会 clear log_buffer。
+        #! 但 clear 后 MMCV 的 json 日志也拿不到评估指标。
+        #! 因此这里在 clear 前手动把当前 runner.log_buffer.output 中的
+        #! 精简评估指标写入 {timestamp}.log.json，做到：
+        #!   - 终端只保留 compact table；
+        #!   - json 文件仍记录 current / 0.5s / 1s / ... / avg 的评估结果，
+        #!     不再保存 eval_iter_num/time/data_time 等辅助字段，便于后续画曲线。
+        """
+        timestamp = getattr(runner, 'timestamp', None)
+        if timestamp is None:
+            return
+        json_log_path = osp.join(runner.work_dir, f'{timestamp}.log.json')
+        log_dict = {
+            'mode': 'val',
+            'epoch': runner.epoch + 1,
+            'iter': runner.iter + 1,
+        }
+
+        dataset = getattr(self.dataloader, 'dataset', None)
+        #* 优先从 Dataset 读取预测时间间隔。
+        #* SemanticKITTIWorldDataset 中定义 forecast_time_interval=0.5，
+        #* 表示 step_1/step_2/... 分别对应 0.5s/1s/...。
+        #* 如果其他数据集没有该字段，则默认按 0.5s 处理。
+        time_interval = getattr(dataset, 'forecast_time_interval', 0.5)
+
+        #* 只匹配 compact forecast 指标：
+        #*   step_0_mIoU / step_0_IoU / step_1_mIoU / ...
+        #* 不再保存 eval_iter_num、time、data_time 或逐类别 IoU，
+        #* 保持 .log.json 中评估记录足够简洁。
+        metric_pattern = re.compile(r'^step_(\d+)_(mIoU|IoU)$')
+        grouped_metrics = {}
+
+        for key, value in runner.log_buffer.output.items():
+            match = metric_pattern.match(key)
+            if match:
+                step_idx = int(match.group(1))
+                metric_name = match.group(2)
+                #* 将 step_i 转成可读时间标签：
+                #*   step_0 -> current，step_1 -> 0.5s，step_2 -> 1s。
+                #* 同一时刻的 mIoU 和 IoU 先归组，再合并为一个 JSON 字段。
+                time_label = self._format_eval_time_label(
+                    step_idx, time_interval)
+                grouped_metrics.setdefault(time_label, {})[metric_name] = (
+                    self._json_safe_value(value))
+            elif key in ('avg_mIoU', 'avg_IoU'):
+                grouped_metrics.setdefault('avg', {})[key[4:]] = (
+                    self._json_safe_value(value))
+
+        #* 合并示例："current_mIoU/IoU": "12.30%/30.00%"。
+        #* 斜杠两侧固定为 mIoU、IoU，将原始 0~1 指标乘以 100，保留两位小数。
+        #* 含百分号和斜杠的值保存为 JSON 字符串；后续画曲线时可先用
+        #* value.split('/') 拆分，去掉 % 后转为 float。缺失指标写 null 字样，
+        #* 避免误记为 0；这里只改变日志格式，评估和最优 checkpoint 仍用数值。
+        for time_label, metrics in grouped_metrics.items():
+            values = [metrics.get(name) for name in ('mIoU', 'IoU')]
+            log_dict[f'{time_label}_mIoU/IoU'] = '/'.join(
+                'null' if value is None else f'{value * 100:.2f}%' for value in values)
+
+        with open(json_log_path, 'a') as f:
+            f.write(json.dumps(log_dict, ensure_ascii=False) + '\n')
+
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
         # Synchronization of BatchNorm's buffer (running_mean
@@ -113,6 +225,9 @@ class CustomDistEvalHook(BaseDistEvalHook):
                 #! “Epoch [1][5/10] time=0 data_time=0 memory=...” 形式，
                 #! 既重复又容易误导为新一轮训练日志。这里清空 ready 状态，
                 #! 保留 evaluate() 表格输出，跳过 TextLoggerHook 的二次打印。
+                #! 但在清空前，先将精简评估指标写入 .log.json，避免 json
+                #! 只记录训练 loss 而缺少每轮评估结果。
+                self._dump_eval_results_to_json(runner)
                 runner.log_buffer.clear()
 
         #! 修复原因：

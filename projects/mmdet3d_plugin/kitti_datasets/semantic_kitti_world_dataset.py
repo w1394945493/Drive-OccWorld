@@ -95,6 +95,10 @@ class SemanticKITTIWorldDataset(Dataset):
         self.camera_names = self.CAMERA_GROUPS[use_camera]
         self.history_queue_length = int(history_queue_length)
         self.future_queue_length = int(future_queue_length)
+        #* SemanticKITTI occupancy 关键帧按约 2Hz 组织，相邻 token 间隔约 0.5s。
+        #* EvalHook 写 .log.json 时会用该字段把 step_1/step_2/... 转成
+        #* 0.5s/1s/... 这样的更直观时间标签。
+        self.forecast_time_interval = 0.5
         self.filter_invalid = filter_invalid
         self.load_occ = load_occ
         self.load_img = load_img
