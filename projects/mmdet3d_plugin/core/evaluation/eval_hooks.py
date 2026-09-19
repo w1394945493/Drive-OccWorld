@@ -28,10 +28,11 @@ def _calc_dynamic_intervals(start_interval, dynamic_interval_list):
     return dynamic_milestones, dynamic_intervals
 
 
-class CustomDistEvalHook(BaseDistEvalHook):
+class _ForecastEvalMixin:
+    # todo: 单卡和多卡共用调度/JSON 格式化，避免只修复 DDP 而单卡仍走原生日志。
 
     def __init__(self, *args, dynamic_intervals=None,  **kwargs):
-        super(CustomDistEvalHook, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.use_dynamic_intervals = dynamic_intervals is not None
         if self.use_dynamic_intervals:
             self.dynamic_milestones, self.dynamic_intervals = \
@@ -73,10 +74,10 @@ class CustomDistEvalHook(BaseDistEvalHook):
             except ValueError:
                 pass
         if isinstance(value, (list, tuple)):
-            return [CustomDistEvalHook._json_safe_value(v) for v in value]
+            return [_ForecastEvalMixin._json_safe_value(v) for v in value]
         if isinstance(value, dict):
             return {
-                k: CustomDistEvalHook._json_safe_value(v)
+                k: _ForecastEvalMixin._json_safe_value(v)
                 for k, v in value.items()
             }
         return value
@@ -128,7 +129,8 @@ class CustomDistEvalHook(BaseDistEvalHook):
         log_dict = {
             'mode': 'val',
             'epoch': runner.epoch + 1,
-            'iter': runner.iter + 1,
+            #* after_train_epoch 时 iter 已递增；after_train_iter 时尚未递增。
+            'iter': runner.iter if self.by_epoch else runner.iter + 1,
         }
 
         dataset = getattr(self.dataloader, 'dataset', None)
@@ -173,6 +175,37 @@ class CustomDistEvalHook(BaseDistEvalHook):
 
         with open(json_log_path, 'a') as f:
             f.write(json.dumps(log_dict, ensure_ascii=False) + '\n')
+
+    def _finish_compact_logging(self, runner):
+        if getattr(self.dataloader.dataset, 'suppress_eval_log_buffer', False):
+            self._dump_eval_results_to_json(runner)
+            runner.log_buffer.clear()
+
+
+class CustomEvalHook(_ForecastEvalMixin, BaseEvalHook):
+    """单卡评估：复用百分比 JSON 保存和日志清理，不执行分布式通信。"""
+
+    def _do_evaluate(self, runner):
+        if not self._should_evaluate(runner):
+            return
+        from mmdet.apis import single_gpu_test
+
+        was_training = runner.model.training
+        try:
+            results = single_gpu_test(runner.model, self.dataloader, show=False)
+            runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
+            key_score = self.evaluate(runner, results)
+            if self.save_best and key_score is not None:
+                self._save_ckpt(runner, key_score)
+            # todo: 原单卡 EvalHook 不会执行我们在多卡中添加的 JSON 保存/clear，
+            # 因此曾重复打印 Epoch [1][5/20]，并将原始 step_i 指标写入日志。
+            self._finish_compact_logging(runner)
+        finally:
+            runner.model.train(was_training)
+        runner.logger.info('单卡评估结束：结果已记录，评估 Hook 已返回训练流程。')
+
+
+class CustomDistEvalHook(_ForecastEvalMixin, BaseDistEvalHook):
 
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
@@ -227,8 +260,7 @@ class CustomDistEvalHook(BaseDistEvalHook):
                 #! 保留 evaluate() 表格输出，跳过 TextLoggerHook 的二次打印。
                 #! 但在清空前，先将精简评估指标写入 .log.json，避免 json
                 #! 只记录训练 loss 而缺少每轮评估结果。
-                self._dump_eval_results_to_json(runner)
-                runner.log_buffer.clear()
+                self._finish_compact_logging(runner)
 
         #! 修复原因：
         # todo: 必要同步点：
@@ -243,4 +275,10 @@ class CustomDistEvalHook(BaseDistEvalHook):
         #! 这里在评估 hook 末尾同步所有 rank，确保 rank0 完成评估日志后，
         #! 全部进程再一起进入下一个 epoch/iter。
         dist.barrier()
+        # todo: 各 rank 一致清理日志状态，防止后续 LoggerHook 的 collective
+        # 在不同 rank 上因 log_buffer 状态不同而执行不一致。
+        if getattr(self.dataloader.dataset, 'suppress_eval_log_buffer', False):
+            runner.log_buffer.clear()
+        if runner.rank == 0:
+            runner.logger.info('多卡评估结束：结果已记录，各 rank 已完成同步。')
   
