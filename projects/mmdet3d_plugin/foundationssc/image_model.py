@@ -1,4 +1,4 @@
-"""第二阶段：冻结 FoundationStereo，训练图像 FPN，尚未接入体素/占据头。"""
+"""分阶段前端：冻结 FoundationStereo → 图像 FPN → 可选三维体素编码。"""
 from pathlib import Path
 
 import torch
@@ -46,7 +46,7 @@ class FoundationImagePyramid(nn.Module):
 class FoundationSSCImageModel(BaseModule):
     def __init__(self, stereo_checkpoint, stereo_config,
                  gru_iters=12, backbone_channels=1024, out_channels=160,
-                 strict_load=True, train_cfg=None, test_cfg=None):
+                 strict_load=True, voxel_encoder=None, train_cfg=None, test_cfg=None):
         super().__init__()
         from omegaconf import OmegaConf
         #* 所有骨干源码均在本包中；仅权重与 YAML 是外部数据文件。
@@ -69,6 +69,15 @@ class FoundationSSCImageModel(BaseModule):
         self.img_backbone.requires_grad_(False)
         self.img_backbone.eval()
         self.image_pyramid = FoundationImagePyramid(backbone_channels, out_channels)
+        self.voxel_encoder = None
+        if voxel_encoder is not None:
+            from .voxel.encoder import FoundationVoxelEncoder
+            options = dict(voxel_encoder)
+            options.setdefault('input_channels', 4 * out_channels)
+            options.setdefault('disparity_channels', args.max_disp // 4)
+            if options['disparity_channels'] != args.max_disp // 4:
+                raise ValueError('voxel disparity_channels 必须等于 stereo YAML max_disp//4')
+            self.voxel_encoder = FoundationVoxelEncoder(**options)
 
     def train(self, mode=True):
         super().train(mode)
@@ -93,11 +102,18 @@ class FoundationSSCImageModel(BaseModule):
         return dict(img_feats=fused.unsqueeze(1), disparity=disparity,
                     dino_features=left_features, pyramid=pyramid)
 
-    def forward_test(self, img_inputs, img_metas, **kwargs):
-        return self.extract_image_features(img_inputs, img_metas)
+    def forward_test(self, img_inputs, img_metas, stage='images', **kwargs):
+        output = self.extract_image_features(img_inputs, img_metas)
+        if stage == 'voxels':
+            if self.voxel_encoder is None:
+                raise ValueError('voxels 阶段需要配置 voxel_encoder')
+            output.update(self.voxel_encoder(output, img_inputs, img_metas))
+        elif stage != 'images':
+            raise ValueError(f'不支持的前向阶段：{stage}')
+        return output
 
     def forward_train(self, **kwargs):
-        raise NotImplementedError('第二阶段仅验证图像特征；尚未实现占据预测与训练损失')
+        raise NotImplementedError('当前仅验证图像/体素特征；尚未实现占据预测与训练损失')
 
     def forward(self, return_loss=False, **kwargs):
         return self.forward_train(**kwargs) if return_loss else self.forward_test(**kwargs)

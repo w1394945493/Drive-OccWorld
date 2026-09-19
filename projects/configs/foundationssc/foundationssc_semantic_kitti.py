@@ -1,4 +1,4 @@
-"""FoundationSSC 第二阶段：双目数据 + 冻结骨干 + 可训练图像 FPN。"""
+"""FoundationSSC 第一至三阶段：双目数据、图像前端、三维体素特征。"""
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 ann_root = 'data/semantic_kitti'
@@ -26,6 +26,20 @@ model = dict(
     stereo_checkpoint='/c20250502/wangyushen/Weights/foundationssc/23-51-11/model_best_bp2.pth',
     stereo_config='/c20250502/wangyushen/Weights/foundationssc/23-51-11/cfg.yaml',
     gru_iters=12, backbone_channels=1024, out_channels=160,
-    strict_load=True)
+    strict_load=True,
+    #* 第三阶段：输出 [B,128,128,128,16] = [B,C,X,Y,Z]，覆盖完整 point_cloud_range。
+    # 与最终 GT [256,256,32] 不同，体素边长为 0.4m；后续占据头再恢复目标尺寸。
+    voxel_encoder=dict(
+        #* ops/ 就地编译后使用融合 CUDA 汇聚和注意力；pytorch 仅作为对照后端。
+        ops_backend='cuda',
+        point_cloud_range=point_cloud_range, voxel_shape=(128, 128, 16),
+        input_size=input_size, depth_bound=(2., 58., .5), channels=128,
+        downsample=8, pool_chunk=8,
+        # disparity_channels 自动取 stereo YAML 的 max_disp//4，不再硬编码 104。
+        depth_cfg=dict(dformer_layers=4, mixer_layers=8),
+        refiner_cfg=dict(cross_layers=3, self_layers=2, heads=8, points=8,
+                         ffn_channels=256, dropout=.1, self_layout=(512, 512),
+                         query_chunk=2048),
+        fusion_groups=16))
 #* 完整 stereo checkpoint 必须包含 EdgeNeXt、DINO 和立体匹配网络权重。
 # 不再读取任何辅助骨干 checkpoint，也不自动下载权重。
