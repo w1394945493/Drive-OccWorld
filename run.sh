@@ -93,6 +93,13 @@ python scripts/vis_semantic_kitti_drive_occworld.py \
   --save-npy
 
 # =====================================================================#
+# foundationssc
+cd projects/mmdet3d_plugin/foundationssc/ops
+python setup.py build_ext --inplace
+
+python scripts/test_foundationssc.py --check-grad
+
+# =====================================================================#
 #  火山服务器训练
 
 PYTHONPATH="$(pwd)" \
