@@ -1,4 +1,4 @@
-"""分阶段前端：冻结 FoundationStereo → 图像 FPN → 可选三维体素编码。"""
+"""当前帧 SSC：冻结 FoundationStereo → 图像/体素特征 → 占据预测与监督。"""
 from pathlib import Path
 
 import torch
@@ -46,7 +46,8 @@ class FoundationImagePyramid(nn.Module):
 class FoundationSSCImageModel(BaseModule):
     def __init__(self, stereo_checkpoint, stereo_config,
                  gru_iters=12, backbone_channels=1024, out_channels=160,
-                 strict_load=True, voxel_encoder=None, train_cfg=None, test_cfg=None):
+                 strict_load=True, voxel_encoder=None, occ_encoder_backbone=None,
+                 occ_encoder_neck=None, pts_bbox_head=None, train_cfg=None, test_cfg=None):
         super().__init__()
         from omegaconf import OmegaConf
         #* 所有骨干源码均在本包中；仅权重与 YAML 是外部数据文件。
@@ -79,6 +80,20 @@ class FoundationSSCImageModel(BaseModule):
                 raise ValueError('voxel disparity_channels 必须等于 stereo YAML max_disp//4')
             self.voxel_encoder = FoundationVoxelEncoder(**options)
 
+        #* 与原 FoundationSSC 一致：融合体素 → 3D ResNet → 3D FPN → OccHead。
+        # 本地直接实例化，避免和 Drive-OccWorld 现有同名注册模块冲突。
+        from .occupancy import CustomResNet3D, GeneralizedLSSFPN, OccHead
+        modules = ((occ_encoder_backbone, CustomResNet3D, 'occ_encoder_backbone'),
+                   (occ_encoder_neck, GeneralizedLSSFPN, 'occ_encoder_neck'),
+                   (pts_bbox_head, OccHead, 'pts_bbox_head'))
+        if self.voxel_encoder is None or any(config is None for config, _, _ in modules):
+            raise ValueError('完整占据模型需配置 voxel_encoder、occ_encoder_backbone、occ_encoder_neck 和 pts_bbox_head')
+        for config, cls, name in modules:
+            options = dict(config)
+            if options.pop('type', cls.__name__) != cls.__name__:
+                raise ValueError(f'{name} 应使用本地 {cls.__name__}')
+            setattr(self, name, cls(**options))
+
     def train(self, mode=True):
         super().train(mode)
         #* 无论外层如何切换，冻结骨干始终 eval；FPN 正常切换 train/eval。
@@ -88,7 +103,7 @@ class FoundationSSCImageModel(BaseModule):
     def extract_image_features(self, img_inputs, img_metas):
         raw = img_metas['raw_img']
         if len(raw) != 2:
-            raise ValueError('当前阶段要求每帧一对左右图像')
+            raise ValueError('当前模型要求每帧一对左右图像')
         device = next(self.image_pyramid.parameters()).device
         left, right = [x.permute(0, 3, 1, 2).to(device=device, dtype=torch.float32).contiguous() for x in raw]
         if left.shape != right.shape or left.shape[0] != img_inputs[0].shape[0]:
@@ -102,18 +117,28 @@ class FoundationSSCImageModel(BaseModule):
         return dict(img_feats=fused.unsqueeze(1), disparity=disparity,
                     dino_features=left_features, pyramid=pyramid)
 
-    def forward_test(self, img_inputs, img_metas, stage='images', **kwargs):
+    def _forward_occupancy(self, img_inputs, img_metas):
+        """不读取未来信息或 GT：双目 → 图像特征 → 体素 → 当前帧语义 logits。"""
         output = self.extract_image_features(img_inputs, img_metas)
-        if stage == 'voxels':
-            if self.voxel_encoder is None:
-                raise ValueError('voxels 阶段需要配置 voxel_encoder')
-            output.update(self.voxel_encoder(output, img_inputs, img_metas))
-        elif stage != 'images':
-            raise ValueError(f'不支持的前向阶段：{stage}')
+        output.update(self.voxel_encoder(output, img_inputs, img_metas))
+        encoded = self.occ_encoder_neck(self.occ_encoder_backbone(output['voxel_feats']))
+        #* 原 neck 返回两个融合尺度，原 detector 仅将最高分辨率尺度送给 OccHead。
+        output.update(self.pts_bbox_head([encoded[0]]))
+        output['pred'] = output['output_voxels'].detach().argmax(dim=1)
         return output
 
-    def forward_train(self, **kwargs):
-        raise NotImplementedError('当前仅验证图像/体素特征；尚未实现占据预测与训练损失')
+    def forward_test(self, img_inputs, img_metas, **kwargs):
+        return self._forward_occupancy(img_inputs, img_metas)
+
+    def forward_train(self, img_inputs, img_metas, gt_occ, return_outputs=False, **kwargs):
+        output = self._forward_occupancy(img_inputs, img_metas)
+        losses = self.pts_bbox_head.loss(output['output_voxels'], gt_occ)
+        #* 默认返回 loss 字典；调试脚本可取同一次前向的输出，避免重复运行骨干。
+        # 尚未接入原深度监督和图像语义辅助损失，它们需要额外 GT，不能以伪标签替代。
+        if return_outputs:
+            output['losses'] = losses
+            return output
+        return losses
 
     def forward(self, return_loss=False, **kwargs):
         return self.forward_train(**kwargs) if return_loss else self.forward_test(**kwargs)

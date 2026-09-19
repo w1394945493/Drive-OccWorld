@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""FoundationSSC 完整特征流程验证：数据 → 图像特征 → 三维体素特征。
+"""FoundationSSC 完整验证：数据 → 图像特征 → 体素 → 占据预测 → 真实占据损失。
 
 固定执行当前已实现的完整流程；--check-grad 可额外检查反向传播。
-尚未接入占据分类头、训练损失和评估，不将特征探针当作正式训练目标。
+--check-grad 对真实 GT 占据损失反传；不使用特征探针，尚未接入评估或优化器更新。
 """
 import argparse
 import sys
@@ -46,7 +46,7 @@ def main():
     parser.add_argument('--config', default='projects/configs/foundationssc/foundationssc_semantic_kitti.py')
     parser.add_argument('--stereo-checkpoint', help='覆盖 FoundationStereo 权重路径')
     parser.add_argument('--stereo-config', help='覆盖 FoundationStereo YAML 路径')
-    parser.add_argument('--check-grad', action='store_true', help='使用特征探针检查反传，不是占据训练损失')
+    parser.add_argument('--check-grad', action='store_true', help='对真实占据损失反传，检查可训练模块梯度及骨干冻结')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--ops-backend', choices=['cuda', 'pytorch', 'auto'], help='覆盖体素汇聚与注意力算子后端')
     parser.add_argument('--split', choices=['train', 'val'], default='val')
@@ -87,7 +87,9 @@ def main():
     print(f'冻结骨干参数量：{sum(p.numel() for p in model.img_backbone.parameters()):,}')
     print(f'可训练 FPN 参数量：{sum(p.numel() for p in model.image_pyramid.parameters()):,}')
     print(f'可训练体素前端参数量：{sum(p.numel() for p in model.voxel_encoder.parameters()):,}')
-    print(f'体素算子后端：{model.voxel_encoder.ops_backend}；暂不包含 occupancy 分类头。')
+    print(f'体素算子后端：{model.voxel_encoder.ops_backend}')
+    for name in ('occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head'):
+        print(f'{name} 可训练参数量：{sum(p.numel() for p in getattr(model, name).parameters() if p.requires_grad):,}')
     for index, batch in zip(args.indices, loader):
         check_batch(batch)
         print(f"样本 {index}，场景 {batch['img_metas']['scene_name'][0]}，帧 {batch['img_metas']['token'][0]}")
@@ -101,7 +103,11 @@ def main():
         torch.cuda.reset_peak_memory_stats(device)
         start = time.perf_counter()
         with torch.set_grad_enabled(args.check_grad):
-            output = model(return_loss=False, stage='voxels', **batch)
+            if args.check_grad:
+                output = model(return_loss=True, return_outputs=True, **batch)
+            else:
+                output = model(return_loss=False, **batch)
+                output['losses'] = model.pts_bbox_head.loss(output['output_voxels'], batch['gt_occ'])
             feature = output['img_feats']
             assert feature.shape[:3] == (1, 1, 640), feature.shape
             assert feature.shape[-2:] == tuple(v // 8 for v in batch['img_inputs'][0].shape[-2:]), feature.shape
@@ -128,10 +134,23 @@ def main():
             upper = geom.lower + geom.voxel_size * geom.voxel_size.new_tensor(geom.voxel_shape)
             torch.testing.assert_close(upper.cpu(), batch['img_metas']['pc_range'][0, 3:])
             print('  深度概率、实际标定正反投影和三维空间覆盖检查通过。')
+            logits, prediction = output['output_voxels'], output['pred']
+            assert logits.shape == (batch['gt_occ'].shape[0], model.pts_bbox_head.out_channel, *batch['gt_occ'].shape[1:])
+            assert prediction.shape == batch['gt_occ'].shape and prediction.dtype == torch.int64
+            assert torch.isfinite(logits).all()
+            torch.testing.assert_close(prediction, logits.detach().argmax(1))
+            print(f'  占据 logits: {tuple(logits.shape)}；类别预测: {tuple(prediction.shape)}')
+            print(f'  标签约定：empty={model.pts_bbox_head.empty_idx}，ignore={model.pts_bbox_head.ignore_index}')
+            losses = output['losses']
+            assert set(losses) == {'loss_voxel_ce', 'loss_voxel_sem_scal', 'loss_voxel_geo_scal'}
+            for name, loss in losses.items():
+                assert loss.ndim == 0 and torch.isfinite(loss), name
+                print(f'  {name}: {loss.item():.6f}')
+            total_loss = sum(losses.values())
+            print(f'  占据总损失: {total_loss.item():.6f}（未包含深度/图像语义辅助监督）')
             if args.check_grad:
-                #* 只验证梯度连通性，不代表已接入 SSC loss 或 optimizer。
-                probe = output['voxel_feats'].square().mean()
-                probe.backward()
+                #* 真实 GT 的 CE + semantic/geometric scaling，替代旧体素特征平方均值探针。
+                total_loss.backward()
                 grads = [p.grad for p in model.image_pyramid.parameters() if p.requires_grad]
                 assert grads and all(g is not None and torch.isfinite(g).all() for g in grads)
                 assert any(g.abs().sum() > 0 for g in grads)
@@ -144,17 +163,22 @@ def main():
                     assert any(torch.count_nonzero(x) for x in values), name
                     print(f'  {name} 反向梯度检查通过。')
                 del values, module
-                del probe
+                for name in ('occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head'):
+                    values = [p.grad for p in getattr(model, name).parameters() if p.requires_grad]
+                    assert values and all(x is not None and torch.isfinite(x).all() for x in values), name
+                    assert any(torch.count_nonzero(x) for x in values), name
+                    print(f'  {name} 真实损失反向梯度检查通过。')
+                del values
         torch.cuda.synchronize(device)
         print(f'  融合图像特征: {tuple(feature.shape)}, dtype={feature.dtype}')
         print(f"  DINO各层: {[tuple(pair[0].shape) for pair in output['dino_features']]}")
         print(f"  视差概率/视差图: {[tuple(x.shape) for x in output['disparity']]}")
         print(f'  耗时: {time.perf_counter()-start:.3f}s；显存峰值: {torch.cuda.max_memory_allocated(device)/1024**3:.2f} GiB')
-        del output, feature, tensors
+        del output, feature, tensors, logits, prediction, losses, total_loss, loss
         if args.check_grad:
             del grads
         model.zero_grad(set_to_none=True)
-    print('完整特征流程检查完成：数据 → 图像特征 → 体素特征；尚未接入占据分类头及训练损失。')
+    print('完整流程检查完成：数据 → 图像特征 → 体素 → 占据预测与三项真实占据损失；尚未接入评估和 optimizer.step。')
 
 
 if __name__ == '__main__':

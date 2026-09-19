@@ -51,7 +51,7 @@ python scripts/test_foundationssc.py --indices 0 --check-grad
 第一条为无数据/无 checkpoint 的 CUDA 扩展测试，包含源码校验、算子适配对照、空输入、
 小尺寸完整三维前向及梯度检查。后两条使用真实数据和 CUDA，打印中间张量、
 射线/候选/可见体素数量，检查深度概率和真实标定的投影往返。
-通过结构/几何测试不代表已恢复原论文精度；占据预测头、监督与评估属于下一阶段。
+通过结构/几何测试不代表已恢复原论文精度；占据预测与损失已接到后续 occupancy 模块，评估尚未接入。
 
 移植模块的来源保留于此；许可参考上级 stereo/FOUNDATIONSSC_LICENSE 与原组件声明。
 注意力设计参考 VoxFormer（NVIDIA Source Code License-NC）与 OpenMMLab；不统一重新许可。
