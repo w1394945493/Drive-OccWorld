@@ -195,7 +195,13 @@ class CustomEvalHook(_ForecastEvalMixin, BaseEvalHook):
 
         was_training = runner.model.training
         try:
-            results = single_gpu_test(runner.model, self.dataloader, show=False)
+            model = getattr(runner.model, 'module', runner.model)
+            if getattr(model, 'occupancy_eval_per_sample', False):
+                #* FoundationSSC 没有检测框/传统 img 字段，使用自己的逐样本统计入口。
+                from projects.mmdet3d_plugin.bevformer.apis.test import _test_current_occupancy
+                results = _test_current_occupancy(runner.model, self.dataloader)
+            else:
+                results = single_gpu_test(runner.model, self.dataloader, show=False)
             runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
             key_score = self.evaluate(runner, results)
             if self.save_best and key_score is not None:

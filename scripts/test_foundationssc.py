@@ -59,6 +59,9 @@ def main():
     import projects.mmdet3d_plugin  # noqa: F401，注册 Dataset 与 pipeline
     cfg = Config.fromfile(args.config)
     dataset_cfg = cfg.data[args.split].copy()
+    #* 独立脚本采用普通 DataLoader；正式 train.py 才使用 MMCV DataContainer。
+    dataset_cfg['pipeline'] = [dict(step, runner_format=False) if step['type'] == 'PackFoundationSSCInputs'
+                               else dict(step) for step in dataset_cfg['pipeline']]
     if args.ann_file:
         dataset_cfg['ann_file'] = args.ann_file
     dataset = build_dataset(dataset_cfg)

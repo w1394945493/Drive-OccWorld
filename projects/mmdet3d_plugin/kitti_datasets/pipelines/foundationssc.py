@@ -105,8 +105,18 @@ class LoadFoundationSSCOccupancy:
 
 @PIPELINES.register_module()
 class PackFoundationSSCInputs:
+    def __init__(self, runner_format=False):
+        self.runner_format = runner_format
+
     def __call__(self, results):
-        #* 原 FoundationSSC 使用普通 dict/default_collate；这里不套 BEVFormer 的 DC。
-        # 后续接 train.py 时由新模型适配 forward(data_dict)，不能直接交给 Drive_OccWorld。
+        #* 正式 MMCV runner：张量按 batch 堆叠；meta 按样本保留在 CPU，
+        # 字符串 token 不参与 tensor scatter，原始双目图像由模型按需移到 GPU。
+        if self.runner_format:
+            from mmcv.parallel import DataContainer as DC
+            return dict(
+                img_inputs=tuple(DC(x, stack=True, pad_dims=None) for x in results['img_inputs']),
+                img_metas=DC(results['foundation_meta'], cpu_only=True),
+                gt_occ=DC(results['gt_occ'], stack=True, pad_dims=None))
+        #* 独立验证脚本仍可使用普通 default_collate，不依赖并行 wrapper。
         return dict(img_inputs=results['img_inputs'],
                     img_metas=results['foundation_meta'], gt_occ=results['gt_occ'])

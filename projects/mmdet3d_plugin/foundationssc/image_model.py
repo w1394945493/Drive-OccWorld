@@ -2,7 +2,9 @@
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.utils.data._utils.collate import default_collate
 from mmcv.runner import BaseModule
 from mmdet.models import DETECTORS
 
@@ -102,6 +104,34 @@ class FoundationSSCImageModel(BaseModule):
         self.img_backbone.eval()
         return self
 
+    def init_weights(self):
+        #* torch 模块已在构造时初始化，冻结骨干也已严格加载预训练权重。
+        # train.py 会再次调用 init_weights；不能递归重置已加载的冻结骨干。
+        self._is_init = True
+
+    def train_step(self, data, optimizer=None):
+        """MMCV Runner 接口：这里只算 loss，反传/裁剪/更新交给 OptimizerHook。"""
+        losses = self(return_loss=True, **data)
+        values = {}
+        for name, value in losses.items():
+            if torch.is_tensor(value):
+                values[name] = value.mean()
+            elif isinstance(value, list) and all(torch.is_tensor(x) for x in value):
+                values[name] = sum(x.mean() for x in value)
+            else:
+                raise TypeError(f'{name} 必须为 Tensor 或 Tensor 列表')
+        loss = sum(value for name, value in values.items() if 'loss' in name)
+        values['loss'] = loss
+        log_vars = {}
+        for name, value in values.items():
+            #* 仅日志副本跨卡平均，不替换本卡带梯度的 loss；DDP 负责梯度同步。
+            logged = value.detach().clone()
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(logged)
+                logged /= dist.get_world_size()
+            log_vars[name] = logged.item()
+        return dict(loss=loss, log_vars=log_vars, num_samples=data['gt_occ'].shape[0])
+
     def extract_image_features(self, img_inputs, img_metas):
         raw = img_metas['raw_img']
         if len(raw) != 2:
@@ -169,4 +199,7 @@ class FoundationSSCImageModel(BaseModule):
         return losses
 
     def forward(self, return_loss=False, **kwargs):
+        #* MMCV scatter 后为 list[每样本 meta]；独立脚本则已 default_collate 成 dict。
+        if isinstance(kwargs.get('img_metas'), (list, tuple)):
+            kwargs['img_metas'] = default_collate(kwargs['img_metas'])
         return self.forward_train(**kwargs) if return_loss else self.forward_test(**kwargs)

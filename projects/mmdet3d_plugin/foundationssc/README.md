@@ -1,7 +1,8 @@
 # FoundationSSC 分阶段移植
 
 目前实现当前帧的图像前端、体素特征、占据预测与三项占据损失。
-尚未接入原深度/2D 语义辅助监督、评估以及正式 train.py 的 runner/DataContainer 接口。
+已接入当前帧 IoU/mIoU 评估及 train.py 的 runner/DataContainer 接口。
+尚未接入原深度/2D 语义辅助监督及未来占据预测。
 
 - 数据：当前帧左右 RGB、标定、occupancy，全部通过现有 PKL 构造。
 - 冻结骨干：本地 `stereo/` 包实现 FoundationStereo、DepthAnything 和 DINOv2。
@@ -9,7 +10,8 @@
 - 可训练适配：等价实现 SimpleFPN 默认 `layers=[4]` 和 SECONDFPN，输出 640 通道。
 - 三维前端：DSGP 深度/context → LSS 粗体素与 proposal/VoxFormer 细化 → 三平面门控融合。
 - 占据分支：原 CustomResNet3D → GeneralizedLSSFPN → OccHead，输出 20 类 logits 和类别预测。
-- `forward_test` 返回特征、`output_voxels` 和 `pred`；`forward_train` 默认返回三项真实占据损失。
+- `forward_test` 有 GT 时默认返回逐样本混淆矩阵；无 GT 或 `return_outputs=True` 时返回特征、logits、pred。
+  `forward_train` 默认返回三项真实占据损失。
   调试时 `return_outputs=True` 额外返回同一次前向的特征与预测，不重复运行骨干。
 
 从 Drive-OccWorld 根目录运行：
@@ -42,3 +44,36 @@ Small 配置需要 11-33-40 的权重/YAML；占据分支规模没有随骨干�
 
 体素阶段配置默认使用本地 CUDA 汇聚/注意力，运行前需就地编译；命令及数值/梯度
 验证见 [ops/README.md](ops/README.md)。可用 `--ops-backend pytorch` 切回对照后端。
+
+## 正式训练入口
+
+从仓库根目录运行；先确认配置中的 train/val PKL 和 Small 权重/YAML 路径存在。
+下面用小数据验证两个 epoch 的训练、保存、评估及恢复训练模式：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python tools/train.py \
+  projects/configs/foundationssc/foundationssc_semantic_kitti.py \
+  --work-dir out/foundationssc_train_debug --no-auto-resume \
+  --cfg-options total_epochs=2 data.train.max_samples=4 data.val.max_samples=2 \
+  data.workers_per_gpu=0 log_config.interval=1 lr_config.warmup_iters=2
+```
+
+全量训练去掉这些 `--cfg-options`，改用新的 work-dir；默认 24 epochs、每卡 batch=1，
+每轮验证 current IoU/mIoU、保存 checkpoint，并额外按 current_mIoU 保存最佳模型。
+默认自动从 work-dir 恢复训练；`--no-auto-resume` 用于明确从头调试。
+只需覆盖 total_epochs，train.py 会同步 runner.max_epochs。
+
+双卡小数据验证（每卡 batch=1，总 batch=2）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=. torchrun --nproc_per_node=2 --master_port=29501 \
+  tools/train.py projects/configs/foundationssc/foundationssc_semantic_kitti.py \
+  --launcher pytorch --work-dir out/foundationssc_train_debug_ddp --no-auto-resume \
+  --cfg-options total_epochs=2 data.train.max_samples=4 data.val.max_samples=3 \
+  data.workers_per_gpu=0 log_config.interval=1 lr_config.warmup_iters=2
+```
+
+验证集取 3 个样本可检查分布式 sampler 补齐后的 token 去重。当前不启用 MMCV fp16。
+独立 `test_foundationssc.py` 会关闭 runner_format，继续使用普通 DataLoader；
+正式训练的 PackFoundationSSCInputs 则启用 DataContainer。train_step 只返回带梯度 loss
+和日志；backward、梯度裁剪、optimizer.step 由 MMCV OptimizerHook 执行，避免重复更新。

@@ -1,6 +1,20 @@
 """FoundationSSC Small：双目 → 体素 → 当前帧占据预测与三项占据损失。"""
+#* ================== 训练参数 ==================
+samples_per_gpu = 1
+workers_per_gpu = 2
+total_epochs = 24
+learning_rate = 3e-4
+log_interval = 20
+eval_interval = 1
+checkpoint_interval = 1
+max_keep_ckpts = 3
+train_max_samples = None
+val_max_samples = None
+
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
+#* 按配置注册新模型，不让原 Drive-OccWorld 配置额外依赖 FoundationSSC。
+custom_imports = dict(imports=['projects.mmdet3d_plugin.foundationssc'], allow_failed_imports=False)
 ann_root = 'data/semantic_kitti'
 input_size = (384, 1280)
 occ_size = (256, 256, 32)
@@ -20,16 +34,20 @@ pipeline = [
     dict(type='LoadFoundationSSCStereo', input_size=input_size),
     dict(type='LoadFoundationSSCOccupancy', occ_size=occ_size,
          point_cloud_range=point_cloud_range),
-    dict(type='PackFoundationSSCInputs'),
+    dict(type='PackFoundationSSCInputs', runner_format=True),
 ]
 dataset_common = dict(
     type='SemanticKITTIWorldDataset', pipeline=pipeline, use_camera='stereo',
     history_queue_length=0, future_queue_length=0, filter_invalid=True,
     format_for_train=False, load_img=True, load_occ=True)
 data = dict(
-    samples_per_gpu=1, workers_per_gpu=0,
-    train=dict(**dataset_common, ann_file=f'{ann_root}/semantickitti_infos_train.pkl', test_mode=False),
-    val=dict(**dataset_common, ann_file=f'{ann_root}/semantickitti_infos_val.pkl', test_mode=True))
+    samples_per_gpu=samples_per_gpu, workers_per_gpu=workers_per_gpu,
+    shuffler_sampler=dict(type='DistributedGroupSampler'),
+    nonshuffler_sampler=dict(type='DistributedSampler'),
+    train=dict(**dataset_common, ann_file=f'{ann_root}/semantickitti_infos_train.pkl',
+               max_samples=train_max_samples, test_mode=False),
+    val=dict(**dataset_common, ann_file=f'{ann_root}/semantickitti_infos_val.pkl',
+             max_samples=val_max_samples, test_mode=True))
 
 #* 数据与模型统一配置；FoundationStereo/DINOv2 均使用本仓库实现。
 #* 对齐原 FoundationSSC-small-SemanticKITTI.py：使用 11-33-40 的 Small 权重/YAML，
@@ -81,3 +99,28 @@ model = dict(
 #* 完整 stereo checkpoint 必须包含 EdgeNeXt、DINO 和立体匹配网络权重。
 # Small 权重需搭配其原版 cfg.yaml（vit_size='vits'），不要混用 23-51-11 的 Large YAML。
 # 不再读取任何辅助骨干 checkpoint，也不自动下载权重。
+
+#* ================== tools/train.py 正式运行配置 ==================
+# 只训练当前帧 SSC 的三项占据损失，不等于原论文全部辅助监督的复现。
+# 优化器参考原 Small 的 AdamW；此处采用本仓库 epoch runner 的余弦调度。
+optimizer = dict(type='AdamW', lr=learning_rate, weight_decay=0.01)
+optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+lr_config = dict(policy='CosineAnnealing', by_epoch=True,
+                 warmup='linear', warmup_iters=500, warmup_ratio=1. / 3,
+                 min_lr_ratio=1e-3)
+runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
+checkpoint_config = dict(interval=checkpoint_interval, by_epoch=True,
+                         max_keep_ckpts=max_keep_ckpts)
+log_config = dict(interval=log_interval, hooks=[dict(type='TextLoggerHook')])
+evaluation = dict(interval=eval_interval, save_best='current_mIoU', rule='greater')
+workflow = [('train', 1)]
+dist_params = dict(backend='nccl')
+log_level = 'INFO'
+work_dir = 'out/foundationssc_semantic_kitti'
+load_from = None  # 冻结骨干由 model.stereo_checkpoint 加载；不是全模型 checkpoint。
+resume_from = None
+auto_resume = True
+# 动态可见体素/候选筛选可能使部分参数在某个 batch 未参与 loss，DDP 需允许未使用参数。
+find_unused_parameters = True
+cudnn_benchmark = False
+#* 暂不启用 MMCV fp16：先验证原 CUDA 算子的 FP32 训练闭环。
