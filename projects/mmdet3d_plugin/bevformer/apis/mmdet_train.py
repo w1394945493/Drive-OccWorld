@@ -15,8 +15,6 @@ from mmcv.runner import (HOOKS, DistSamplerSeedHook, EpochBasedRunner,
                          build_runner, get_dist_info)
 from mmcv.utils import build_from_cfg
 
-from mmdet.core import EvalHook
-
 from mmdet.datasets import (build_dataset,
                             replace_ImageToTensor)
 from mmdet.utils import get_root_logger
@@ -199,10 +197,9 @@ def custom_train_detector(model,
         eval_cfg = cfg.get('evaluation', {})
         eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
         eval_cfg['jsonfile_prefix'] = osp.join('val', cfg.work_dir, time.ctime().replace(' ','_').replace(':','_'))
-        # todo: SemanticKITTI 单卡也需要百分比 JSON 保存及日志清理；此前仅多卡生效。
-        eval_hook = CustomDistEvalHook if distributed else (
-            CustomEvalHook if getattr(val_dataset, 'suppress_eval_log_buffer', False)
-            else EvalHook)
+        # todo: 单卡、多卡统一使用自定义评估；精简 JSON 和日志清理由 Hook 内部开关控制。
+        eval_hook = CustomDistEvalHook if distributed else CustomEvalHook
+        # 注册评估回调，按 eval_cfg 指定的间隔执行。
         runner.register_hook(eval_hook(val_dataloader, **eval_cfg))
 
     # user-defined hooks
