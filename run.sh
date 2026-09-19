@@ -54,7 +54,7 @@ python scripts/test_semantic_kitti_drive_occworld_forward.py \
 CUDA_VISIBLE_DEVICES=4 \
 PYTHONPATH="$(pwd)" \
 python tools/train.py \
-  /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/kitti/semantic_kitti_drive_occworld.py \
+  /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/kitti/semantic_kitti_drive_occworld_test.py \
   --work-dir out/semantic_kitti_drive_occworld_epoch_debug \
   --cfg-options \
   total_epochs=2 \
@@ -63,21 +63,21 @@ python tools/train.py \
   data.val.max_samples=5 \
   data.workers_per_gpu=0 \
   checkpoint_config.interval=1 \
-  evaluation.interval=1 \
+  evaluation.interval=1
 
 
 # 多卡测试流程
-CUDA_VISIBLE_DEVICES=0,1 \
+CUDA_VISIBLE_DEVICES=2,4,6,7 \
 PYTHONPATH="$(pwd)" \
-torchrun --nproc_per_node=2 --master_port=29501 \
+torchrun --nproc_per_node=4 --master_port=29501 \
   tools/train.py \
-  projects/configs/kitti/semantic_kitti_drive_occworld.py \
+  /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/projects/configs/kitti/semantic_kitti_drive_occworld_test.py \
   --launcher pytorch \
   --work-dir out/semantic_kitti_drive_occworld_epoch_debug_ddp \
   --cfg-options \
   total_epochs=4 \
-  data.train.max_samples=20 \
-  data.val.max_samples=10 \
+  data.train.max_samples=40 \
+  data.val.max_samples=20 \
   data.workers_per_gpu=0 \
   checkpoint_config.interval=1 \
   evaluation.interval=1
@@ -86,7 +86,7 @@ torchrun --nproc_per_node=2 --master_port=29501 \
 PYTHONPATH="$(pwd)" \
 python scripts/vis_semantic_kitti_drive_occworld.py \
   --config projects/configs/kitti/semantic_kitti_drive_occworld.py \
-  --checkpoint /c20250502/wangyushen/Outputs/drive_occworld/semkitti/train/epoch_24.pth \
+  --checkpoint /c20250502/wangyushen/Outputs/drive_occworld/semkitti/train2/latest.pth \
   --split val \
   --index 0 \
   --out-dir out/semantic_kitti_drive_occworld_vis \
