@@ -1,7 +1,7 @@
 """本地 VoxFormer/DFA3D 路径：候选交叉注意力、掩码先验、自注意力扩散。
 
 参照 FoundationSSC 的单尺度/单左相机配置。保留默认 512×512 展平 self-attention
-布局（它不是物理 BEV）；支持本地 CUDA 算子与 PyTorch 对照后端，不依赖外部 dfa3D。
+布局（它不是物理 BEV）；CUDA 使用本地移植的原 DFA3D 与 MMCV 算子，PyTorch 用于调试。
 模块命名不同，不支持直接载入原完整 SSC checkpoint；立体骨干 checkpoint 不受影响。
 """
 import math
@@ -89,7 +89,7 @@ class CrossLayer(nn.Module):
             locations = reference[:, start:start + self.chunk, None, None] + offset
             weights = self.weights(q).reshape(b, -1, self.heads, self.points).softmax(-1)
             if use_cuda(self.ops_backend, value):
-                #* CUDA 直接返回加权结果，不保留 [B,Q,heads,P,C] 八邻域中间张量。
+                #* 调用原 FoundationSSC DFA3D：depth_score 采样 → weighted attention。
                 update = deform_attention(value, locations, weights, depth).flatten(-2)
             else:
                 samples = sample_depth_weighted(value, depth, locations)
@@ -133,9 +133,12 @@ class SelfLayer(nn.Module):
             loc = refs[None, start:start + q.shape[1], None, None, None] + offset / q.new_tensor([w, h])
             weight = self.weights(inp).reshape(b, -1, self.heads, 2, self.points).softmax(-1)
             if use_cuda(self.ops_backend, values):
-                #* 两队列的点合并成 2P，权重除 2 等价于原先两队列结果取平均。
-                update = deform_attention(values.reshape(b, self.heads, c // self.heads, h, w),
-                                          loc.flatten(3, 4), weight.flatten(3, 4) / 2).flatten(-2)
+                #* 与原 DeformSelfAttention 一致：两队列合入 batch，各自计算后取平均。
+                queue_values = values.reshape(b, self.heads, c // self.heads, h, w).repeat_interleave(2, dim=0)
+                queue_loc = loc.permute(0, 3, 1, 2, 4, 5).reshape(b*2, q.shape[1], self.heads, self.points, 2)
+                queue_weight = weight.permute(0, 3, 1, 2, 4).reshape(b*2, q.shape[1], self.heads, self.points)
+                update = deform_attention(queue_values, queue_loc, queue_weight)
+                update = update.reshape(b, 2, q.shape[1], c).mean(1)
             else:
                 grid = loc.permute(0, 2, 1, 3, 4, 5).reshape(b * self.heads, -1, 2 * self.points, 2)
                 sampled = F.grid_sample(values, grid * 2 - 1, align_corners=False)

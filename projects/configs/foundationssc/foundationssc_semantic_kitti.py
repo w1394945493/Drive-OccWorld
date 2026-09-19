@@ -30,7 +30,7 @@ model = dict(
     #* 第三阶段：输出 [B,128,128,128,16] = [B,C,X,Y,Z]，覆盖完整 point_cloud_range。
     # 与最终 GT [256,256,32] 不同，体素边长为 0.4m；后续占据头再恢复目标尺寸。
     voxel_encoder=dict(
-        #* ops/ 就地编译后使用融合 CUDA 汇聚和注意力；pytorch 仅作为对照后端。
+        #* ops/ 就地编译原 bev_pool/DFA3D；自注意力沿用 MMCV，pytorch 仅用于调试。
         ops_backend='cuda',
         point_cloud_range=point_cloud_range, voxel_shape=(128, 128, 16),
         input_size=input_size, depth_bound=(2., 58., .5), channels=128,

@@ -23,13 +23,13 @@
 
 参考 FoundationSSC 的 `DSGP_Net.py`、`LSSViewTransformer.py`、`VoxelProposalLayer.py`、
 `VoxFormerHead.py`、transformer_utils 与 `DualFeatFusion.py`。所有执行代码都在本仓库。
-Context/DFormer/Mixer/融合模块由参考实现移植；几何用 PyTorch 重写，汇聚与注意力提供本地 CUDA 和 PyTorch 后端。
+Context/DFormer/Mixer/融合模块由参考实现移植；几何用 PyTorch 实现，CUDA 汇聚与注意力使用原扩展。
 没有用普通全局 attention 替代 deformable attention，也没有跳过 proposal/细化分支。
 
-- 不依赖 `bev_pool`、`spconv`、`dfa3D` 外部扩展；配置默认使用本地 `ops/` CUDA 实现。
-  PyTorch 对照后端使用 index_add 汇聚、八邻域三线性采样。
-  DFA3D 已与显式 depth×feature 三维体的 grid_sample 比较数值/梯度；未与原 CUDA 扩展逐位比对。
-  编译及 CUDA 前向/梯度对照命令见 [../ops/README.md](../ops/README.md)，正式训练前应实测性能。
+- 原 `bev_pool` 和 `DFA3D` 扩展完整移入 `ops/`，不依赖它们的全局安装；2D 注意力依赖 MMCV CUDA 扩展。
+  配置默认走原 CUDA 路径。PyTorch 调试后端使用 index_add 与八邻域插值，曾通过独立数学对照，
+  但不将其在插值折点的梯度约定作为原扩展的判定基准。
+  编译、源码核验及原封装适配测试见 [../ops/README.md](../ops/README.md)。
 - 默认保留原 self-attention 的 512×512 展平布局；这是 128×128×16 个 token 的二维布局，
   不是 512×512 米制 BEV。修改 voxel_shape 时须同步修改 self_layout，保证乘积一致。
 - batch 中逐样本处理候选，支持小尺寸 batch=1/2 检查；原候选代码仅支持 batch=1。
@@ -43,13 +43,13 @@ Context/DFormer/Mixer/融合模块由参考实现移植；几何用 PyTorch 重�
 ## 验证
 
 ```bash
-python scripts/test_foundationssc_local_voxel.py
-python scripts/test_foundationssc.py --stage voxels --indices 0
-python scripts/test_foundationssc.py --stage voxels --indices 0 --check-grad
+python scripts/test_foundationssc_cuda_ops.py
+python scripts/test_foundationssc.py --indices 0
+python scripts/test_foundationssc.py --indices 0 --check-grad
 ```
 
-第一条为无数据/无 checkpoint 的 CPU 回归测试，包含手算几何、边界、空候选、采样对照、
-小尺寸 batch=1/2 完整三维前向及梯度检查。后两条使用真实数据和 CUDA，打印中间张量、
+第一条为无数据/无 checkpoint 的 CUDA 扩展测试，包含源码校验、算子适配对照、空输入、
+小尺寸完整三维前向及梯度检查。后两条使用真实数据和 CUDA，打印中间张量、
 射线/候选/可见体素数量，检查深度概率和真实标定的投影往返。
 通过结构/几何测试不代表已恢复原论文精度；占据预测头、监督与评估属于下一阶段。
 

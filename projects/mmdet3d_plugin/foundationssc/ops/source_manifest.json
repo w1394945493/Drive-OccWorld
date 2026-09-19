@@ -1,0 +1,161 @@
+{
+  "description": "原 FoundationSSC 源码校验。仅 ext_loader 与 3D autograd 封装修改本地包导入；其余逐字节相同。",
+  "files": [
+    {
+      "source": "packages/bev_pool/bev_pool/__init__.py",
+      "local": "bev_pool/__init__.py",
+      "source_sha256": "ca521fab23b8570c3a196350e411b8733877bfedd0221d2a5fea9f56c09133f4",
+      "local_sha256": "ca521fab23b8570c3a196350e411b8733877bfedd0221d2a5fea9f56c09133f4"
+    },
+    {
+      "source": "packages/bev_pool/bev_pool/bev_pool.py",
+      "local": "bev_pool/bev_pool.py",
+      "source_sha256": "111cceed3ad2381864e298284309e7aad7a2014ed3671b8ebe4ead1957ab0f1f",
+      "local_sha256": "111cceed3ad2381864e298284309e7aad7a2014ed3671b8ebe4ead1957ab0f1f"
+    },
+    {
+      "source": "packages/bev_pool/bev_pool/src/bev_pool.cpp",
+      "local": "bev_pool/src/bev_pool.cpp",
+      "source_sha256": "db6542146e527161e8c6e552f117c50c7863b5d3aa11533f03e991c5f6de895a",
+      "local_sha256": "db6542146e527161e8c6e552f117c50c7863b5d3aa11533f03e991c5f6de895a"
+    },
+    {
+      "source": "packages/bev_pool/bev_pool/src/bev_pool_cuda.cu",
+      "local": "bev_pool/src/bev_pool_cuda.cu",
+      "source_sha256": "e1c4c668ae6a97b8ddf245187c81d94db1aaaff32b92050655cbb297c4e792b0",
+      "local_sha256": "e1c4c668ae6a97b8ddf245187c81d94db1aaaff32b92050655cbb297c4e792b0"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/ms_depth_score_sample.cpp",
+      "local": "dfa3D/ops/csrc/ms_depth_score_sample.cpp",
+      "source_sha256": "a60a5b323730100e7cacddbd50fac7a71021c6b67eb354ca345523659cd99224",
+      "local_sha256": "a60a5b323730100e7cacddbd50fac7a71021c6b67eb354ca345523659cd99224"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/pybind.cpp",
+      "local": "dfa3D/ops/csrc/pybind.cpp",
+      "source_sha256": "5a78928f8aac28589eef8760c5aef8a277cfe8c75172b07ea6b4ab1e02064b43",
+      "local_sha256": "5a78928f8aac28589eef8760c5aef8a277cfe8c75172b07ea6b4ab1e02064b43"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/wms_deform_attn.cpp",
+      "local": "dfa3D/ops/csrc/wms_deform_attn.cpp",
+      "source_sha256": "e01645c920f4a9d202503304d2f38f1dc289f31864f0e5b453724886373dd660",
+      "local_sha256": "e01645c920f4a9d202503304d2f38f1dc289f31864f0e5b453724886373dd660"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/common/parrots_cuda_helper.hpp",
+      "local": "dfa3D/ops/csrc/common/parrots_cuda_helper.hpp",
+      "source_sha256": "ab1a46ed999e49448125abba31b79f4f7cee65a3a15d4dd1c7ccb44ec4d84662",
+      "local_sha256": "ab1a46ed999e49448125abba31b79f4f7cee65a3a15d4dd1c7ccb44ec4d84662"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/common/parrots_cpp_helper.hpp",
+      "local": "dfa3D/ops/csrc/common/parrots_cpp_helper.hpp",
+      "source_sha256": "64b7aee120be28f2016e9dfdd99264282c20ae3743299f0de44484c80212eeb4",
+      "local_sha256": "64b7aee120be28f2016e9dfdd99264282c20ae3743299f0de44484c80212eeb4"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/common/box_iou_rotated_utils.hpp",
+      "local": "dfa3D/ops/csrc/common/box_iou_rotated_utils.hpp",
+      "source_sha256": "dec37c59722f72deef72ce24704469b7be9eab08fa835f2aeae248f231f65574",
+      "local_sha256": "dec37c59722f72deef72ce24704469b7be9eab08fa835f2aeae248f231f65574"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/cuda/wms_deform_attn_cuda.cu",
+      "local": "dfa3D/ops/csrc/cuda/wms_deform_attn_cuda.cu",
+      "source_sha256": "afdf1d72674925b12eb4d3159fa8570479b3a0a9576f6af5a0fb455ab17a29b7",
+      "local_sha256": "afdf1d72674925b12eb4d3159fa8570479b3a0a9576f6af5a0fb455ab17a29b7"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/cuda/ms_depth_score_sample_cuda.cu",
+      "local": "dfa3D/ops/csrc/cuda/ms_depth_score_sample_cuda.cu",
+      "source_sha256": "b2993fcfe5e8a78c74b5b25e94e1acc4d89828fd51598ef2d6a866bcb9be79e7",
+      "local_sha256": "b2993fcfe5e8a78c74b5b25e94e1acc4d89828fd51598ef2d6a866bcb9be79e7"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/common/pytorch_device_registry.hpp",
+      "local": "dfa3D/ops/csrc/common/pytorch_device_registry.hpp",
+      "source_sha256": "cd647c09936d780fb90099d280be9d4c36f60a710ddd718375ca7e6d05466533",
+      "local_sha256": "cd647c09936d780fb90099d280be9d4c36f60a710ddd718375ca7e6d05466533"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/common/pytorch_cuda_helper.hpp",
+      "local": "dfa3D/ops/csrc/common/pytorch_cuda_helper.hpp",
+      "source_sha256": "25b75aff9b911ffdf64220fbfdda71fb3e91034060406631d73e1e1033815df7",
+      "local_sha256": "25b75aff9b911ffdf64220fbfdda71fb3e91034060406631d73e1e1033815df7"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/common/pytorch_cpp_helper.hpp",
+      "local": "dfa3D/ops/csrc/common/pytorch_cpp_helper.hpp",
+      "source_sha256": "a7aced3814fbc39edebe948a0a2ee6636c8c0e89583482821a2e3e4c3ed7243b",
+      "local_sha256": "a7aced3814fbc39edebe948a0a2ee6636c8c0e89583482821a2e3e4c3ed7243b"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/cuda/cudabind.cpp",
+      "local": "dfa3D/ops/csrc/cuda/cudabind.cpp",
+      "source_sha256": "3dd5a0258b9334ed1100d996efdae755b90def9bdb4015635c85f9bfae3cdbaa",
+      "local_sha256": "3dd5a0258b9334ed1100d996efdae755b90def9bdb4015635c85f9bfae3cdbaa"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/common/cuda/ms_depth_score_sample_cuda_kernel.cuh",
+      "local": "dfa3D/ops/csrc/common/cuda/ms_depth_score_sample_cuda_kernel.cuh",
+      "source_sha256": "0e52d05437206290a4e32eb293ff69c67b1d58255a8b87edcec48fdefd9af628",
+      "local_sha256": "0e52d05437206290a4e32eb293ff69c67b1d58255a8b87edcec48fdefd9af628"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/common/cuda/common_cuda_helper.hpp",
+      "local": "dfa3D/ops/csrc/common/cuda/common_cuda_helper.hpp",
+      "source_sha256": "3538676112978e9e26be9578df19720281ef105a2f4beceb8aaee79d72c89f9b",
+      "local_sha256": "3538676112978e9e26be9578df19720281ef105a2f4beceb8aaee79d72c89f9b"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/csrc/common/cuda/wms_deform_attn_cuda_kernel.cuh",
+      "local": "dfa3D/ops/csrc/common/cuda/wms_deform_attn_cuda_kernel.cuh",
+      "source_sha256": "737ba9756bca1613e47bbbea3a6c464f02940709ab8d95914b0ff0542f6ffefd",
+      "local_sha256": "737ba9756bca1613e47bbbea3a6c464f02940709ab8d95914b0ff0542f6ffefd"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/__init__.py",
+      "local": "dfa3D/__init__.py",
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "local_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ext_loader.py",
+      "local": "dfa3D/ext_loader.py",
+      "source_sha256": "70093326c20daea4d627f7dd0a11cbbbddf9634d9ba0058a28f8c6625f14e68d",
+      "local_sha256": "7f085f519a33fc2f377eb48dc4e70ac0144a74cbad52ae2f0260a7018dca899a"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/__init__.py",
+      "local": "dfa3D/ops/__init__.py",
+      "source_sha256": "24bb292d076143b04b4cf57dd5dbe4ad8d2d879d7c3fc5e223d478147c5a11ea",
+      "local_sha256": "24bb292d076143b04b4cf57dd5dbe4ad8d2d879d7c3fc5e223d478147c5a11ea"
+    },
+    {
+      "source": "packages/DFA3D/dfa3D/ops/multi_scale_3D_deform_attn.py",
+      "local": "dfa3D/ops/multi_scale_3D_deform_attn.py",
+      "source_sha256": "178f4038d6e773a074ebe2fe3c56e4b4b0c1d0d435e6b5517c083018edef341b",
+      "local_sha256": "178f4038d6e773a074ebe2fe3c56e4b4b0c1d0d435e6b5517c083018edef341b"
+    },
+    {
+      "source": "mmdet3d_plugin/models/img2bev/transformer_utils/multi_scale_3ddeformable_attn_function.py",
+      "local": "multi_scale_3ddeformable_attn_function.py",
+      "source_sha256": "98aa7403103de430bc7a0438d8e3a7ac5af91593251c29246fc3baaef1287324",
+      "local_sha256": "4aa446fb5da0f2bdb80384b605ffffb318ada7af1eaed61fbdf12b07efafe5dc"
+    },
+    {
+      "source": "mmdet3d_plugin/models/img2bev/transformer_utils/multi_scale_deformable_attn_function.py",
+      "local": "multi_scale_deformable_attn_function.py",
+      "source_sha256": "173db14ca06ce7935c3b20858e88e379733c519d010ed2003e8b4fcbdbfe7161",
+      "local_sha256": "173db14ca06ce7935c3b20858e88e379733c519d010ed2003e8b4fcbdbfe7161"
+    },
+    {
+      "source": "LICENSE",
+      "local": "FOUNDATIONSSC_LICENSE",
+      "source_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "local_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    }
+  ]
+}

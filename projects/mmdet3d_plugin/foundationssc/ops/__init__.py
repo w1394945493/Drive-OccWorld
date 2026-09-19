@@ -1,4 +1,4 @@
-"""FoundationSSC 本地 CUDA 算子；惰性加载，导入包不会自动编译。"""
+"""FoundationSSC 原始扩展的本地入口；CPU 导入不强制加载 CUDA/MMCV。"""
 from .functional import lift_pool, deform_attention, require_extension, use_cuda
 
 __all__ = ['lift_pool', 'deform_attention', 'require_extension', 'use_cuda']

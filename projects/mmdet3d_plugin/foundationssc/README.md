@@ -12,14 +12,9 @@
 从 Drive-OccWorld 根目录运行：
 
 ```bash
-python scripts/test_foundationssc.py --stage images --indices 0
-python scripts/test_foundationssc.py --stage images --indices 0 --check-grad
-python scripts/test_foundationssc.py --stage voxels --indices 0
-python scripts/test_foundationssc.py --stage voxels --indices 0 --check-grad
+python scripts/test_foundationssc.py --indices 0
+python scripts/test_foundationssc.py --indices 0 --check-grad
 ```
-
-无需数据/权重的本地骨干 CPU 冒烟测试（随机初始化 ViT-S 小输入）：
-`python scripts/test_foundationssc_local_backbone.py`。
 
 数据和模型配置已合并到 `projects/configs/foundationssc/foundationssc_semantic_kitti.py`。
 路径可通过 `--stereo-checkpoint`、`--stereo-config`、`--ann-file` 覆盖。
@@ -32,7 +27,7 @@ python scripts/test_foundationssc.py --stage voxels --indices 0 --check-grad
 没有引入原仓库训练/评估/演示代码。移除了 sys.path 注入和 Utils 的全局 logging 重置。
 原始版权头与可用许可证保留在 stereo 目录；不同组件的许可分别适用，未统一改许可。
 
-真实图像测试要求 CUDA，默认不反传；`--check-grad` 对相应阶段最终特征平方均值
+测试固定执行数据、图像特征和体素特征完整流程，要求 CUDA，默认不反传；`--check-grad` 对最终体素特征平方均值
 反传，检查可训练模块梯度和骨干冻结，不是 SSC 训练损失。骨干混合精度沿用 YAML。
 单独的 FoundationStereo checkpoint 不包含新 FPN/三维前端，它们当前随机初始化。
 

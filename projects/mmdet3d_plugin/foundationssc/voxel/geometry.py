@@ -106,7 +106,7 @@ class VoxelGeometry(nn.Module):
             idx, valid = self.indices(xyz)
             hits += valid.reshape(b, -1).sum(-1)
             if cuda:
-                #* CUDA 融合 Lift+Splat，只保存每条射线的 voxel id，不生成 lifted features。
+                #* 先收集 voxel id；下方由原 FoundationSSC Lift→bev_pool 路径汇聚。
                 indices.append(torch.where(valid, idx, -1).reshape(b, len(ds), h * w))
                 continue
             idx = idx + torch.arange(b, device=idx.device).view(b, 1, 1, 1, 1) * math.prod(self.voxel_shape)
@@ -114,7 +114,7 @@ class VoxelGeometry(nn.Module):
             out.index_add_(0, idx[valid], lifted[valid])
         if cuda:
             out = lift_pool(context[:, 0].reshape(b, c, h * w), depth_prob.flatten(2),
-                            torch.cat(indices, 1), math.prod(self.voxel_shape))
+                            torch.cat(indices, 1), self.voxel_shape)
             return out.reshape(b, c, *self.voxel_shape), hits
         return out.reshape(b, *self.voxel_shape, c).permute(0, 4, 1, 2, 3).contiguous(), hits
 

@@ -11,7 +11,7 @@ class LayerNorm2d(nn.LayerNorm):
     def forward(self, x):
         return super().forward(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
 
-
+1
 class FoundationImagePyramid(nn.Module):
     """对应原 SimpleFPN(layers=[4]) + SECONDFPN，不重复注册同名 neck。"""
     def __init__(self, backbone_channels=1024, out_channels=160):
