@@ -5,8 +5,8 @@
     1. 读取 SemanticKITTI Drive-OccWorld 配置；
     2. 构建 Dataset / Model；
     3. 可选加载 checkpoint；
-    4. 对指定样本执行一次 occupancy forecasting 推理；
-    5. 保存预测/GT occupancy 的 BEV top-down 并列对比 PNG 和原始 .npy。
+    4. 对指定的一个或多个样本逐个执行 occupancy forecasting 推理；
+    5. 按 out_dir/<场景名>/<帧名>/ 保存并列对比 PNG 和 occupancy.npz。
 
 说明：
     - 本脚本不弹出 GUI，matplotlib 使用 Agg 后端，适合服务器环境。
@@ -85,11 +85,11 @@ def parse_args():
         choices=['train', 'val'],
         default='val',
         help='使用 cfg.data 中的哪个 split。')
-    parser.add_argument(
-        '--index',
-        type=int,
-        default=0,
-        help='需要可视化的数据集 index。')
+    index_group = parser.add_mutually_exclusive_group()
+    index_group.add_argument('--index', type=int, default=None,
+                             help='单个有效样本索引，兼容原命令；默认选择 0。')
+    index_group.add_argument('--indices', type=int, nargs='+', default=None,
+                             help='多个有效样本索引，例如 --indices 0 10 100。')
     parser.add_argument(
         '--out-dir',
         default='out/semantic_kitti_drive_occworld_vis',
@@ -102,7 +102,7 @@ def parse_args():
     parser.add_argument(
         '--save-npy',
         action='store_true',
-        help='额外保存 pred_occ.npy / gt_occ.npy。')
+        help='除默认 occupancy.npz 外，额外保存两个 .npy，兼容原命令。')
     parser.add_argument(
         '--empty-idx',
         type=int,
@@ -352,20 +352,21 @@ def main():
 
     dataset_cfg = cfg.data[args.split]
     dataset = build_dataset(dataset_cfg)
-    if not (0 <= args.index < len(dataset)):
-        raise IndexError(
-            f'index={args.index} out of range [0, {len(dataset) - 1}]')
+    #* 去重并保持输入顺序；索引是过滤后的 Dataset 样本编号。
+    indices = list(dict.fromkeys(args.indices if args.indices is not None
+                               else [args.index if args.index is not None else 0]))
+    for index in indices:
+        if not (0 <= index < len(dataset)):
+            raise IndexError(f'index={index} out of range [0, {len(dataset) - 1}]')
 
-    subset = torch.utils.data.Subset(dataset, [args.index])
+    subset = torch.utils.data.Subset(dataset, indices)
     dataloader = DataLoader(
         subset,
         batch_size=1,
         shuffle=False,
         num_workers=0,
         collate_fn=debug_collate)
-    batch = next(iter(dataloader))
-    model_inputs = batch_to_model_inputs(batch, device)
-
+    #* 模型和权重只加载一次；各样本仍以 batch_size=1 独立推理。
     model = build_model(
         cfg.model,
         train_cfg=cfg.get('train_cfg'),
@@ -379,42 +380,49 @@ def main():
     if hasattr(model, 'set_epoch'):
         model.set_epoch(0)
 
-    token = batch.get('current_token', [f'index_{args.index}'])[0]
-    out_dir = osp.join(args.out_dir, str(token))
-    os.makedirs(out_dir, exist_ok=True)
+    for progress, (index, batch) in enumerate(zip(indices, dataloader), start=1):
+        #* 从 PKL 原始 info 取真实场景/帧名，避免训练格式丢弃 current_token
+        #* 后误用 index_0 作为目录；例如 sequence-08/000010/。
+        info = dataset.data_infos[dataset.valid_indices[index]]
+        token = str(info['token'])
+        scene_name = str(info.get('scene_name') or info['scene_token'])
+        frame_name = token.rsplit('_', 1)[-1]
+        for name in (scene_name, frame_name):
+            if name in ('', '.', '..') or '/' in name or '\\' in name:
+                raise ValueError(f'场景名/帧名不是有效目录名：{name!r}')
+        out_dir = osp.join(args.out_dir, scene_name, frame_name)
+        os.makedirs(out_dir, exist_ok=True)
 
-    print(f'开始推理 index={args.index}, token={token}, device={device}')
-    occ_logits, occ_gts, _ = inference_occ_logits(model, model_inputs)
-    pred_occ = logits_to_prediction(occ_logits, occ_gts.shape)
+        print(f'[{progress}/{len(indices)}] 推理 index={index}, token={token}, device={device}')
+        model_inputs = batch_to_model_inputs(batch, device)
+        occ_logits, occ_gts, _ = inference_occ_logits(model, model_inputs)
+        pred_occ = logits_to_prediction(occ_logits, occ_gts.shape)
+        pred_np = pred_occ.detach().cpu().numpy().astype(np.uint8)
+        gt_np = occ_gts.detach().cpu().numpy().astype(np.uint8)
+        #* 及时释放当前样本 GPU 张量，避免下一样本前向时仍保留上一份 logits。
+        del model_inputs, occ_logits, occ_gts, pred_occ
 
-    pred_np = pred_occ.detach().cpu().numpy().astype(np.uint8)
-    gt_np = occ_gts.detach().cpu().numpy().astype(np.uint8)
+        #* NPZ 默认保存完整 3D 类别数组 [当前+未来, X, Y, Z]，不是 BEV 投影。
+        #* 使用 np.load(path)['pred_occ'/'gt_occ'] 读取；255 忽略标签原样保留。
+        np.savez_compressed(
+            osp.join(out_dir, 'occupancy.npz'), pred_occ=pred_np, gt_occ=gt_np,
+            token=np.asarray(token), scene_name=np.asarray(scene_name),
+            dataset_index=np.asarray(index))
+        if args.save_npy:
+            np.save(osp.join(out_dir, 'pred_occ.npy'), pred_np)
+            np.save(osp.join(out_dir, 'gt_occ.npy'), gt_np)
 
-    if args.save_npy:
-        np.save(osp.join(out_dir, 'pred_occ.npy'), pred_np)
-        np.save(osp.join(out_dir, 'gt_occ.npy'), gt_np)
+        for step_idx in range(pred_np.shape[0]):
+            step_name = 'current' if step_idx == 0 else f'future_{step_idx}'
+            pred_bev = voxel_to_bev(pred_np[step_idx], empty_idx=args.empty_idx)
+            gt_bev = voxel_to_bev(gt_np[step_idx], empty_idx=args.empty_idx)
+            save_pair_png(
+                pred_bev, gt_bev,
+                osp.join(out_dir, f'{step_idx:02d}_{step_name}_pred_gt.png'),
+                step_name=step_name, empty_idx=args.empty_idx)
+        print(f'  对比图和 occupancy.npz 已保存至：{out_dir}')
 
-    num_steps = pred_np.shape[0]
-    for step_idx in range(num_steps):
-        step_name = 'current' if step_idx == 0 else f'future_{step_idx}'
-        pred_bev = voxel_to_bev(pred_np[step_idx], empty_idx=args.empty_idx)
-        gt_bev = voxel_to_bev(gt_np[step_idx], empty_idx=args.empty_idx)
-
-        #* 仅保存 pred-gt 并列对比图。
-        #* 单独 pred.png / gt.png 容易造成输出文件过多，当前调试主要看对比效果。
-        save_pair_png(
-            pred_bev,
-            gt_bev,
-            osp.join(out_dir, f'{step_idx:02d}_{step_name}_pred_gt.png'),
-            step_name=step_name,
-            empty_idx=args.empty_idx)
-
-    print('可视化完成。输出目录:')
-    print(f'  {out_dir}')
-    print('主要文件:')
-    print('  00_current_pred_gt.png')
-    if num_steps > 1:
-        print(f'  01_future_1_pred_gt.png ... {num_steps - 1:02d}_future_{num_steps - 1}_pred_gt.png')
+    print(f'可视化完成，共 {len(indices)} 个样本。')
 
 
 if __name__ == '__main__':
