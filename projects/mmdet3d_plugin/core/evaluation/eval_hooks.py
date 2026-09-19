@@ -159,6 +159,9 @@ class _ForecastEvalMixin:
                     step_idx, time_interval)
                 grouped_metrics.setdefault(time_label, {})[metric_name] = (
                     self._json_safe_value(value))
+            elif key in ('current_mIoU', 'current_IoU'):
+                #* 当前帧 SSC 的精简指标也写入百分比 JSON。
+                grouped_metrics.setdefault('current', {})[key[8:]] = self._json_safe_value(value)
             elif key in ('avg_mIoU', 'avg_IoU'):
                 grouped_metrics.setdefault('avg', {})[key[4:]] = (
                     self._json_safe_value(value))

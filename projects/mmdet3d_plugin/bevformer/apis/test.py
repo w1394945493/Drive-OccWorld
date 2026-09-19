@@ -43,6 +43,37 @@ def custom_encode_mask_results(mask_results):
                         dtype='uint8'))[0])  # encoded with RLE
     return [encoded_mask_results]
 
+def _test_current_occupancy(model, data_loader):
+    """FoundationSSC 单/多卡逐样本收集；不写临时 PKL，不预先按卡求和。"""
+    model.eval()
+    rank, world_size = get_dist_info()
+    local_results = []
+    progress = mmcv.ProgressBar(len(data_loader.dataset)) if rank == 0 else None
+    with torch.no_grad():
+        for data in data_loader:
+            results = model(return_loss=False, **data)
+            if not isinstance(results, list) or any('sample_token' not in item for item in results):
+                raise ValueError('SSC 评估要求每个样本返回带 sample_token 的统计字典')
+            local_results.extend(results)
+            if progress is not None:
+                progress.update(min(len(results) * world_size, max(0, len(data_loader.dataset) - progress.completed)))
+    #* 所有 rank 仅调用一次相同通信；空 rank 也必须参与，避免 collective 错位。
+    parts = [local_results]
+    if world_size > 1:
+        parts = [None] * world_size
+        dist.all_gather_object(parts, local_results)
+    if rank != 0:
+        return None
+    #* 同时兼容连续/交错分布式采样，去掉 sampler 为均分 batch 补齐的样本。
+    unique = {}
+    for part in parts:
+        for result in part:
+            unique.setdefault(result['sample_token'], result)
+    if len(unique) != len(data_loader.dataset):
+        raise ValueError(f'SSC 评估样本覆盖异常：{len(unique)} / {len(data_loader.dataset)}')
+    return list(unique.values())
+
+
 def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, show=False, out_dir=None):
     """Test model with multiple gpus.
     This method tests model with multiple gpus and collects the results
@@ -59,6 +90,9 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
     Returns:
         list: The prediction results.
     """
+
+    if getattr(getattr(model, 'module', model), 'occupancy_eval_per_sample', False):
+        return _test_current_occupancy(model, data_loader)
 
     model.eval()
 

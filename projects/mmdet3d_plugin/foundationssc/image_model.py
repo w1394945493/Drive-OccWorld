@@ -44,6 +44,8 @@ class FoundationImagePyramid(nn.Module):
 
 @DETECTORS.register_module()
 class FoundationSSCImageModel(BaseModule):
+    #* 测试入口据此选择逐样本 SSC 收集，不进入 forecasting 的按卡预求和分支。
+    occupancy_eval_per_sample = True
     def __init__(self, stereo_checkpoint, stereo_config,
                  gru_iters=12, backbone_channels=1024, out_channels=160,
                  strict_load=True, voxel_encoder=None, occ_encoder_backbone=None,
@@ -127,8 +129,34 @@ class FoundationSSCImageModel(BaseModule):
         output['pred'] = output['output_voxels'].detach().argmax(dim=1)
         return output
 
-    def forward_test(self, img_inputs, img_metas, **kwargs):
-        return self._forward_occupancy(img_inputs, img_metas)
+    def occupancy_results(self, pred, gt_occ, img_metas):
+        """每个样本返回 hist[gt, pred]；GT 仅用于统计，不参与预测。"""
+        gt = gt_occ.to(device=pred.device)
+        if gt.shape != pred.shape or gt.ndim != 4 or gt.is_floating_point():
+            raise ValueError('pred/gt_occ 应为同形状 [B,X,Y,Z]，GT 必须是整数标签')
+        classes = self.pts_bbox_head.out_channel
+        tokens = img_metas['token']
+        if isinstance(tokens, str):
+            tokens = [tokens]
+        if len(tokens) != pred.shape[0]:
+            raise ValueError('token 数量与 batch 不一致')
+        results = []
+        for prediction, target, token in zip(pred, gt, tokens):
+            valid = target != self.pts_bbox_head.ignore_index
+            target, prediction = target[valid].long(), prediction[valid].long()
+            if ((target < 0) | (target >= classes) | (prediction < 0) | (prediction >= classes)).any():
+                raise ValueError('评估标签超出类别范围')
+            hist = torch.bincount(target * classes + prediction, minlength=classes ** 2).reshape(classes, classes)
+            #* 只传小型 CPU 混淆矩阵；token 用于剔除分布式 sampler 补齐的重复样本。
+            results.append(dict(sample_token=token, hist_for_iou_per_frame=[hist.cpu().numpy()]))
+        return results
+
+    def forward_test(self, img_inputs, img_metas, gt_occ=None, return_outputs=False, **kwargs):
+        output = self._forward_occupancy(img_inputs, img_metas)
+        #* 调试/可视化显式保留原始输出；正式评估默认返回 list[dict]。
+        if return_outputs or gt_occ is None:
+            return output
+        return self.occupancy_results(output['pred'], gt_occ, img_metas)
 
     def forward_train(self, img_inputs, img_metas, gt_occ, return_outputs=False, **kwargs):
         output = self._forward_occupancy(img_inputs, img_metas)

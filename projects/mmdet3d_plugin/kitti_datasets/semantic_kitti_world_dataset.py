@@ -990,6 +990,13 @@ class SemanticKITTIWorldDataset(Dataset):
             for hist in per_frame_hists
         ]
 
+        #* 单帧 SSC 仅显示 current；多帧 forecasting 的表格和指标键保持原样。
+        if len(per_frame_hists) == 1:
+            table.field_names = ['metric', 'current']
+            table.add_row(['mIoU(%)', self._pct(miou_values[0])])
+            table.add_row(['IoU(%)', self._pct(occ_iou_values[0])])
+            return table, dict(current_mIoU=miou_values[0], current_IoU=occ_iou_values[0])
+
         #* Avg. 计算当前 + 未来所有 step 的平均值。
         # 也就是 step_0, step_1, ..., step_N 全部参与平均。
         valid_mious = [v for v in miou_values if np.isfinite(v)]
@@ -1046,15 +1053,14 @@ class SemanticKITTIWorldDataset(Dataset):
             compact_table, compact_metrics = self._format_compact_forecast_table(
                 per_frame_hists)
             eval_results.update(compact_metrics)
+            title = ('SemanticKITTI 当前帧占据评估 (current):' if len(per_frame_hists) == 1 else
+                     'SemanticKITTI compact forecasting metrics '
+                     '(0=current, 1..N=future, Avg.=current+future average):')
             if logger is not None:
-                logger.info(
-                    'SemanticKITTI compact forecasting metrics '
-                    '(0=current, 1..N=future, Avg.=current+future average):')
+                logger.info(title)
                 logger.info('\n' + compact_table.get_string())
             else:
-                print(
-                    '\nSemanticKITTI compact forecasting metrics '
-                    '(0=current, 1..N=future, Avg.=current+future average):')
+                print('\n' + title)
                 print(compact_table)
 
         eval_items = [

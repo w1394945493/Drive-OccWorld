@@ -90,6 +90,7 @@ def main():
     print(f'体素算子后端：{model.voxel_encoder.ops_backend}')
     for name in ('occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head'):
         print(f'{name} 可训练参数量：{sum(p.numel() for p in getattr(model, name).parameters() if p.requires_grad):,}')
+    eval_results = []
     for index, batch in zip(args.indices, loader):
         check_batch(batch)
         print(f"样本 {index}，场景 {batch['img_metas']['scene_name'][0]}，帧 {batch['img_metas']['token'][0]}")
@@ -106,7 +107,7 @@ def main():
             if args.check_grad:
                 output = model(return_loss=True, return_outputs=True, **batch)
             else:
-                output = model(return_loss=False, **batch)
+                output = model(return_loss=False, return_outputs=True, **batch)
                 output['losses'] = model.pts_bbox_head.loss(output['output_voxels'], batch['gt_occ'])
             feature = output['img_feats']
             assert feature.shape[:3] == (1, 1, 640), feature.shape
@@ -169,6 +170,7 @@ def main():
                     assert any(torch.count_nonzero(x) for x in values), name
                     print(f'  {name} 真实损失反向梯度检查通过。')
                 del values
+        eval_results.extend(model.occupancy_results(output['pred'], batch['gt_occ'], batch['img_metas']))
         torch.cuda.synchronize(device)
         print(f'  融合图像特征: {tuple(feature.shape)}, dtype={feature.dtype}')
         print(f"  DINO各层: {[tuple(pair[0].shape) for pair in output['dino_features']]}")
@@ -178,7 +180,8 @@ def main():
         if args.check_grad:
             del grads
         model.zero_grad(set_to_none=True)
-    print('完整流程检查完成：数据 → 图像特征 → 体素 → 占据预测与三项真实占据损失；尚未接入评估和 optimizer.step。')
+    dataset.evaluate(eval_results)
+    print('完整流程检查完成：数据 → 特征 → 占据预测/损失 → 当前帧 IoU/mIoU；尚未执行 optimizer.step。')
 
 
 if __name__ == '__main__':
