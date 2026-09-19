@@ -979,7 +979,10 @@ class SemanticKITTIWorldDataset(Dataset):
         """
         table = PrettyTable()
         step_names = [str(i) for i in range(len(per_frame_hists))]
-        table.field_names = ['metric'] + step_names + ['Avg.']
+        #* PrettyTable 不允许初始化列数后再改变列数；单/多帧表头只设置一次。
+        single_frame = len(per_frame_hists) == 1
+        table.field_names = (['metric', 'current'] if single_frame
+                             else ['metric'] + step_names + ['Avg.'])
 
         miou_values = [
             self._semantic_miou_from_hist(hist)
@@ -991,8 +994,7 @@ class SemanticKITTIWorldDataset(Dataset):
         ]
 
         #* 单帧 SSC 仅显示 current；多帧 forecasting 的表格和指标键保持原样。
-        if len(per_frame_hists) == 1:
-            table.field_names = ['metric', 'current']
+        if single_frame:
             table.add_row(['mIoU(%)', self._pct(miou_values[0])])
             table.add_row(['IoU(%)', self._pct(occ_iou_values[0])])
             return table, dict(current_mIoU=miou_values[0], current_IoU=occ_iou_values[0])
