@@ -1,13 +1,13 @@
 """FoundationSSC Small：双目 → 体素 → 当前帧占据预测与三项占据损失。"""
 #* ================== 训练参数 ==================
 samples_per_gpu = 1
-workers_per_gpu = 2
+workers_per_gpu = 4
 total_epochs = 24
 learning_rate = 3e-4
-log_interval = 20
+log_interval = 50
 eval_interval = 1
 checkpoint_interval = 1
-max_keep_ckpts = 3
+max_keep_ckpts = 1
 train_max_samples = None
 val_max_samples = None
 

@@ -97,7 +97,37 @@ python scripts/vis_semantic_kitti_drive_occworld.py \
 cd projects/mmdet3d_plugin/foundationssc/ops
 python setup.py build_ext --inplace
 
-python scripts/test_foundationssc.py --check-grad
+python scripts/test_foundationssc.py
+
+# 单卡测试
+CUDA_VISIBLE_DEVICES=4 PYTHONPATH=. python tools/train.py \
+  projects/configs/foundationssc/foundationssc_semantic_kitti.py \
+  --work-dir out/foundationssc_train_debug \
+  --no-auto-resume \
+  --cfg-options \
+  total_epochs=2 \
+  data.train.max_samples=20 \
+  data.val.max_samples=5 \
+  data.workers_per_gpu=0 \
+  log_config.interval=1 \
+  lr_config.warmup_iters=2
+
+# 多卡测试流程
+CUDA_VISIBLE_DEVICES=2,4 \
+PYTHONPATH="$(pwd)" \
+torchrun --nproc_per_node=2 --master_port=29501 \
+  tools/train.py \
+  projects/configs/foundationssc/foundationssc_semantic_kitti.py \
+  --launcher pytorch \
+  --work-dir out/foundationssc_train_debug_ddp \
+  --no-auto-resume \
+  --cfg-options \
+  total_epochs=2 \
+  data.train.max_samples=20 \
+  data.val.max_samples=6 \
+  data.workers_per_gpu=0 \
+  log_config.interval=1 \
+  lr_config.warmup_iters=2
 
 # =====================================================================#
 #  火山服务器训练
@@ -114,7 +144,14 @@ torchrun \
     --launcher pytorch \
     --work-dir /c20250502/wangyushen/Outputs/drive_occworld/semkitti/train
 
+# Drive-OccWorld semantic-kitti
 cd /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld
 . /root/miniconda3/bin/activate
 conda activate /vepfs-mlp2/c20250502/haoce/conda_env/wys_temp_2
 bash sh/train_semkitti.sh
+
+# foundationssc 
+cd /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld
+. /root/miniconda3/bin/activate
+conda activate /vepfs-mlp2/c20250502/haoce/conda_env/wys_temp_2
+bash sh/train_foundationssc.sh
