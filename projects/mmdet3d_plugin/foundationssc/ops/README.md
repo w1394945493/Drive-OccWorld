@@ -34,6 +34,9 @@ MMCV 2D attention 使用环境中已有的 mmcv-full CUDA 扩展，本命令不�
   原汇聚输出 `[B,C,Z,X,Y]`，适配后转为前端需要的 `[B,C,X,Y,Z]`。
 - DFA3D 按原实现先采样四邻域的 depth_score，再做加权注意力；每个 head 共用深度分布。
 - 自注意力两队列合入 batch，分别调用 MMCV 后再平均，与原调用方式一致。
+- 分块调用先在循环外 `prepare_attention` 一次，再用 `deform_attention_prepared`
+  复用连续 value 和按 head 展开的深度分布。原封装只保存共享存储的引用，
+  避免每块留存整份副本；不 detach，也不跨 forward 缓存计算图。
 - 适配入口目前使用 FP32；原 fp16/fp32 封装均保留。坐标输入应有限。
 - 原 bev_pool 使用默认 CUDA 流，适配层拒绝非默认流，不修改其内核。
 - 原 bev_pool 不支持空集合、注意力不支持零 query，外围返回带零梯度链的空/零结果。
@@ -46,6 +49,8 @@ MMCV 2D attention 使用环境中已有的 mmcv-full CUDA 扩展，本命令不�
 # 无 GPU 也可检查源码；reference-root 可选，模型运行不需要原仓库。
 python scripts/test_foundationssc_cuda_ops.py --source-only
 python scripts/test_foundationssc_cuda_ops.py --source-only --reference-root ../FoundationSSC
+# 无 GPU 的共享存储/梯度连接检查（CPU 替身，不代表 CUDA 数值验证）。
+python scripts/test_foundationssc_cuda_ops.py --memory-only
 # 检查实际加载的 so 路径，包括 MMCV。
 python scripts/test_foundationssc_cuda_ops.py --import-only
 # GPU：汇聚数值、适配层对原封装的前后向、完整体素模块梯度。
@@ -54,6 +59,8 @@ python scripts/test_foundationssc.py --check-grad
 ```
 
 完整模块检查有限梯度和关键偏移参数非零梯度；算子适配层与原封装仍严格比较前后向。
+默认 CUDA 测试还比较分块/整块自注意力与交叉注意力的前后向，检查实际传入原算子的
+value/depth 地址相同、每层只准备一次，不随 query 块数增加整份特征副本。
 不再将之前自写 PyTorch/grid_sample 在插值折点的导数作为原 CUDA 实现的判定基准。
 PyTorch 后端仍可用于 CPU 调试，并不据此宣称完整模型已复现原论文精度。
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """验证原扩展源码、适配层与原封装的前后向一致性，以及完整体素模块接线。"""
 import argparse
+import copy
+from contextlib import ExitStack, nullcontext
 import hashlib
 import importlib.util
 import json
@@ -8,6 +10,7 @@ from pathlib import Path
 import sys
 import time
 import types
+from unittest.mock import patch
 
 import torch
 
@@ -123,6 +126,88 @@ def test_ops(device):
     print('通过：空 query 前向/反向')
 
 
+def test_shared_layers(device, mock_ops=False):
+    """分块/不分块前后向对照，并断言每层只准备一份 value/depth 存储。
+
+    mock_ops=True 仅用于无 GPU 的存储生命周期检查，不验证 CUDA 数学实现。
+    GPU 正常测试使用真实原算子，比较分块/整块的输出和输入、参数梯度。
+    """
+    from _foundation_test.ops import functional
+    from _foundation_test.voxel import refiner
+
+    def fake_2d(value, shapes, starts, loc, weights, step):
+        #* CPU 替身保留输入梯度与输出布局，只用于验证循环和共享，不冒充注意力计算。
+        signal = value.mean(1)[:, None] + loc.sum((-1, -2, -3))[..., None] * .01
+        return (signal * weights.sum((-1, -2))[..., None]).flatten(-2)
+
+    def fake_3d(value, depth, shapes, starts, loc, weights, step):
+        output = fake_2d(value, shapes, starts, loc, weights, step)
+        return output + depth.mean((1,2,3))[:,None,None], None
+
+    with ExitStack() as stack:
+        if mock_ops:
+            stack.enter_context(patch.object(functional, '_check_float'))
+            stack.enter_context(patch('torch.cuda.device', side_effect=lambda _: nullcontext()))
+            stack.enter_context(patch.dict(sys.modules, {
+                '_foundation_test.ops.multi_scale_deformable_attn_function': types.SimpleNamespace(
+                    MultiScaleDeformableAttnFunction_fp32=types.SimpleNamespace(apply=fake_2d)),
+                '_foundation_test.ops.multi_scale_3ddeformable_attn_function': types.SimpleNamespace(
+                    MultiScale3DDeformableAttnFunction_fp32=types.SimpleNamespace(apply=fake_3d)),
+            }))
+            stack.enter_context(patch.object(refiner, 'use_cuda', return_value=True))
+        for batch in (1, 2):
+            for cross in (False, True):
+                cls = refiner.CrossLayer if cross else refiner.SelfLayer
+                layer = cls(8, 2, 2, 16, 0., 3, ops_backend='cuda').to(device).eval()
+                reference = copy.deepcopy(layer)
+                reference.chunk = 100
+                q = torch.randn(batch, 20, 8, device=device, requires_grad=True)
+                if cross:
+                    inputs = [q, torch.randn(batch,8,4,5,device=device,requires_grad=True),
+                              torch.rand(batch,6,4,5,device=device,requires_grad=True)]
+                    points = torch.rand(batch,20,3,device=device)
+                    visible = torch.ones(batch,20,device=device,dtype=torch.bool)
+                    call = lambda module, args: module(*args, points, visible)
+                else:
+                    inputs = [q, torch.randn(1,20,8,device=device,requires_grad=True)]
+                    call = lambda module, args: module(*args, (4,5))
+                other = [x.detach().clone().requires_grad_() for x in inputs]
+                module_name = 'multi_scale_3ddeformable_attn_function' if cross else 'multi_scale_deformable_attn_function'
+                class_name = 'MultiScale3DDeformableAttnFunction_fp32' if cross else 'MultiScaleDeformableAttnFunction_fp32'
+                operator = getattr(importlib.import_module('_foundation_test.ops.' + module_name), class_name)
+                with patch.object(refiner, 'prepare_attention', wraps=functional.prepare_attention) as prep, \
+                     patch.object(refiner, 'deform_attention_prepared', wraps=functional.deform_attention_prepared) as run, \
+                     patch.object(operator, 'apply', wraps=operator.apply) as raw:
+                    out = call(layer, inputs)
+                    assert prep.call_count == 1, 'value/depth 在循环中被重复准备'
+                    assert run.call_count == 7
+                    first = run.call_args_list[0].args[0]
+                    for invocation in run.call_args_list:
+                        memory = invocation.args[0]
+                        assert memory is first, '各 query 块未共享同一个 memory'
+                        for tensor, original in zip(memory, first):
+                            if tensor is not None:
+                                assert tensor.data_ptr() == original.data_ptr()
+                    #* 还要检查真正送入原 autograd 的张量，防止适配层内部再次复制。
+                    assert raw.call_count == 7
+                    for invocation in raw.call_args_list:
+                        assert invocation.args[0].data_ptr() == first[0].data_ptr()
+                        if cross:
+                            assert invocation.args[1].data_ptr() == first[1].data_ptr()
+                expected = call(reference, other)
+                torch.testing.assert_close(out, expected, atol=3e-4, rtol=3e-4)
+                grad = torch.randn_like(out)
+                out.backward(grad)
+                expected.backward(grad)
+                for x,y in zip(inputs,other):
+                    assert x.grad is not None and torch.isfinite(x.grad).all()
+                    torch.testing.assert_close(x.grad,y.grad,atol=3e-4,rtol=2e-3)
+                for (name,x),(_,y) in zip(layer.named_parameters(),reference.named_parameters()):
+                    assert x.grad is not None and y.grad is not None, name
+                    torch.testing.assert_close(x.grad,y.grad,atol=3e-4,rtol=2e-3, msg=lambda msg: f'{name}: {msg}')
+                print(f"通过：{'CPU替身结构' if mock_ops else 'CUDA'} {'交叉' if cross else '自'}注意力 batch={batch}：7 块共享一份 memory，分块/整块前后向一致")
+
+
 def test_encoder(device):
     from _foundation_test.voxel.encoder import FoundationVoxelEncoder
     model = FoundationVoxelEncoder(
@@ -184,6 +269,7 @@ if __name__ == '__main__':
     parser.add_argument('--device',default='cuda:0')
     parser.add_argument('--import-only',action='store_true',help='仅检查本地两项扩展和 MMCV 加载，不代表通过 CUDA 数值测试')
     parser.add_argument('--source-only',action='store_true',help='仅核对源码，无需 GPU/MMCV')
+    parser.add_argument('--memory-only',action='store_true',help='CPU 替身检查分块共享存储和梯度连接，不代替真实 CUDA 测试')
     parser.add_argument('--reference-root',help='可选：原 FoundationSSC 仓库路径，用于核对源文件 SHA256；运行模型不依赖它')
     parser.add_argument('--benchmark',action='store_true')
     args=parser.parse_args()
@@ -191,6 +277,11 @@ if __name__ == '__main__':
     if args.source_only:
         raise SystemExit(0)
     load_local_package()
+    if args.memory_only:
+        torch.manual_seed(0)
+        torch.set_num_threads(2)
+        test_shared_layers(torch.device('cpu'), mock_ops=True)
+        raise SystemExit(0)
     from _foundation_test.ops import require_extension
     for name, ext in require_extension().items():
         print(f'扩展加载成功：{name}: {ext.__file__}')
@@ -204,6 +295,7 @@ if __name__ == '__main__':
         torch.backends.cudnn.allow_tf32=False
         #* 原 bev_pool 在默认流 launch；不改源内核，因此使用默认流验证。
         test_ops(device)
+        test_shared_layers(device)
         test_encoder(device)
         torch.cuda.synchronize()
         print('全部原扩展适配检查通过。')

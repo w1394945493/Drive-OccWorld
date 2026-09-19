@@ -65,43 +65,64 @@ def lift_pool(context, depth, indices, voxel_shape):
     return pooled.permute(0, 1, 3, 4, 2).contiguous().reshape(b, c, x*y*z)
 
 
-def deform_attention(value, locations, weights, depth=None):
-    """当前单尺度布局 → 原多尺度接口；返回 [B,Q,heads,C_per_head]。
+def prepare_attention(value, depth=None, batch_repeats=1):
+    """每层仅准备一次原算子布局；返回的张量由所有 query 分块共享，不 detach。
 
-    value[B,heads,C,H,W]，locations[B,Q,heads,P,2/3]，weights[B,Q,heads,P]。
-    DFA3D 原实现先得到四邻域 depth_score，再由 weighted attention 汇聚；
-    不再调用本地自写三线性 CUDA 内核。2D 分支调用原 MMCV autograd 封装。
+    value[B,heads,C,H,W] → values[B,HW,heads,C]。
+    自注意力 batch_repeats=2 表示原双队列；DFA3D 深度分布按 head 展开一次。
+    返回对象只在当前 forward 内使用，不能跨迭代缓存，否则会持有旧计算图。
     """
-    tensors = (value, locations, weights) if depth is None else (value, locations, weights, depth)
-    _check_float(*tensors)
+    _check_float(value) if depth is None else _check_float(value, depth)
     b, heads, channels, h, w = value.shape
-    dim = 2 if depth is None else 3
+    if batch_repeats < 1 or not isinstance(batch_repeats, int):
+        raise ValueError('batch_repeats 必须是正整数')
+    if depth is not None and (depth.ndim != 4 or depth.shape[0] != b or depth.shape[-2:] != (h, w)):
+        raise ValueError('depth 应为 [B,D,H,W]')
+    values = value.permute(0, 3, 4, 1, 2).reshape(b, h*w, heads, channels).contiguous()
+    if batch_repeats != 1:
+        values = values.repeat_interleave(batch_repeats, dim=0)
+    distribution = None
+    shape = [h, w]
+    if depth is not None:
+        d = depth.shape[1]
+        distribution = depth.permute(0, 2, 3, 1).reshape(b, h*w, 1, d).repeat(1, 1, heads, 1).contiguous()
+        if batch_repeats != 1:
+            distribution = distribution.repeat_interleave(batch_repeats, dim=0)
+        shape.append(d)
+    shapes = torch.tensor([shape], dtype=torch.long, device=value.device)
+    starts = torch.zeros(1, dtype=torch.long, device=value.device)
+    return values, distribution, shapes, starts
+
+
+def deform_attention_prepared(memory, locations, weights):
+    """仅处理当前 query 块；memory 中的大张量直接传入原封装，不复制、不修改。"""
+    values, distribution, shapes, starts = memory
+    b, _, heads, channels = values.shape
+    dim = 2 if distribution is None else 3
+    _check_float(values, locations, weights)
     if locations.ndim != 5 or locations.shape[0] != b or locations.shape[2] != heads or locations.shape[-1] != dim:
         raise ValueError('locations 维度不匹配')
     if weights.shape != locations.shape[:-1]:
         raise ValueError('weights 应与 locations 的采样点对应')
-    if depth is not None and (depth.ndim != 4 or depth.shape[0] != b or depth.shape[-2:] != (h, w)):
-        raise ValueError('depth 应为 [B,D,H,W]')
     q = locations.shape[1]
     if q == 0:
-        return value.new_zeros((b, 0, heads, channels)) + sum(t.sum() * 0 for t in tensors)
-    #* 原接口：value[B,HW,heads,C]，loc[B,Q,heads,level=1,P,dim]。
-    values = value.permute(0, 3, 4, 1, 2).reshape(b, h*w, heads, channels).contiguous()
+        tensors = (values, locations, weights) if distribution is None else (values, locations, weights, distribution)
+        return values.new_zeros((b, 0, heads, channels)) + sum(t.sum() * 0 for t in tensors)
     loc = locations.unsqueeze(3).contiguous()
     attn = weights.unsqueeze(3).contiguous()
-    starts = torch.zeros(1, dtype=torch.long, device=value.device)
-    #* 原 im2col_step=64；需整除 batch，非整除时以单样本分块，不改变数值语义。
     step = min(b, 64) if b % min(b, 64) == 0 else 1
-    with torch.cuda.device(value.device):
-        if depth is None:
+    #* 原封装会 save_for_backward(values/distribution)。各分块保存同一存储的引用，
+    #* 而不是每块保留一份完整特征；所有块的梯度仍累加到原来的 value/depth。
+    with torch.cuda.device(values.device):
+        if distribution is None:
             from .multi_scale_deformable_attn_function import MultiScaleDeformableAttnFunction_fp32
-            shapes = starts.new_tensor([[h, w]])
             output = MultiScaleDeformableAttnFunction_fp32.apply(values, shapes, starts, loc, attn, step)
         else:
             from .multi_scale_3ddeformable_attn_function import MultiScale3DDeformableAttnFunction_fp32
-            d = depth.shape[1]
-            #* 对齐原 cross attention：每个 head 共用一份深度分布。
-            distribution = depth.permute(0, 2, 3, 1).reshape(b, h*w, 1, d).repeat(1, 1, heads, 1).contiguous()
-            shapes = starts.new_tensor([[h, w, d]])
             output, _ = MultiScale3DDeformableAttnFunction_fp32.apply(values, distribution, shapes, starts, loc, attn, step)
     return output.reshape(b, q, heads, channels)
+
+
+def deform_attention(value, locations, weights, depth=None):
+    """单次调用兼容入口；分块循环请先 prepare_attention，再复用 memory。"""
+    return deform_attention_prepared(prepare_attention(value, depth), locations, weights)
