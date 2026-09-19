@@ -415,15 +415,18 @@ model = dict(
             iou_cost=dict(type='IoUCost', weight=0.0),
             pc_range=point_cloud_range))))
 
-# 这里先不设置 pipeline，让 Dataset 自己返回 frame_inputs + img + img_metas + segmentation，
-# 便于检查第一阶段模型输入：
-#   img: [history + current, num_cam, C, H, W]
-#   segmentation: [history + current + future, H_occ, W_occ, D_occ]
+#* 与正式配置共用时序 pipeline，保留本配置的归一化及 padding 参数。
+bevformer_pipeline = [dict(type=name) for name in (
+    'LoadTemporalKittiImages',
+    'NormalizeTemporalKittiImages',
+    'PadTemporalKittiImages',
+    'LoadTemporalKittiOccupancy',
+    'PackKittiWorldInputs')]
 semantic_kitti_train_dataset = dict(
     type='SemanticKITTIWorldDataset',
     ann_file=f'{ann_root}/semantickitti_infos_train.pkl',
     data_root=data_root,
-    pipeline=None,
+    pipeline=bevformer_pipeline,
     use_camera=use_camera,
     history_queue_length=history_queue_length,
     future_queue_length=future_queue_length,
@@ -447,7 +450,7 @@ semantic_kitti_val_dataset = dict(
     type='SemanticKITTIWorldDataset',
     ann_file=f'{ann_root}/semantickitti_infos_val.pkl',
     data_root=data_root,
-    pipeline=None,
+    pipeline=bevformer_pipeline,
     use_camera=use_camera,
     history_queue_length=history_queue_length,
     future_queue_length=future_queue_length,

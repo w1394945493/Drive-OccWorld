@@ -37,7 +37,7 @@ class SemanticKITTIWorldDataset(Dataset):
 
     输出约定：
         - img: shape = [history + current, num_cam, C, H, W]，
-          Dataset 内部完成读取、normalize、pad 和 HWC->CHW；
+          时序 pipeline 完成读取、normalize、pad 和 HWC->CHW；
         - img_metas: 历史帧 + 当前帧的几何与图像 meta；
         - segmentation: shape = [history + current + future, H, W, D]，
           直接由 occ_path 读取并 stack，供 Drive-OccWorld 第一阶段 occupancy loss 使用。
@@ -125,7 +125,14 @@ class SemanticKITTIWorldDataset(Dataset):
         #* 真正接收的字段；False 时保留完整调试字段，方便脚本直接检查样本内容。
         self.format_for_train = format_for_train
         self.test_mode = test_mode
-        self.pipeline = Compose(pipeline) if pipeline is not None else None
+        #* 默认提供等价 BEVFormer 时序处理链，兼容旧配置 pipeline=None。
+        # 显式 pipeline 也接收完整窗口；format_for_train 不再提前绕过 pipeline。
+        if pipeline is None:
+            pipeline = [dict(type=name) for name in (
+                'LoadTemporalKittiImages', 'NormalizeTemporalKittiImages',
+                'PadTemporalKittiImages', 'LoadTemporalKittiOccupancy',
+                'PackKittiWorldInputs')]
+        self.pipeline = Compose(pipeline)
         #! SemanticKITTI 第一阶段评估已经在 evaluate() 内部打印 compact table。
         #! 如果继续让 MMCV TextLoggerHook 把 eval_results 作为普通训练日志
         #! 再打印一遍，会出现类似 Epoch [1][5/10]、time=0、data_time=0、
@@ -315,6 +322,7 @@ class SemanticKITTIWorldDataset(Dataset):
         return input_dict
 
     def _pad_image(self, img):
+        #* 旧实现仅保留用于等价性对照；正式 __getitem__ 已改用 pipeline。
         """Pad one image on right/bottom and return padded image + shapes."""
         ori_shape = img.shape
         h, w = img.shape[:2]
@@ -340,6 +348,7 @@ class SemanticKITTIWorldDataset(Dataset):
         return padded, ori_shape, pad_shape
 
     def _normalize_image(self, img):
+        #* 旧实现仅用于对照；正式路径由 NormalizeTemporalKittiImages 处理。
         """Normalize BGR image according to img_norm_cfg."""
         mean = np.asarray(self.img_norm_cfg['mean'], dtype=np.float32)
         std = np.asarray(self.img_norm_cfg['std'], dtype=np.float32)
@@ -348,6 +357,7 @@ class SemanticKITTIWorldDataset(Dataset):
         return (img - mean) / std
 
     def _load_images(self, frame_inputs):
+        #* 旧实现仅用于对照；正式路径由时序图像 pipeline 处理。
         """Load and preprocess history/current images.
 
         Returns:
@@ -510,6 +520,7 @@ class SemanticKITTIWorldDataset(Dataset):
 
     @staticmethod
     def _load_occ(occ_path):
+        #* 旧实现仅用于对照；正式路径由 LoadTemporalKittiOccupancy 处理。
         """Load dense occupancy label from converter-produced occ_path."""
         if not osp.isfile(occ_path):
             raise FileNotFoundError(f'Missing occupancy file: {occ_path}')
@@ -589,23 +600,16 @@ class SemanticKITTIWorldDataset(Dataset):
 
         current_pos = self.history_queue_length
         frame_inputs = []
-        occ_seq = []
         for pos, frame_idx in enumerate(window_indices):
             info = self.data_infos[frame_idx]
             frame_inputs.append(self._build_single_frame_input(
                 info, is_current=(pos == current_pos)))
-            if self.load_occ:
-                occ_seq.append(self._load_occ(info['occ_path']))
 
         current_info = self.data_infos[raw_index]
         input_frame_inputs = frame_inputs[:current_pos + 1]
         current_input = frame_inputs[current_pos]
-        if self.load_img:
-            img, shape_metas = self._load_images(input_frame_inputs)
-        else:
-            img, shape_metas = None, None
         img_metas = self._build_img_metas(
-            input_frame_inputs, current_input, shape_metas=shape_metas)
+            input_frame_inputs, current_input)
         img_metas = self._add_future_transforms_to_current_meta(
             img_metas, window_indices, current_pos)
         compat_fields = self._build_stage1_drive_occworld_compat_fields(
@@ -615,9 +619,15 @@ class SemanticKITTIWorldDataset(Dataset):
             frame_inputs=frame_inputs,
             input_frame_inputs=input_frame_inputs,
             current_input=current_input,
-            img=img,
+            img=None,
             img_metas=img_metas,
-            segmentation=np.stack(occ_seq) if self.load_occ else None,
+            segmentation=None,
+            occ_paths=[frame['occ_path'] for frame in frame_inputs],
+            preprocess_cfg=dict(
+                load_img=self.load_img, load_occ=self.load_occ,
+                to_float32=self.to_float32, img_norm_cfg=copy.deepcopy(self.img_norm_cfg),
+                pad_shape=self.pad_shape, size_divisor=self.size_divisor,
+                format_for_train=self.format_for_train),
             #* 这些字段是为了兼容 Drive-OccWorld 原 forward 接口的
             #* pseudo/dummy 字段；第一阶段关闭 planning/action ablation 时，
             #* 它们只用于让 future_pred() 的对齐逻辑先跑通。
@@ -627,32 +637,11 @@ class SemanticKITTIWorldDataset(Dataset):
         )
 
     def __getitem__(self, index):
-        """Get one sample.
-
-        若提供 pipeline：
-            目前只对当前帧 current_input 执行 pipeline，并把 segmentation
-            附加回输出。这适合先验证单帧/当前帧图像读取链路。
-
-        若不提供 pipeline：
-            直接返回包含 img / img_metas / segmentation / frame_inputs 的 dict，
-            便于调试历史/未来窗口和第一阶段模型输入是否正确。
-
-        后续若要完全贴合 Drive-OccWorld 的 [history,current] 图像队列格式，
-        可在此基础上增加 queue 合并逻辑。
-        """
-        data = self.get_data_info(index)
-        if self.format_for_train:
-            return self._format_for_train(data)
-        if self.pipeline is None:
-            return data
-
-        results = self.pipeline(data['current_input'])
-        results['segmentation'] = data['segmentation']
-        results['window_tokens'] = data['window_tokens']
-        results['current_token'] = data['current_token']
-        return results
+        """Dataset 整理完整窗口，pipeline 加载/预处理/打包；不读取未来图像。"""
+        return self.pipeline(self.get_data_info(index))
 
     def _format_for_train(self, data):
+        #* 旧实现仅用于对照；正式路径由 PackKittiWorldInputs 打包。
         """Format one sample for MMDetection/MMCV train.py.
 
         #! 修复/适配原因：

@@ -340,7 +340,8 @@ class Drive_OccWorld(BEVFormer):
         #* SemanticKITTI Dataset 适配层也需要做同样转换。
         #* 因此 img_meta['future2ref_lidar_transform'][frame_idx] 虽然语义上是
         #* future -> ref，但实际存储的是可被 row-vector 右乘直接使用的矩阵。
-        #
+
+        # * 第 frame_idx 个未来帧 LiDAR 坐标系 → 当前参考帧 LiDAR 坐标系”的变换矩阵。
         # 原 nuScenes/离线 SemanticKITTI Dataset 会在当前参考帧 img_meta 中预先写入这些未来位姿变换。
         future2ref = [img_meta['future2ref_lidar_transform'][frame_idx] for img_meta in img_metas]
         future2ref = ref_to_history_list.new_tensor(np.array(future2ref))  # (1 4 4) # shape: [B, 4, 4]，device/dtype 跟随 ref_to_history_list。
@@ -351,9 +352,9 @@ class Drive_OccWorld(BEVFormer):
             # 注意这里先 transpose，是因为当前代码里的 4x4 矩阵按 row-vector 形式使用：
             #   aligned_bev_coords = aligned_bev_coords @ future_to_history_list
             # 因此平移项实际位于 transpose 后的 [:2, 3]。
-            future2ref = future2ref.transpose(-1, -2)
-            future2ref[:, :2, 3] = translation_xy  # 用 plan_traj 累计位移替代 Dataset 中的 x/y 平移。
-            future2ref = future2ref.transpose(-1, -2)
+            future2ref = future2ref.transpose(-1, -2) # * 行向量右乘 -> 列向量左乘
+            future2ref[:, :2, 3] = translation_xy     # * 使用 plan_traj 累计位移替代 Dataset 中的 x/y 平移。
+            future2ref = future2ref.transpose(-1, -2) # * 列向量左乘 -> 行向量右乘
             future2ref = future2ref.detach().clone()  # 这里作为几何对齐条件使用，不让梯度回传到 plan_traj。
 
         # ref2future: 当前参考帧 ref lidar 坐标 -> 目标未来帧 lidar 坐标。
@@ -379,6 +380,8 @@ class Drive_OccWorld(BEVFormer):
         # 2. compute the transformation matrix from current frame to all previous frames.
         # 将 future -> ref 扩展到每个 memory BEV 帧。
         future2ref = future2ref.unsqueeze(1).repeat(1, num_frame, 1, 1).contiguous()  # [B, num_frame, 4, 4]。
+
+
         # 组合得到 future -> history/current memory：
         #   future -> ref/current  再  ref/current -> each memory frame。
         # future_to_history_list: [B, num_frame, 4, 4]。
@@ -395,6 +398,9 @@ class Drive_OccWorld(BEVFormer):
         # 给 BEV x/y 坐标补齐 z/齐次坐标，变成 [x, y, 1, 1] 风格，便于乘 4x4 矩阵。
         # 注意这里保持原实现：用 ones_like(bev_coords[..., :2]) 一次补两个维度。
         aligned_bev_coords = torch.cat([bev_coords, torch.ones_like(bev_coords[..., :2])], -1)
+
+
+        # * aligned_bev_coords @ future_to_history_list：点坐标在左、矩阵在右  row-vector 右乘；
         # 将 future BEV 中每个 query 的实际坐标变换到每个 memory BEV 坐标系。
         # aligned_bev_coords: [B, num_frame, H*W, 4] @ [B, num_frame, 4, 4]
         #                   -> [B, num_frame, H*W, 4]
@@ -414,8 +420,8 @@ class Drive_OccWorld(BEVFormer):
         # 由于每个 memory 帧使用同一套 target future grid，这里取最后一个 num_frame 位置即可。
         tgt_grids = bev_grids[:, -1].contiguous()
         # 返回：
-        # - tgt_grids: future BEV query 自身坐标，shape [B, H*W, 2]；
-        # - aligned_bev_grids: future query 对齐到各 memory BEV 后的采样坐标，
+        # - tgt_grids: future BEV query 自身坐标，shape [B, H*W, 2]； # * tgt_grids: 自身坐标
+        # - aligned_bev_grids: future query 对齐到各 memory BEV 后的采样坐标， # * aligned_bev_grids: 采样坐标
         #   shape [B, H*W, memory_queue_len, 2]，数值范围约为 [0,1]；
         # - ref2future: ref/current -> future，用于更新下一步 memory 的位姿关系，
         #   shape [B, 4, 4]；
@@ -849,7 +855,13 @@ class Drive_OccWorld(BEVFormer):
             return {"pseudo_loss": torch.tensor(0.0, device=img.device, requires_grad=True)}
 
 
-        #* ================== 1. 输入增强/随机丢帧 ==================
+        #* ======================================================================
+        # * 一、当前 BEV 表示构建：历史/当前图像 -> 历史 BEV -> 当前 ref_bev
+        # 输入：图像序列和各帧 meta；输出：ref_bev、历史 prev_bev_list。
+        # 主要模块：图像 Backbone/FPN + BEVFormer；当前 BEV 融合历史信息。
+        # 改进分析入口：图像特征、历史运动补偿、时序融合、历史帧梯度保留范围。
+        #* ======================================================================
+        # 输入增强/随机丢帧。
         # 对当前帧或历史帧做随机 drop，用于增强模型对时序缺失的鲁棒性。
         # A1. Randomly drop cur image input.
         if np.random.rand() < self.random_drop_image_rate:
@@ -896,7 +908,14 @@ class Drive_OccWorld(BEVFormer):
             sem_occupancy, ref_pose_pred, ref_pose_loss = None, None, None
 
 
-        #* ================== 4. 当前/历史 BEV -> 自回归未来 BEV/Occupancy ==================
+        #* ======================================================================
+        # * 二、未来 BEV 自回归预测：BEV memory -> 未来 BEV -> occupancy logits
+        # 输入：历史/当前 BEV、位姿与启用的动作条件；输出：next_bev_preds 等。
+        # 主要模块：Memory Queue + World Decoder；每步预测 BEV 更新到 memory。
+        # 改进分析入口：坐标对齐、条件注入、未来时序建模、梯度截断与误差累积。
+        # 注意：future_pred() 内部已调用占据预测头，返回的 next_bev_preds 是
+        # occupancy logits；第三部分负责监督这些结果，并非再次把 BEV 解码。
+        #* ======================================================================
         #* 对应论文 3.2 的 Memory Queue W_M + World Decoder W_D：
         #* 先把历史/当前 BEV 组成 WM，再由 W_D 自回归预测未来 BEV 和 semantic occupancy。
         # 用 memory_queue、future pose/action condition 和 WorldHeadV1 逐帧预测未来 BEV。
@@ -960,7 +979,12 @@ class Drive_OccWorld(BEVFormer):
                                                                 valid_frames, img_metas, prev_img_metas, num_frames, occ_flow='flow')
 
 
-        #* ================== 5. 计算训练损失 ==================
+        #* ======================================================================
+        # * 三、占据监督与损失汇总：当前/未来预测 + GT -> losses
+        # 主要入口：compute_occ_loss()；对齐预测/标签尺寸并计算各层占据损失。
+        # 改进分析入口：监督分辨率、未来帧/中间层监督、损失权重与计算开销。
+        # 另外按开关汇总 semantic normalization、flow 和 planning 的辅助损失。
+        #* ======================================================================
         # 当前配置主要使用 occupancy loss；turn_on_flow/turn_on_plan 打开时才会额外计算 flow/plan loss。
         losses = dict()
         # E1. Compute loss for occ predictions.
