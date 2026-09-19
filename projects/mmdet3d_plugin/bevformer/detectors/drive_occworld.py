@@ -343,7 +343,7 @@ class Drive_OccWorld(BEVFormer):
         #
         # 原 nuScenes/离线 SemanticKITTI Dataset 会在当前参考帧 img_meta 中预先写入这些未来位姿变换。
         future2ref = [img_meta['future2ref_lidar_transform'][frame_idx] for img_meta in img_metas]
-        future2ref = ref_to_history_list.new_tensor(np.array(future2ref))  # shape: [B, 4, 4]，device/dtype 跟随 ref_to_history_list。
+        future2ref = ref_to_history_list.new_tensor(np.array(future2ref))  # (1 4 4) # shape: [B, 4, 4]，device/dtype 跟随 ref_to_history_list。
 
         # use translation_xy
         if self.future_pred_head.use_plan_traj:
@@ -362,7 +362,7 @@ class Drive_OccWorld(BEVFormer):
         #* ref_to_history_list 也要同步追加 ref -> future 的相对位姿，
         #* 这样下一步预测更远未来 BEV 时，才能把新 memory BEV 和目标 future query 对齐。
         ref2future = [img_meta['ref2future_lidar_transform'][frame_idx] for img_meta in img_metas]
-        ref2future = ref_to_history_list.new_tensor(np.array(ref2future))  # shape: [B, 4, 4]。
+        ref2future = ref_to_history_list.new_tensor(np.array(ref2future)) # (1 4 4) # shape: [B, 4, 4]。
 
         # use translation_xy
         if self.future_pred_head.use_plan_traj:
@@ -374,7 +374,7 @@ class Drive_OccWorld(BEVFormer):
             translation_xyz = -(rot @ translation_xyz).squeeze(2)   # 根据逆变换关系得到 ref -> future 平移。
             ref2future[:, :3, 3] = translation_xyz  # 写回 ref2future 平移项。
             ref2future = ref2future.transpose(-1, -2)
-            ref2future = ref2future.detach().clone()  # 几何条件不参与反传。
+            ref2future = ref2future.detach().clone() # (1 4 4) # 几何条件不参与反传。
 
         # 2. compute the transformation matrix from current frame to all previous frames.
         # 将 future -> ref 扩展到每个 memory BEV 帧。
@@ -911,7 +911,7 @@ class Drive_OccWorld(BEVFormer):
                 train_frame = np.random.choice(np.arange(1, self.future_pred_frame_num + 1), 1)[0]  # 随机抽一个未来帧省显存。
                 valid_frames.append(train_frame)  # 只监督当前帧 + 抽中的未来帧。
 
-            prev_bev_list = torch.stack(prev_bev_list, dim=1) # (1 2 40000 256) 历史BEV特征
+            prev_bev_list = torch.stack(prev_bev_list, dim=1) # (1 2 40000 256) 历史BEV特征 memory_queue_len: 当前+历史帧BEV特征保留数量
             prev_bev_list = torch.cat([prev_bev_list, ref_bev.unsqueeze(1)], dim=1)[:, -self.memory_queue_len:, ...] # (1 40000 256) 将历史和当前bev特征拼接 # (1 1 65536 256) memory queue 长度；设为 1 表示每一步只保留最新的 BEV 作为下一步预测的 memory。
             # D2. prepare conditional-normalization dict.
             if self.future_pred_head.prev_render_neck.sem_norm and self.future_pred_head.prev_render_neck.sem_gt_train and self.training_epoch < 12: # False
@@ -946,6 +946,8 @@ class Drive_OccWorld(BEVFormer):
             #* 用于未来 BEV query 与 memory BEV 的几何对齐。
             plan_dict = {'sem_occupancy': sem_occupancy, 'sample_traj': sample_traj, 'gt_traj': sdc_planning, 'ref_pose_pred': ref_pose_pred} # sem_occupancy: None sample_traj:(1 1800 5 3) sdc_planning:(1 5 3) ref_pose_pred: None
 
+            # ======================================================================================================#
+            # * future occupancy forecasting
             # D5. predict future occ in auto-regressive manner
             #* 对应论文 Future Forecasting with World Decoder：
             next_bev_preds, next_bev_sem, next_pose_preds, next_pose_loss = self.future_pred(prev_bev_list, action_condition_dict, cond_norm_dict, plan_dict,

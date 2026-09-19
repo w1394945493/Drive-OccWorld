@@ -160,8 +160,10 @@ _dim_ = 256
 _pos_dim_ = _dim_ // 2
 _ffn_dim_ = _dim_ * 2
 _num_levels_ = 4
-future_decoder_layer_num = 3
-bevformer_encoder_layer_num = 6
+# future_decoder_layer_num = 3
+# bevformer_encoder_layer_num = 6
+future_decoder_layer_num = 1
+bevformer_encoder_layer_num = 3
 
 # WorldHeadV1.forward_head 会输出当前帧 + future_queue_length 帧的 occupancy。
 frame_loss_weight = [[1] for _ in range(future_queue_length + 1)]
