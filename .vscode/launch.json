@@ -69,5 +69,21 @@
             },
             "console": "integratedTerminal"
         },
+        {
+            "name": "foundationssc kitti train",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/train.py",
+            "args": [
+                "projects/configs/foundationssc/foundationssc_semantic_kitti.py",
+                "--work-dir",
+                "out/foundationssc/train",
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "4",
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "console": "integratedTerminal"
+        },
     ]
 }

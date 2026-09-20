@@ -155,7 +155,7 @@ class FoundationSSCImageModel(BaseModule):
         if len(raw) != 2:
             raise ValueError('当前模型要求每帧一对左右图像')
         device = next(self.image_pyramid.parameters()).device
-        left, right = [x.permute(0, 3, 1, 2).to(device=device, dtype=torch.float32).contiguous() for x in raw]
+        left, right = [x.permute(0, 3, 1, 2).to(device=device, dtype=torch.float32).contiguous() for x in raw] # (1 3 384 1280)
         if left.shape != right.shape or left.shape[0] != img_inputs[0].shape[0]:
             raise ValueError('双目形状或 batch 不一致')
         #* 原图数值保持 0..255；FoundationStereo 内部 normalize_image 负责归一化。
