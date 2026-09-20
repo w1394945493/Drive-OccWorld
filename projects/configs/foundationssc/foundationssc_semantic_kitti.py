@@ -1,4 +1,4 @@
-"""FoundationSSC Small：双目 → 体素 → 当前帧占据预测与三项占据损失。"""
+"""FoundationSSC Small：当前帧占据预测，含深度/二维语义辅助监督。"""
 #* ================== 训练参数 ==================
 samples_per_gpu = 1
 workers_per_gpu = 4
@@ -10,9 +10,10 @@ checkpoint_interval = 1
 max_keep_ckpts = 1
 train_max_samples = None
 val_max_samples = None
-#* （FoundationSSC 辅助深度&语义损失) 先可选加载验证，尚不增加训练损失；
-# 默认关闭以兼容原数据。根目录下应有 <seq>/labels/<frame>.label。
-load_aux_lidar = False
+#* （FoundationSSC 辅助深度&语义损失) 模型默认关闭，本配置开启两项监督。
+use_depth_loss = True
+use_semantic_loss = True
+load_aux_lidar = use_depth_loss or use_semantic_loss
 pts_label_root = None  # None 使用 PKL/标准 sequences；原布局可设为 .../dataset/lidarseg。
 
 plugin = True
@@ -57,6 +58,10 @@ data = dict(
     val=dict(**dataset_common, ann_file=f'{ann_root}/semantickitti_infos_val.pkl',
              max_samples=val_max_samples, test_mode=True))
 
+#* （FoundationSSC 辅助深度&语义损失) 验证只计算 occupancy 指标，不读取点级标签。
+data['val']['pipeline'] = [dict(step) for step in pipeline if step['type'] not in
+                         ('LoadSemanticKITTIPointsAndLabels', 'ProjectFoundationSSCLidar')]
+
 #* 数据与模型统一配置；FoundationStereo/DINOv2 均使用本仓库实现。
 #* 对齐原 FoundationSSC-small-SemanticKITTI.py：使用 11-33-40 的 Small 权重/YAML，
 # DINOv2 为 ViT-S/14，输出 384 通道；不是只把 Large 模型通道数强行缩小。
@@ -64,6 +69,8 @@ data = dict(
 # Small 不改变图像尺寸、体素网格和三维模块规模。
 model = dict(
     type='FoundationSSCImageModel',
+    use_depth_loss=use_depth_loss, use_semantic_loss=use_semantic_loss,
+    loss_depth_weight=1., loss_seg_weight=1.,
     stereo_checkpoint='/c20250502/wangyushen/Weights/foundationssc/11-33-40/model_best_bp2.pth',
     stereo_config='/c20250502/wangyushen/Weights/foundationssc/11-33-40/cfg.yaml',
     gru_iters=12, backbone_channels=384, out_channels=160,
@@ -94,7 +101,7 @@ model = dict(
         conv_cfg=dict(type='Conv3d'), act_cfg=dict(type='ReLU', inplace=True),
         upsample_cfg=dict(mode='trilinear', align_corners=False)),
     #* 128→64→20 通道分类，再将 logits 从 [128,128,16] 插值到 [256,256,32]。
-    # 不插值类别标签、不改变 GT；未接入原 depth/2D segmentation 辅助监督。
+    # 不插值类别标签、不改变 GT；两项辅助监督在模型中单独计算。
     pts_bbox_head=dict(
         type='OccHead', in_channels=[128], out_channel=num_classes,
         num_level=1, with_cp=False, occ_size=occ_size,
@@ -109,7 +116,7 @@ model = dict(
 # 不再读取任何辅助骨干 checkpoint，也不自动下载权重。
 
 #* ================== tools/train.py 正式运行配置 ==================
-# 只训练当前帧 SSC 的三项占据损失，不等于原论文全部辅助监督的复现。
+# 当前配置训练三项占据损失及两项辅助损失；训练调度仍与原版存在差异。
 # 优化器参考原 Small 的 AdamW；此处采用本仓库 epoch runner 的余弦调度。
 optimizer = dict(type='AdamW', lr=learning_rate, weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))

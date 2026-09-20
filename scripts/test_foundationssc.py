@@ -143,7 +143,9 @@ def main():
                                else dict(step) for step in dataset_cfg['pipeline']]
     #* （FoundationSSC 辅助深度&语义损失) 命令行直接插入步骤，避免顶层配置变量
     # 被覆盖后不能重新生成 pipeline 的问题；显式根目录也会自动启用读取。
-    if args.check_lidar_labels or args.pts_label_root or args.projection_out_dir:
+    #* （FoundationSSC 辅助深度&语义损失) 主脚本验证损失时也需 GT；正式 val pipeline 无需。
+    check_aux_loss = not args.data_only and (cfg.model.get('use_depth_loss', False) or cfg.model.get('use_semantic_loss', False))
+    if args.check_lidar_labels or args.pts_label_root or args.projection_out_dir or check_aux_loss:
         steps = dataset_cfg['pipeline']
         existing = next((step for step in steps if step['type'] == 'LoadSemanticKITTIPointsAndLabels'), None)
         if existing is None:
@@ -217,7 +219,7 @@ def main():
                 output = model(return_loss=True, return_outputs=True, **batch)
             else:
                 output = model(return_loss=False, return_outputs=True, **batch)
-                output['losses'] = model.pts_bbox_head.loss(output['output_voxels'], batch['gt_occ'])
+                output['losses'] = model.compute_losses(output, batch['gt_occ'], batch['img_metas'], batch.get('gt_semantics'))
             feature = output['img_feats']
             assert feature.shape[:3] == (1, 1, 640), feature.shape
             assert feature.shape[-2:] == tuple(v // 8 for v in batch['img_inputs'][0].shape[-2:]), feature.shape
@@ -252,12 +254,18 @@ def main():
             print(f'  占据 logits: {tuple(logits.shape)}；类别预测: {tuple(prediction.shape)}')
             print(f'  标签约定：empty={model.pts_bbox_head.empty_idx}，ignore={model.pts_bbox_head.ignore_index}')
             losses = output['losses']
-            assert set(losses) == {'loss_voxel_ce', 'loss_voxel_sem_scal', 'loss_voxel_geo_scal'}
+            #* （FoundationSSC 辅助深度&语义损失) 按开关检查损失，允许旧三项/新五项。
+            expected_losses = {'loss_voxel_ce', 'loss_voxel_sem_scal', 'loss_voxel_geo_scal'}
+            if model.use_depth_loss:
+                expected_losses.add('loss_depth')
+            if model.use_semantic_loss:
+                expected_losses.add('loss_seg_ce')
+            assert set(losses) == expected_losses
             for name, loss in losses.items():
                 assert loss.ndim == 0 and torch.isfinite(loss), name
                 print(f'  {name}: {loss.item():.6f}')
             total_loss = sum(losses.values())
-            print(f'  占据总损失: {total_loss.item():.6f}（未包含深度/图像语义辅助监督）')
+            print(f'  总损失: {total_loss.item():.6f}；深度监督={model.use_depth_loss}，二维语义监督={model.use_semantic_loss}')
             if args.check_grad:
                 #* 真实 GT 的 CE + semantic/geometric scaling，替代旧体素特征平方均值探针。
                 total_loss.backward()
@@ -273,7 +281,7 @@ def main():
                     assert any(torch.count_nonzero(x) for x in values), name
                     print(f'  {name} 反向梯度检查通过。')
                 del values, module
-                for name in ('occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head'):
+                for name in ('occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head') + (('plugin_head',) if model.use_semantic_loss else ()):
                     values = [p.grad for p in getattr(model, name).parameters() if p.requires_grad]
                     assert values and all(x is not None and torch.isfinite(x).all() for x in values), name
                     assert any(torch.count_nonzero(x) for x in values), name

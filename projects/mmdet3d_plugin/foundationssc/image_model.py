@@ -51,7 +51,9 @@ class FoundationSSCImageModel(BaseModule):
     def __init__(self, stereo_checkpoint, stereo_config,
                  gru_iters=12, backbone_channels=1024, out_channels=160,
                  strict_load=True, voxel_encoder=None, occ_encoder_backbone=None,
-                 occ_encoder_neck=None, pts_bbox_head=None, train_cfg=None, test_cfg=None):
+                 occ_encoder_neck=None, pts_bbox_head=None, train_cfg=None, test_cfg=None,
+                 use_depth_loss=False, use_semantic_loss=False,
+                 loss_depth_weight=1., loss_seg_weight=1.):
         super().__init__()
         from omegaconf import OmegaConf
         #* 所有骨干源码均在本包中；仅权重与 YAML 是外部数据文件。
@@ -97,6 +99,14 @@ class FoundationSSCImageModel(BaseModule):
             if options.pop('type', cls.__name__) != cls.__name__:
                 raise ValueError(f'{name} 应使用本地 {cls.__name__}')
             setattr(self, name, cls(**options))
+        #* （FoundationSSC 辅助深度&语义损失) 默认关闭，旧模型结构/三项损失不变。
+        self.use_depth_loss = use_depth_loss
+        self.use_semantic_loss = use_semantic_loss
+        self.loss_depth_weight = float(loss_depth_weight)
+        self.loss_seg_weight = float(loss_seg_weight)
+        if self.use_semantic_loss:
+            from .auxiliary import PluginSegmentationHead
+            self.plugin_head = PluginSegmentationHead(voxel_encoder.get('channels', 128), self.pts_bbox_head.out_channel)
 
     def train(self, mode=True):
         super().train(mode)
@@ -188,11 +198,34 @@ class FoundationSSCImageModel(BaseModule):
             return output
         return self.occupancy_results(output['pred'], gt_occ, img_metas)
 
-    def forward_train(self, img_inputs, img_metas, gt_occ, return_outputs=False, **kwargs):
-        output = self._forward_occupancy(img_inputs, img_metas)
+    def compute_losses(self, output, gt_occ, img_metas, gt_semantics=None):
         losses = self.pts_bbox_head.loss(output['output_voxels'], gt_occ)
+        #* （FoundationSSC 辅助深度&语义损失) 仅训练/显式损失检查访问 GT，推理不需要 LiDAR。
+        if self.use_depth_loss or self.use_semantic_loss:
+            if 'gt_depths' not in img_metas or 'projection_camera_indices' not in img_metas:
+                raise ValueError('辅助监督已开启，请配置点云加载及 ProjectFoundationSSCLidar')
+            cameras = img_metas['projection_camera_indices']
+            left = cameras == 0
+            if not (left.sum(1) == 1).all():
+                raise ValueError('辅助监督每个样本必须且仅包含一个左相机标签')
+            rows = torch.arange(left.shape[0], device=left.device)
+            slots = left.long().argmax(1)
+            depth = img_metas['gt_depths'][rows, slots][:, None]
+            if self.use_depth_loss:
+                from .auxiliary import depth_loss
+                losses['loss_depth'] = self.loss_depth_weight * depth_loss(output['depth_prob'], depth, self.voxel_encoder.depth_bound)
+            if self.use_semantic_loss:
+                if gt_semantics is None:
+                    raise ValueError('use_semantic_loss=True 时必须提供 gt_semantics')
+                target = gt_semantics[rows.to(gt_semantics.device), slots.to(gt_semantics.device)][:, None]
+                logits = self.plugin_head(output['context'][:, 0].float())
+                losses['loss_seg_ce'] = self.loss_seg_weight * self.plugin_head.loss(logits, target, depth)
+        return losses
+
+    def forward_train(self, img_inputs, img_metas, gt_occ, return_outputs=False, gt_semantics=None, **kwargs):
+        output = self._forward_occupancy(img_inputs, img_metas)
+        losses = self.compute_losses(output, gt_occ, img_metas, gt_semantics)
         #* 默认返回 loss 字典；调试脚本可取同一次前向的输出，避免重复运行骨干。
-        # 尚未接入原深度监督和图像语义辅助损失，它们需要额外 GT，不能以伪标签替代。
         if return_outputs:
             output['losses'] = losses
             return output
