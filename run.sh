@@ -129,6 +129,12 @@ torchrun --nproc_per_node=2 --master_port=29501 \
   log_config.interval=1 \
   lr_config.warmup_iters=2
 
+# 可视化 
+CUDA_VISIBLE_DEVICES=4 PYTHONPATH=. python scripts/vis_foundationssc.py \
+  --checkpoint /c20250502/wangyushen/Outputs/drive_occworld/foundationssc/train/latest.pth \
+  --indices 0 40 80 \
+  --out-dir out/foundationssc_vis
+
 # =====================================================================#
 #  火山服务器训练
 
