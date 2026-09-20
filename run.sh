@@ -138,6 +138,14 @@ CUDA_VISIBLE_DEVICES=4 PYTHONPATH=. python scripts/vis_foundationssc.py \
 python3 /home/wys/wsl/forks/Drive-OccWorld/scripts/vis_occupancy_npz_mayavi.py \
   /home/wys/wsl/forks/Outputs/outputs/foundationssc_vis/sequence-08/000400/occupancy.npz
 
+# lidar 点云&语义标注
+python scripts/test_foundationssc.py \
+  --data-only --check-lidar-labels \
+  --indices 0 10 \
+  --projection-out-dir out/foundationssc_projection
+
+python scripts/test_foundationssc.py --check-grad
+
 # =====================================================================#
 #  火山服务器训练
 

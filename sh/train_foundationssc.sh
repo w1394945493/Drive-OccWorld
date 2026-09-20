@@ -8,4 +8,4 @@ torchrun \
     tools/train.py \
     projects/configs/foundationssc/foundationssc_semantic_kitti.py \
     --launcher pytorch \
-    --work-dir /c20250502/wangyushen/Outputs/drive_occworld/foundationssc/train
+    --work-dir /c20250502/wangyushen/Outputs/drive_occworld/foundationssc/train2
