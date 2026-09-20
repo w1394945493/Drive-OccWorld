@@ -1,4 +1,4 @@
-"""SemanticKITTI 原始点云与点级语义/实例标签，暂不执行图像投影。"""
+"""SemanticKITTI 点级标签读取与相机图像稀疏监督投影。"""
 from pathlib import Path
 import numpy as np
 import torch
@@ -57,4 +57,62 @@ class LoadSemanticKITTIPointsAndLabels:
             points=torch.from_numpy(points), semantic_raw=torch.from_numpy(raw),
             semantic_labels=torch.from_numpy(lut[raw]), instance_ids=torch.from_numpy(instances),
             lidar_path=str(lidar), pts_label_path=str(label))
+        return results
+
+
+@PIPELINES.register_module()
+class ProjectFoundationSSCLidar:
+    """使用当前 img_inputs 的标定/post transform，默认生成左图标签。"""
+    def __init__(self, camera_indices=(0,)):
+        self.camera_indices = tuple(camera_indices)
+        if not self.camera_indices or len(set(self.camera_indices)) != len(self.camera_indices) or any(i not in (0, 1) for i in self.camera_indices):
+            raise ValueError('camera_indices 应为 (0,)、(1,) 或 (0,1)')
+
+    def __call__(self, results):
+        #* （FoundationSSC 辅助深度&语义损失) 在加载图像/点云后、打包前投影。
+        # 当前点云仍在原 LiDAR 坐标系；不对它重复应用 voxel/BDA 变换。
+        aux = results['aux_lidar']
+        xyz = aux['points'][:, :3].numpy().astype(np.float64)
+        semantics = aux['semantic_labels'].numpy()
+        images, rots, trans, intrinsics, post_rots, post_trans = results['img_inputs'][:6]
+        height, width = images.shape[-2:]
+        depths, targets = [], []
+        for cam in self.camera_indices:
+            rotation, translation = rots[cam].numpy(), trans[cam].numpy()
+            #* （FoundationSSC 辅助深度&语义损失) camera→LiDAR 的逆变换，
+            # 再乘原图内参；depth 保存相机 Z（米），不是欧氏距离。
+            camera_xyz = np.linalg.solve(rotation, (xyz - translation).T).T
+            depth = camera_xyz[:, 2]
+            k = intrinsics[cam].numpy()
+            projected = camera_xyz @ k[:3, :3].T
+            if k.shape == (4, 4):
+                projected += k[:3, 3]  # 当前 PKL 为零，不重复外参平移。
+            valid = np.isfinite(projected).all(1) & np.isfinite(depth) & (depth > 0) & (projected[:, 2] > 0)
+            source = np.flatnonzero(valid)
+            uv1 = projected[valid] / projected[valid, 2:3]
+            #* （FoundationSSC 辅助深度&语义损失) 对原图像素同步 resize/crop；
+            # 不缩放深度数值、不对离散语义图插值。
+            augmented = uv1 @ post_rots[cam].numpy().T + post_trans[cam].numpy()
+            u, v = augmented[:, 0], augmented[:, 1]
+            inside = np.isfinite(u) & np.isfinite(v) & (u >= 0) & (u <= width - 1) & (v >= 0) & (v <= height - 1)
+            source = source[inside]
+            x, y = np.rint(u[inside]).astype(np.int64), np.rint(v[inside]).astype(np.int64)
+            pixel = y * width + x
+            #* （FoundationSSC 辅助深度&语义损失) 按像素、深度、原始点序排序，
+            # 每个像素只写最近点；避免重复索引赋值的覆盖顺序不确定。
+            order = np.lexsort((source, depth[source], pixel))
+            pixel, source = pixel[order], source[order]
+            keep = np.r_[True, pixel[1:] != pixel[:-1]] if len(pixel) else np.zeros(0, dtype=bool)
+            pixel, source = pixel[keep], source[keep]
+            depth_map = np.zeros(height * width, dtype=np.float32)
+            semantic_map = np.full(height * width, 255, dtype=np.int64)
+            depth_map[pixel] = depth[source]
+            semantic_map[pixel] = semantics[source]
+            depths.append(torch.from_numpy(depth_map.reshape(height, width)))
+            targets.append(torch.from_numpy(semantic_map.reshape(height, width)))
+        #* （FoundationSSC 辅助深度&语义损失) 未命中像素 depth=0/semantic=255；
+        # 命中的点级 unlabeled=0 保留原映射。右图仅用于几何检查，损失后续取左图。
+        results['foundation_meta']['gt_depths'] = torch.stack(depths)
+        results['foundation_meta']['projection_camera_indices'] = torch.tensor(self.camera_indices)
+        results['gt_semantics'] = torch.stack(targets)
         return results

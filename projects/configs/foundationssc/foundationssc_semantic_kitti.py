@@ -42,6 +42,8 @@ pipeline = [
 ]
 if load_aux_lidar:
     pipeline.insert(-1, dict(type='LoadSemanticKITTIPointsAndLabels', pts_label_root=pts_label_root))
+    #* （FoundationSSC 辅助深度&语义损失) 训练准备默认左图；调试脚本可覆盖为左右图。
+    pipeline.insert(-1, dict(type='ProjectFoundationSSCLidar', camera_indices=(0,)))
 dataset_common = dict(
     type='SemanticKITTIWorldDataset', pipeline=pipeline, use_camera='stereo',
     history_queue_length=0, future_queue_length=0, filter_invalid=True,

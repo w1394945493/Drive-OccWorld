@@ -53,6 +53,65 @@ def check_batch(batch):
     transformed = (post_rots @ point[..., None]).squeeze(-1) + post_trans
     recovered = (torch.linalg.inv(post_rots) @ (transformed - post_trans)[..., None]).squeeze(-1)
     torch.testing.assert_close(point, recovered)
+    #* （FoundationSSC 辅助深度&语义损失) 稀疏标签必须与变换后的输入图像同尺寸。
+    if 'gt_semantics' in batch:
+        depth, semantics = meta['gt_depths'], batch['gt_semantics']
+        assert depth.shape == semantics.shape and depth.shape[-2:] == images.shape[-2:]
+        assert torch.isfinite(depth).all() and (depth >= 0).all()
+        assert (semantics[depth == 0] == 255).all()
+        assert ((semantics[depth > 0] >= 0) & (semantics[depth > 0] < 20)).all()
+        for slot, cam in enumerate(meta['projection_camera_indices'][0].tolist()):
+            valid = depth[0, slot] > 0
+            values = depth[0, slot][valid]
+            limits = (float(values.min()), float(values.max())) if values.numel() else None
+            print(f'相机 {cam}：有效投影像素={int(valid.sum())}，深度范围(m)={limits}')
+
+
+def save_projection_overlays(batch, out_dir):
+    #* （FoundationSSC 辅助深度&语义损失) 只画最终稀疏标签覆盖在 resize/crop 后 RGB 上，
+    # 上排深度、下排语义；左右共用深度色标，保存图片不需要桌面。
+    import os
+    os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib')
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from vis_foundationssc import COLORS
+    meta = batch['img_metas']
+    cams = meta['projection_camera_indices'][0].tolist()
+    depth, semantic = meta['gt_depths'][0].numpy(), batch['gt_semantics'][0].numpy()
+    scene, token = str(meta['scene_name'][0]), str(meta['token'][0])
+    frame = token.rsplit('_', 1)[-1]
+    for name in (scene, frame):
+        if name in ('', '.', '..') or '/' in name or '\\' in name:
+            raise ValueError(f'非法保存目录名：{name!r}')
+    folder = Path(out_dir) / scene / frame
+    folder.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(2, len(cams), figsize=(10 * len(cams), 6), squeeze=False)
+    finite = depth[depth > 0]
+    maximum = max(1., float(finite.max())) if finite.size else 1.
+    artist = None
+    for slot, cam in enumerate(cams):
+        raw = meta['raw_img'][cam][0].numpy()
+        y, x = np.where(depth[slot] > 0)
+        for ax in axes[:, slot]:
+            ax.imshow(raw)
+            ax.set_xlim(-.5, raw.shape[1] - .5)
+            ax.set_ylim(raw.shape[0] - .5, -.5)
+            ax.axis('off')
+        artist = axes[0, slot].scatter(x, y, c=depth[slot, y, x], s=2, cmap='turbo', vmin=0, vmax=maximum)
+        colors = COLORS[semantic[slot, y, x]].copy()
+        colors[semantic[slot, y, x] == 0] = [128, 128, 128]  # 点级 unlabeled，非 empty。
+        axes[1, slot].scatter(x, y, c=colors / 255., s=2)
+        side = 'Left' if cam == 0 else 'Right'
+        axes[0, slot].set_title(f'{side}: depth (m), {len(x)} pixels')
+        axes[1, slot].set_title(f'{side}: semantics (gray = unlabeled)')
+    fig.colorbar(artist, ax=axes[0].tolist(), fraction=.025, pad=.02)
+    fig.savefig(folder / 'lidar_projection_overlay.png', dpi=160, bbox_inches='tight')
+    plt.close(fig)
+    np.savez_compressed(folder / 'lidar_projection.npz', gt_depths=depth,
+                        gt_semantics=semantic, camera_indices=np.asarray(cams), token=np.asarray(token))
+    print(f'投影叠加图和稀疏标签已保存：{folder}')
 
 
 def main():
@@ -70,6 +129,8 @@ def main():
     parser.add_argument('--check-lidar-labels', action='store_true')
     parser.add_argument('--pts-label-root', help='点级标签根目录，下面为 <seq>/labels/*.label')
     parser.add_argument('--data-only', action='store_true', help='只运行数据检查，不加载模型/权重或使用 CUDA')
+    #* （FoundationSSC 辅助深度&语义损失) 指定目录即启用左右投影，结果按场景/帧保存。
+    parser.add_argument('--projection-out-dir', help='保存左右图的深度/语义叠加 PNG 与标签 NPZ')
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from mmcv import Config
@@ -82,7 +143,7 @@ def main():
                                else dict(step) for step in dataset_cfg['pipeline']]
     #* （FoundationSSC 辅助深度&语义损失) 命令行直接插入步骤，避免顶层配置变量
     # 被覆盖后不能重新生成 pipeline 的问题；显式根目录也会自动启用读取。
-    if args.check_lidar_labels or args.pts_label_root:
+    if args.check_lidar_labels or args.pts_label_root or args.projection_out_dir:
         steps = dataset_cfg['pipeline']
         existing = next((step for step in steps if step['type'] == 'LoadSemanticKITTIPointsAndLabels'), None)
         if existing is None:
@@ -91,6 +152,13 @@ def main():
             steps.insert(position, existing)
         if args.pts_label_root:
             existing['pts_label_root'] = args.pts_label_root
+        #* （FoundationSSC 辅助深度&语义损失) 标签检查同时检查投影；可视化时取左右。
+        projection = next((step for step in steps if step['type'] == 'ProjectFoundationSSCLidar'), None)
+        if projection is None:
+            projection = dict(type='ProjectFoundationSSCLidar', camera_indices=(0,))
+            steps.insert(steps.index(existing) + 1, projection)
+        if args.projection_out_dir:
+            projection['camera_indices'] = (0, 1)
     if args.ann_file:
         dataset_cfg['ann_file'] = args.ann_file
     dataset = build_dataset(dataset_cfg)
@@ -101,7 +169,9 @@ def main():
     if args.data_only:
         for index, batch in zip(args.indices, loader):
             check_batch(batch)
-            print(f'样本 {index} 数据检查通过；未执行投影、辅助损失或模型前向。')
+            if args.projection_out_dir:
+                save_projection_overlays(batch, args.projection_out_dir)
+            print(f'样本 {index} 数据检查通过；未计算辅助损失或模型前向。')
         return
     from projects.mmdet3d_plugin.foundationssc import FoundationSSCImageModel
     options = dict(cfg.model)
@@ -130,6 +200,8 @@ def main():
     eval_results = []
     for index, batch in zip(args.indices, loader):
         check_batch(batch)
+        if args.projection_out_dir:
+            save_projection_overlays(batch, args.projection_out_dir)
         print(f"样本 {index}，场景 {batch['img_metas']['scene_name'][0]}，帧 {batch['img_metas']['token'][0]}")
         names = ('归一化图像', 'camera→lidar旋转', 'camera→lidar平移', '4x4内参', '图像变换旋转', '图像变换平移', 'BDA单位阵', 'camera→lidar矩阵')
         for name, tensor in zip(names, batch['img_inputs']):

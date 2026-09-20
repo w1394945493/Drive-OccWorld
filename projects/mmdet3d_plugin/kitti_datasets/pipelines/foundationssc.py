@@ -113,10 +113,14 @@ class PackFoundationSSCInputs:
         # 字符串 token 不参与 tensor scatter，原始双目图像由模型按需移到 GPU。
         if self.runner_format:
             from mmcv.parallel import DataContainer as DC
-            return dict(
+            packed = dict(
                 img_inputs=tuple(DC(x, stack=True, pad_dims=None) for x in results['img_inputs']),
                 img_metas=DC(results['foundation_meta'], cpu_only=True),
                 gt_occ=DC(results['gt_occ'], stack=True, pad_dims=None))
+            #* （FoundationSSC 辅助深度&语义损失) 深度随 meta，语义随 batch 打包。
+            if 'gt_semantics' in results:
+                packed['gt_semantics'] = DC(results['gt_semantics'], stack=True, pad_dims=None)
+            return packed
         #* 独立验证脚本仍可使用普通 default_collate，不依赖并行 wrapper。
         packed = dict(img_inputs=results['img_inputs'],
                       img_metas=results['foundation_meta'], gt_occ=results['gt_occ'])
@@ -124,4 +128,6 @@ class PackFoundationSSCInputs:
         # 传入未使用的变长数组，后续投影步骤会在打包前消费 aux_lidar。
         if 'aux_lidar' in results:
             packed['aux_lidar'] = results['aux_lidar']
+        if 'gt_semantics' in results:
+            packed['gt_semantics'] = results['gt_semantics']
         return packed
