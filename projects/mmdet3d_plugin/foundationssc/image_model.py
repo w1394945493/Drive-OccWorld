@@ -11,6 +11,7 @@ from mmdet.models import DETECTORS
 
 class LayerNorm2d(nn.LayerNorm):
     def forward(self, x):
+        # [B,C,H,W] → [B,H,W,C]，在通道维做 LayerNorm，再恢复图像布局。
         return super().forward(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
 
 1
@@ -34,6 +35,8 @@ class FoundationImagePyramid(nn.Module):
             self.deblocks.append(nn.Sequential(conv, nn.BatchNorm2d(out_channels, eps=1e-3, momentum=.01), nn.ReLU(inplace=True)))
 
     def forward(self, features):
+        #* 图像金字塔：仅用第 4 组 DINO 特征生成四尺度，再对齐分辨率并拼接。
+        # features 含四个 (feature_map, cls_token)；本模块不使用 cls_token。
         if len(features) != 4:
             raise ValueError('需要四层 DINOv2 特征，以第 4 层构建金字塔')
         x = features[3][0].float()  # FoundationStereo 可输出 FP16；可训练 FPN 使用 FP32。
@@ -41,7 +44,7 @@ class FoundationImagePyramid(nn.Module):
         outputs = [block(level) for block, level in zip(self.deblocks, pyramid)]
         if len({value.shape[-2:] for value in outputs}) != 1:
             raise ValueError('FPN 尺度不匹配，请检查 DINO 特征空间尺寸')
-        return torch.cat(outputs, dim=1), pyramid
+        return torch.cat(outputs, dim=1), pyramid  # fused 用于体素构建；pyramid 保留各尺度中间特征。
 
 
 @DETECTORS.register_module()
@@ -61,6 +64,7 @@ class FoundationSSCImageModel(BaseModule):
                  loss_depth_weight=1., loss_seg_weight=1.):
         super().__init__()
         from omegaconf import OmegaConf
+        #* ================== 初始化：加载并冻结立体骨干 ==================
         #* 所有骨干源码均在本包中；仅权重与 YAML 是外部数据文件。
         from .stereo.core.foundation_stereo import FoundationStereo
         for path in (stereo_checkpoint, stereo_config):
@@ -80,6 +84,7 @@ class FoundationSSCImageModel(BaseModule):
         self.checkpoint_report = dict(missing=list(incompatible.missing_keys), unexpected=list(incompatible.unexpected_keys))
         self.img_backbone.requires_grad_(False)
         self.img_backbone.eval()
+        #* ================== 初始化：可训练图像金字塔与体素前端 ==================
         self.image_pyramid = FoundationImagePyramid(backbone_channels, out_channels)
         self.voxel_encoder = None
         if voxel_encoder is not None:
@@ -91,7 +96,8 @@ class FoundationSSCImageModel(BaseModule):
                 raise ValueError('voxel disparity_channels 必须等于 stereo YAML max_disp//4')
             self.voxel_encoder = FoundationVoxelEncoder(**options)
 
-        #* 与原 FoundationSSC 一致：融合体素 → 3D ResNet → 3D FPN → OccHead。
+        #* ================== 初始化：三维编码器与占据分类头 ==================
+        # 与原 FoundationSSC 一致：融合体素 → 3D ResNet → 3D FPN → OccHead。
         # 本地直接实例化，避免和 Drive-OccWorld 现有同名注册模块冲突。
         from .occupancy import CustomResNet3D, GeneralizedLSSFPN, OccHead
         modules = ((occ_encoder_backbone, CustomResNet3D, 'occ_encoder_backbone'),
@@ -104,7 +110,9 @@ class FoundationSSCImageModel(BaseModule):
             if options.pop('type', cls.__name__) != cls.__name__:
                 raise ValueError(f'{name} 应使用本地 {cls.__name__}')
             setattr(self, name, cls(**options))
-        #* （FoundationSSC 辅助深度&语义损失) 默认关闭，旧模型结构/三项损失不变。
+        #* ================== 初始化：可选辅助监督 ==================
+        #* （FoundationSSC 辅助深度&语义损失) 构造参数默认关闭；是否启用以实际配置文件为准。
+        # 深度损失直接监督 depth_prob；语义损失开启时才创建 plugin_head，不参与推理占据预测。
         self.use_depth_loss = use_depth_loss
         self.use_semantic_loss = use_semantic_loss
         self.loss_depth_weight = float(loss_depth_weight)
@@ -152,6 +160,7 @@ class FoundationSSCImageModel(BaseModule):
     #* 当前帧左右 RGB → 立体匹配结果 + DINO 特征 → 左图多尺度融合特征。
     def extract_image_features(self, img_inputs, img_metas):
         raw = img_metas['raw_img']
+        # raw_img 是 pipeline 已 resize/crop 后、尚未标准化的左右 RGB 图，不是直接读取的原始尺寸图。
         if len(raw) != 2:
             raise ValueError('当前模型要求每帧一对左右图像')
         device = next(self.image_pyramid.parameters()).device
@@ -161,9 +170,30 @@ class FoundationSSCImageModel(BaseModule):
         #* 原图数值保持 0..255；FoundationStereo 内部 normalize_image 负责归一化。
         with torch.no_grad():
             #* 冻结骨干，无梯度；disparity 包含视差概率及视差图，不是 GT。
+            # 输入 left/right=[B,3,H,W]，当前 H=384、W=1280。返回两部分：
+            # disparity 是 [prob, disp_up] 列表，并非单个 Tensor：
+            #   prob: [B,D_disp,H/4,W/4]，左图各像素的离散视差概率，通道维和为1；
+            #         D_disp=stereo YAML 的 max_disp//4，max_disp=416 时为 [B,104,96,320]。
+            #         它是初始代价体的分类概率，不是深度概率，后续由 depth_net 转换。
+            #   disp_up: [B,1,H,W]=[B,1,384,1280]，迭代细化后的左图视差（输入图像像素单位）；
+            #            后续结合焦距和基线按 Z=f*b/disparity 转成预测深度。
+            # features 是四个 DINO 中间层的列表，每项为 (feature_map, cls_token)：
+            #   feature_map: [2B,C,H/16,W/16]=[2B,C,24,80]；四层同尺寸，并非四尺度金字塔。
+            #                DINO patch token 在 extractor 内已 reshape 并插值到此尺寸。
+            #   cls_token: [2B,C]，对应各图像的全局 token，不是语义类别预测。
+            #   C=384（Small）或1024（Large）；2B 的前B项为左图，后B项为右图。
             disparity, features = self.img_backbone(left, right, test_mode=True, iters=self.gru_iters)
         batch = left.shape[0]
+        #* 后续体素构建仅使用左图特征，右图用于前面的立体匹配。
+        # 仅截取左图：四组 ([B,C,24,80], [B,C])；image_pyramid 实际使用第4组 feature_map。
         left_features = [(feature[:batch], cls_token[:batch]) for feature, cls_token in features]
+        # image_pyramid 用第4层左图 DINO 特征 [B,C,24,80] 构建四尺度特征：
+        #   pyramid：四个 Tensor 的列表，尚未统一分辨率/通道；输入图像为384×1280时：
+        #     Small: [B,96,96,320]、[B,192,48,160]、[B,384,24,80]、[B,384,12,40]；
+        #     Large: [B,256,96,320]、[B,512,48,160]、[B,1024,24,80]、[B,1024,12,40]。
+        #   fused：四路分别经卷积/转置卷积变为 [B,160,48,160]，再沿通道维拼接，
+        #          得到 [B,640,48,160]（Small/Large 相同），并非四路求和。
+        # fused 用于后续 voxel 构建；pyramid 保留作中间特征检查，当前不直接送入 voxel_encoder。
         fused, pyramid = self.image_pyramid(left_features)
         #* 图像金字塔训练时有梯度；默认 img_feats=[B,1,640,48,160]，1 表示左相机。
         return dict(img_feats=fused.unsqueeze(1), disparity=disparity,
@@ -175,18 +205,18 @@ class FoundationSSCImageModel(BaseModule):
         output = self.extract_image_features(img_inputs, img_metas)
 
         #* ================== 二、voxel 特征构建 ==================
-        #* voxel/encoder.py：生成 context/深度概率，分别构建 LSS 粗体素和
-        #* proposal 引导的细化体素，再融合为 voxel_feats=[B,128,128,128,16]。
+        # voxel/encoder.py：生成 context/深度概率，分别构建 LSS 粗体素和
+        # proposal 引导的细化体素，再融合为 voxel_feats=[B,128,128,128,16]。
         #* 上述为当前配置尺寸；该部分可训练，使用预测深度而非辅助监督 GT 深度。
         output.update(self.voxel_encoder(output, img_inputs, img_metas))
 
         #* ================== 三、三维占据预测 ==================
         #* 融合 voxel → 多尺度 3D ResNet → 3D FPN → OccHead。
         encoded = self.occ_encoder_neck(self.occ_encoder_backbone(output['voxel_feats']))
-        #* 原 neck 返回两个融合尺度，原 detector 仅将最高分辨率尺度送给 OccHead。
+        # 原 neck 返回两个融合尺度，原 detector 仅将最高分辨率尺度送给 OccHead。
         output.update(self.pts_bbox_head([encoded[0]]))
-        #* 默认 logits=[B,20,256,256,32]，用于训练损失；argmax 得到类别标签
-        #* pred=[B,256,256,32]，仅用于评估/可视化，不通过 argmax 反向传播。
+        # 默认 logits=[B,20,256,256,32]，用于训练损失；argmax 得到 pred=[B,256,256,32]。
+        #* 仅离散 pred 分支 detach，用于评估/可视化；output_voxels 保留计算图供损失反传。
         output['pred'] = output['output_voxels'].detach().argmax(dim=1)
         return output
 
@@ -206,11 +236,12 @@ class FoundationSSCImageModel(BaseModule):
             raise ValueError('token 数量与 batch 不一致')
         results = []
         for prediction, target, token in zip(pred, gt, tokens):
+            # 排除 ignore 标签（默认 255）；empty 类保留在矩阵内，供 Dataset 计算空/非空 IoU。
             valid = target != self.pts_bbox_head.ignore_index
             target, prediction = target[valid].long(), prediction[valid].long()
             if ((target < 0) | (target >= classes) | (prediction < 0) | (prediction >= classes)).any():
                 raise ValueError('评估标签超出类别范围')
-            hist = torch.bincount(target * classes + prediction, minlength=classes ** 2).reshape(classes, classes)
+            hist = torch.bincount(target * classes + prediction, minlength=classes ** 2).reshape(classes, classes)  # [20,20]，行=GT、列=预测。
             #* 只传小型 CPU 混淆矩阵；token 用于剔除分布式 sampler 补齐的重复样本。
             results.append(dict(sample_token=token, hist_for_iou_per_frame=[hist.cpu().numpy()]))
         return results
@@ -237,15 +268,18 @@ class FoundationSSCImageModel(BaseModule):
                 raise ValueError('辅助监督每个样本必须且仅包含一个左相机标签')
             rows = torch.arange(left.shape[0], device=left.device)
             slots = left.long().argmax(1)
+            # 根据相机编号找到左图标签所在槽位，不假设其一定是第 0 个；depth=[B,1,H,W] 为稀疏 GT 深度。
             depth = img_metas['gt_depths'][rows, slots][:, None]
             if self.use_depth_loss:
                 from .auxiliary import depth_loss
+                # 将稀疏 GT 深度转换为低分辨率深度分类目标，监督预测概率，不将 GT 喂入预测前向。
                 losses['loss_depth'] = self.loss_depth_weight * depth_loss(output['depth_prob'], depth, self.voxel_encoder.depth_bound)
             if self.use_semantic_loss:
                 if gt_semantics is None:
                     raise ValueError('use_semantic_loss=True 时必须提供 gt_semantics')
                 target = gt_semantics[rows.to(gt_semantics.device), slots.to(gt_semantics.device)][:, None]
                 logits = self.plugin_head(output['context'][:, 0].float())
+                # 左图二维语义 logits=[B,20,H,W]，仅在有效深度/语义标签位置计算辅助 CE。
                 losses['loss_seg_ce'] = self.loss_seg_weight * self.plugin_head.loss(logits, target, depth)
         return losses
 
@@ -260,6 +294,7 @@ class FoundationSSCImageModel(BaseModule):
         return losses
 
     def forward(self, return_loss=False, **kwargs):
+        #* 统一入口：return_loss=True 返回训练损失，False 返回评估统计或显式请求的原始预测。
         #* MMCV scatter 后为 list[每样本 meta]；独立脚本则已 default_collate 成 dict。
         if isinstance(kwargs.get('img_metas'), (list, tuple)):
             kwargs['img_metas'] = default_collate(kwargs['img_metas'])
