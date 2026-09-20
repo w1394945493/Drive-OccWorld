@@ -118,5 +118,10 @@ class PackFoundationSSCInputs:
                 img_metas=DC(results['foundation_meta'], cpu_only=True),
                 gt_occ=DC(results['gt_occ'], stack=True, pad_dims=None))
         #* 独立验证脚本仍可使用普通 default_collate，不依赖并行 wrapper。
-        return dict(img_inputs=results['img_inputs'],
-                    img_metas=results['foundation_meta'], gt_occ=results['gt_occ'])
+        packed = dict(img_inputs=results['img_inputs'],
+                      img_metas=results['foundation_meta'], gt_occ=results['gt_occ'])
+        #* （FoundationSSC 辅助深度&语义损失) 调试时保留逐点数据；正式 runner 暂不
+        # 传入未使用的变长数组，后续投影步骤会在打包前消费 aux_lidar。
+        if 'aux_lidar' in results:
+            packed['aux_lidar'] = results['aux_lidar']
+        return packed

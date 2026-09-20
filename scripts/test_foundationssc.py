@@ -14,6 +14,20 @@ from torch.utils.data import DataLoader, Subset
 
 
 def check_batch(batch):
+    #* （FoundationSSC 辅助深度&语义损失) 此脚本 batch=1，逐点数组维度 [1,N,...]。
+    if 'aux_lidar' in batch:
+        aux = batch['aux_lidar']
+        points = aux['points']
+        assert points.ndim == 3 and points.shape[0] == 1 and points.shape[-1] == 4
+        for key in ('semantic_raw', 'semantic_labels', 'instance_ids'):
+            assert aux[key].shape == points.shape[:2], key
+        assert torch.isfinite(points).all()
+        assert ((aux['semantic_labels'] >= 0) & (aux['semantic_labels'] < 20)).all()
+        ids, counts = torch.unique(aux['semantic_labels'], return_counts=True)
+        print(f"点云路径：{aux['lidar_path'][0]}；shape={tuple(points.shape)}")
+        print(f"点级标签：{aux['pts_label_path'][0]}；点数/标签数一致")
+        print(f'映射语义分布：{dict(zip(ids.tolist(), counts.tolist()))}')
+        print(f"非零实例ID数量：{torch.unique(aux['instance_ids'][aux['instance_ids'] > 0]).numel()}")
     images, rots, trans, intrins, post_rots, post_trans, bda, c2l = batch['img_inputs']
     assert images.ndim == 5 and images.shape[:3] == (1, 2, 3)
     assert intrins.shape == (1, 2, 4, 4) and c2l.shape == (1, 2, 4, 4)
@@ -52,6 +66,10 @@ def main():
     parser.add_argument('--split', choices=['train', 'val'], default='val')
     parser.add_argument('--ann-file', help='覆盖 PKL 路径；图像/标签路径仍取 PKL')
     parser.add_argument('--indices', nargs='+', type=int, default=[0])
+    #* （FoundationSSC 辅助深度&语义损失) 可不运行模型，先验证点云/标签数据接口。
+    parser.add_argument('--check-lidar-labels', action='store_true')
+    parser.add_argument('--pts-label-root', help='点级标签根目录，下面为 <seq>/labels/*.label')
+    parser.add_argument('--data-only', action='store_true', help='只运行数据检查，不加载模型/权重或使用 CUDA')
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from mmcv import Config
@@ -62,6 +80,17 @@ def main():
     #* 独立脚本采用普通 DataLoader；正式 train.py 才使用 MMCV DataContainer。
     dataset_cfg['pipeline'] = [dict(step, runner_format=False) if step['type'] == 'PackFoundationSSCInputs'
                                else dict(step) for step in dataset_cfg['pipeline']]
+    #* （FoundationSSC 辅助深度&语义损失) 命令行直接插入步骤，避免顶层配置变量
+    # 被覆盖后不能重新生成 pipeline 的问题；显式根目录也会自动启用读取。
+    if args.check_lidar_labels or args.pts_label_root:
+        steps = dataset_cfg['pipeline']
+        existing = next((step for step in steps if step['type'] == 'LoadSemanticKITTIPointsAndLabels'), None)
+        if existing is None:
+            existing = dict(type='LoadSemanticKITTIPointsAndLabels', pts_label_root=cfg.get('pts_label_root'))
+            position = next(i for i, step in enumerate(steps) if step['type'] == 'PackFoundationSSCInputs')
+            steps.insert(position, existing)
+        if args.pts_label_root:
+            existing['pts_label_root'] = args.pts_label_root
     if args.ann_file:
         dataset_cfg['ann_file'] = args.ann_file
     dataset = build_dataset(dataset_cfg)
@@ -69,6 +98,11 @@ def main():
         if not 0 <= index < len(dataset):
             raise IndexError(f'索引 {index} 越界，样本数 {len(dataset)}')
     loader = DataLoader(Subset(dataset, args.indices), batch_size=1, num_workers=0, shuffle=False)
+    if args.data_only:
+        for index, batch in zip(args.indices, loader):
+            check_batch(batch)
+            print(f'样本 {index} 数据检查通过；未执行投影、辅助损失或模型前向。')
+        return
     from projects.mmdet3d_plugin.foundationssc import FoundationSSCImageModel
     options = dict(cfg.model)
     options.pop('type')

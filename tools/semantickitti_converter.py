@@ -79,6 +79,11 @@ def parse_args():
                               'semantickitti_infos_val.pkl under this directory.'))
     parser.add_argument('--check-files', action='store_true',
                         help='check image / occupancy files exist; may be slower on network FS')
+    #* （FoundationSSC 辅助深度&语义损失) 根目录下约定 <seq>/labels/<frame>.label。
+    parser.add_argument('--pts-label-root', default=None,
+                        help='点级标签根目录；默认 <data-root>/sequences，也可指定 <data-root>/lidarseg')
+    parser.add_argument('--check-lidar-labels', action='store_true',
+                        help='额外检查点云和点级标签存在；不影响原 occupancy-only 转换')
     return parser.parse_args()
 
 
@@ -414,10 +419,17 @@ def build_frame_info_from_cache(
         calib,
         frame_idx,
         cmd_thresh,
-        check_files=False):
+        check_files=False, pts_label_root=None, check_lidar_labels=False):
     """Build one Drive-OccWorld-light SemanticKITTI frame info."""
     sequence_dir = osp.join(data_root, 'sequences', sequence)
     raw_token = tokens[frame_idx]
+    #* （FoundationSSC 辅助深度&语义损失) PKL 只登记路径，不保存大体积逐点数组。
+    pts_label_path = osp.join(pts_label_root or osp.join(data_root, 'sequences'),
+                              sequence, 'labels', f'{raw_token}.label')
+    if check_lidar_labels:
+        for path in (osp.join(sequence_dir, 'velodyne', f'{raw_token}.bin'), pts_label_path):
+            if not osp.isfile(path):
+                raise FileNotFoundError(f'缺少辅助监督文件：{path}')
     # SemanticKITTI 的帧号在不同 sequence 间会重复，例如 00/000000 和
     # 01/000000。完整 train pkl 合并多个 sequence 后，为了和 nuScenes
     # “token 全局唯一”的用法接近，这里把 pkl 内 token 写成 sequence_frameid。
@@ -533,6 +545,8 @@ def build_frame_info_from_cache(
         #* ================== 3. occupancy 标签路径 ==================
         'occ_path': occ_path,                                         # str，dense occupancy 标签 .npy 路径
         'lidar_path': osp.join(sequence_dir, 'velodyne', f'{raw_token}.bin'),  # str，原始 LiDAR bin 路径
+        #* （FoundationSSC 辅助深度&语义损失) uint32 点级语义/实例标签，与点云逐点对应。
+        'pts_label_path': pts_label_path,
 
         #* ================== 4. ego/LiDAR 位姿 ==================
         # 第一阶段把 LiDAR 坐标系直接作为 ego 坐标系。
@@ -607,7 +621,9 @@ def build_sequence_infos(data_root, ann_file, sequence, args):
             calib=calib,
             frame_idx=frame_idx,
             cmd_thresh=args.cmd_thresh,
-            check_files=args.check_files))
+            check_files=args.check_files,
+            pts_label_root=args.pts_label_root,
+            check_lidar_labels=args.check_lidar_labels))
     return infos, {
         'sequence': sequence,
         'start_frame_idx': int(start),

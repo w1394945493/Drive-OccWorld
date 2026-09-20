@@ -10,6 +10,10 @@ checkpoint_interval = 1
 max_keep_ckpts = 1
 train_max_samples = None
 val_max_samples = None
+#* （FoundationSSC 辅助深度&语义损失) 先可选加载验证，尚不增加训练损失；
+# 默认关闭以兼容原数据。根目录下应有 <seq>/labels/<frame>.label。
+load_aux_lidar = False
+pts_label_root = None  # None 使用 PKL/标准 sequences；原布局可设为 .../dataset/lidarseg。
 
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
@@ -36,6 +40,8 @@ pipeline = [
          point_cloud_range=point_cloud_range),
     dict(type='PackFoundationSSCInputs', runner_format=True),
 ]
+if load_aux_lidar:
+    pipeline.insert(-1, dict(type='LoadSemanticKITTIPointsAndLabels', pts_label_root=pts_label_root))
 dataset_common = dict(
     type='SemanticKITTIWorldDataset', pipeline=pipeline, use_camera='stereo',
     history_queue_length=0, future_queue_length=0, filter_invalid=True,

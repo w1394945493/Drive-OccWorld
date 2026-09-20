@@ -299,6 +299,8 @@ class SemanticKITTIWorldDataset(Dataset):
             token=info['token'],
             pts_filename=info.get('lidar_path', None),
             lidar_path=info.get('lidar_path', None),
+            #* （FoundationSSC 辅助深度&语义损失) 仅透传路径；读取、解码交给 pipeline。
+            pts_label_path=info.get('pts_label_path', None),
             filename=img_filename,
             img_filename=img_filename,
             lidar2img=lidar2img,

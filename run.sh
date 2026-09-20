@@ -16,7 +16,7 @@ python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/train.py \
 # offline pkl generate 在原pkl文件基础上，生成离线版本的v2.pkl文件
 python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/gen_new_data.py
 
-# use offline dataset 
+# use offline dataset
 CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH="$(pwd)" \
 python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/tools/train.py \
@@ -129,11 +129,14 @@ torchrun --nproc_per_node=2 --master_port=29501 \
   log_config.interval=1 \
   lr_config.warmup_iters=2
 
-# 可视化 
+# 可视化
 CUDA_VISIBLE_DEVICES=4 PYTHONPATH=. python scripts/vis_foundationssc.py \
   --checkpoint /c20250502/wangyushen/Outputs/drive_occworld/foundationssc/train/latest.pth \
   --indices 0 40 80 \
   --out-dir out/foundationssc_vis
+# 本地可视化
+python3 /home/wys/wsl/forks/Drive-OccWorld/scripts/vis_occupancy_npz_mayavi.py \
+  /home/wys/wsl/forks/Outputs/outputs/foundationssc_vis/sequence-08/000400/occupancy.npz
 
 # =====================================================================#
 #  火山服务器训练
@@ -156,7 +159,7 @@ cd /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld
 conda activate /vepfs-mlp2/c20250502/haoce/conda_env/wys_temp_2
 bash sh/train_semkitti.sh
 
-# foundationssc 
+# foundationssc
 cd /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld
 . /root/miniconda3/bin/activate
 conda activate /vepfs-mlp2/c20250502/haoce/conda_env/wys_temp_2
