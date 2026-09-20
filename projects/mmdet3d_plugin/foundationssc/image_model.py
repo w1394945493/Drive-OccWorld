@@ -46,6 +46,11 @@ class FoundationImagePyramid(nn.Module):
 
 @DETECTORS.register_module()
 class FoundationSSCImageModel(BaseModule):
+    #* ================== 模型整体流程 ==================
+    #* 一、双目图像 → 冻结 FoundationStereo/DINO → 可训练图像金字塔。
+    #* 二、图像特征/深度/标定 → LSS 粗体素 + proposal 细化 → 融合 voxel 特征。
+    #* 三、voxel 特征 → 3D ResNet/FPN → 当前帧 occupancy 分类与上采样。
+    #* 四、训练监督与评估：占据/辅助损失，或混淆矩阵汇总；无未来预测模块。
     #* 测试入口据此选择逐样本 SSC 收集，不进入 forecasting 的按卡预求和分支。
     occupancy_eval_per_sample = True
     def __init__(self, stereo_checkpoint, stereo_config,
@@ -121,6 +126,7 @@ class FoundationSSCImageModel(BaseModule):
 
     def train_step(self, data, optimizer=None):
         """MMCV Runner 接口：这里只算 loss，反传/裁剪/更新交给 OptimizerHook。"""
+        #* 四、训练接口：调用下面的一～三部分及损失函数；参数更新由外部 Runner 完成。
         losses = self(return_loss=True, **data)
         values = {}
         for name, value in losses.items():
@@ -142,6 +148,8 @@ class FoundationSSCImageModel(BaseModule):
             log_vars[name] = logged.item()
         return dict(loss=loss, log_vars=log_vars, num_samples=data['gt_occ'].shape[0])
 
+    #* ================== 一、图像特征提取 ==================
+    #* 当前帧左右 RGB → 立体匹配结果 + DINO 特征 → 左图多尺度融合特征。
     def extract_image_features(self, img_inputs, img_metas):
         raw = img_metas['raw_img']
         if len(raw) != 2:
@@ -152,23 +160,39 @@ class FoundationSSCImageModel(BaseModule):
             raise ValueError('双目形状或 batch 不一致')
         #* 原图数值保持 0..255；FoundationStereo 内部 normalize_image 负责归一化。
         with torch.no_grad():
+            #* 冻结骨干，无梯度；disparity 包含视差概率及视差图，不是 GT。
             disparity, features = self.img_backbone(left, right, test_mode=True, iters=self.gru_iters)
         batch = left.shape[0]
         left_features = [(feature[:batch], cls_token[:batch]) for feature, cls_token in features]
         fused, pyramid = self.image_pyramid(left_features)
+        #* 图像金字塔训练时有梯度；默认 img_feats=[B,1,640,48,160]，1 表示左相机。
         return dict(img_feats=fused.unsqueeze(1), disparity=disparity,
                     dino_features=left_features, pyramid=pyramid)
 
     def _forward_occupancy(self, img_inputs, img_metas):
         """不读取未来信息或 GT：双目 → 图像特征 → 体素 → 当前帧语义 logits。"""
+        #* ================== 一、图像特征提取 ==================
         output = self.extract_image_features(img_inputs, img_metas)
+
+        #* ================== 二、voxel 特征构建 ==================
+        #* voxel/encoder.py：生成 context/深度概率，分别构建 LSS 粗体素和
+        #* proposal 引导的细化体素，再融合为 voxel_feats=[B,128,128,128,16]。
+        #* 上述为当前配置尺寸；该部分可训练，使用预测深度而非辅助监督 GT 深度。
         output.update(self.voxel_encoder(output, img_inputs, img_metas))
+
+        #* ================== 三、三维占据预测 ==================
+        #* 融合 voxel → 多尺度 3D ResNet → 3D FPN → OccHead。
         encoded = self.occ_encoder_neck(self.occ_encoder_backbone(output['voxel_feats']))
         #* 原 neck 返回两个融合尺度，原 detector 仅将最高分辨率尺度送给 OccHead。
         output.update(self.pts_bbox_head([encoded[0]]))
+        #* 默认 logits=[B,20,256,256,32]，用于训练损失；argmax 得到类别标签
+        #* pred=[B,256,256,32]，仅用于评估/可视化，不通过 argmax 反向传播。
         output['pred'] = output['output_voxels'].detach().argmax(dim=1)
         return output
 
+    #* ================== 四、训练监督与评估接口 ==================
+    #* 以下 GT 只用于损失/指标；一～三部分的预测前向不依赖 GT。
+    #* 四（1）、评估：逐样本混淆矩阵 → Dataset 汇总 IoU/mIoU。
     def occupancy_results(self, pred, gt_occ, img_metas):
         """每个样本返回 hist[gt, pred]；GT 仅用于统计，不参与预测。"""
         gt = gt_occ.to(device=pred.device)
@@ -192,6 +216,7 @@ class FoundationSSCImageModel(BaseModule):
         return results
 
     def forward_test(self, img_inputs, img_metas, gt_occ=None, return_outputs=False, **kwargs):
+        #* 推理复用一～三部分，不执行辅助二维分类头或训练损失。
         output = self._forward_occupancy(img_inputs, img_metas)
         #* 调试/可视化显式保留原始输出；正式评估默认返回 list[dict]。
         if return_outputs or gt_occ is None:
@@ -199,6 +224,8 @@ class FoundationSSCImageModel(BaseModule):
         return self.occupancy_results(output['pred'], gt_occ, img_metas)
 
     def compute_losses(self, output, gt_occ, img_metas, gt_semantics=None):
+        #* 四（2）、训练监督：三项三维占据损失 + 可选深度 BCE/二维语义 CE。
+        #* 深度监督约束第二部分 depth_prob；二维语义头约束第二部分左图 context。
         losses = self.pts_bbox_head.loss(output['output_voxels'], gt_occ)
         #* （FoundationSSC 辅助深度&语义损失) 仅训练/显式损失检查访问 GT，推理不需要 LiDAR。
         if self.use_depth_loss or self.use_semantic_loss:
@@ -223,6 +250,7 @@ class FoundationSSCImageModel(BaseModule):
         return losses
 
     def forward_train(self, img_inputs, img_metas, gt_occ, return_outputs=False, gt_semantics=None, **kwargs):
+        #* 四（3）、训练总入口：先完成一～三部分预测，再调用 compute_losses。
         output = self._forward_occupancy(img_inputs, img_metas)
         losses = self.compute_losses(output, gt_occ, img_metas, gt_semantics)
         #* 默认返回 loss 字典；调试脚本可取同一次前向的输出，避免重复运行骨干。
@@ -235,4 +263,8 @@ class FoundationSSCImageModel(BaseModule):
         #* MMCV scatter 后为 list[每样本 meta]；独立脚本则已 default_collate 成 dict。
         if isinstance(kwargs.get('img_metas'), (list, tuple)):
             kwargs['img_metas'] = default_collate(kwargs['img_metas'])
-        return self.forward_train(**kwargs) if return_loss else self.forward_test(**kwargs)
+
+        if return_loss:
+            return self.forward_train(**kwargs)
+        else:
+            return self.forward_test(**kwargs)
