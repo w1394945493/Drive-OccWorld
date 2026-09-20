@@ -172,3 +172,9 @@ cd /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld
 . /root/miniconda3/bin/activate
 conda activate /vepfs-mlp2/c20250502/haoce/conda_env/wys_temp_2
 bash sh/train_foundationssc.sh
+
+# foundationssc large
+cd /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld
+. /root/miniconda3/bin/activate
+conda activate /vepfs-mlp2/c20250502/haoce/conda_env/wys_temp_2
+bash sh/train_foundationssc_large.sh
