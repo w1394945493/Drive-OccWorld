@@ -8,4 +8,4 @@ torchrun \
     tools/train.py \
     projects/configs/foundationssc_forecasting/foundationssc_forecast_no_freeze.py \
     --launcher pytorch \
-    --work-dir /c20250502/wangyushen/Outputs/drive_occworld/foundationssc_forecast_no_freeze/train
+    --work-dir /c20250502/wangyushen/Outputs/drive_occworld/foundationssc_forecast_no_freeze/train2
