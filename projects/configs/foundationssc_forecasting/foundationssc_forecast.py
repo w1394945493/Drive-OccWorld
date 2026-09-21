@@ -9,7 +9,7 @@ freeze_decoder = True  # 3D ResNet + 3D FPN + 占据分类头。
 load_from = "/c20250502/wangyushen/Outputs/drive_occworld/foundationssc/train2/best_current_mIoU_epoch_15.pth"
 auto_resume = False
 work_dir = 'out/foundationssc_forecast'
-custom_imports = dict(imports=['projects.mmdet3d_plugin.foundationssc_forcesting'],
+custom_imports = dict(imports=['projects.mmdet3d_plugin.foundationssc_forecasting'],
                       allow_failed_imports=False)
 #! 各步查询上一时刻三维 memory，给定真实未来自车位姿；不再使用卷积残差基线。
 model = dict(type='FoundationSSCForecastModel', future_steps=4,

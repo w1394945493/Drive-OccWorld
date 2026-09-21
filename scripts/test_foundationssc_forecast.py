@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default=str(ROOT / 'projects/configs/foundationssc_forcesting/foundationssc_forecast.py'))
+    parser.add_argument('--config', default=str(ROOT / 'projects/configs/foundationssc_forecasting/foundationssc_forecast.py'))
     parser.add_argument('--checkpoint', default=None,
                         help='完整 FoundationSSC checkpoint；优先于配置 load_from，未传时使用 load_from')
     parser.add_argument('--index', type=int, default=0)

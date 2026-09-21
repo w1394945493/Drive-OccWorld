@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', default=str(ROOT / 'projects/configs/foundationssc_forcesting/foundationssc_forecast.py'))
+    parser.add_argument('--config', default=str(ROOT / 'projects/configs/foundationssc_forecasting/foundationssc_forecast.py'))
     parser.add_argument('--checkpoint', help='优先于配置 load_from；可用单帧权重检查接口，正式预测应加载训练后的 forecasting 权重')
     parser.add_argument('--indices', nargs='+', type=int, default=[0], help='过滤后 Dataset 索引，例如 0 10 100')
     parser.add_argument('--split', choices=['train', 'val'], default='val')
