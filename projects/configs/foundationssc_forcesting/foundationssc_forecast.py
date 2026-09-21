@@ -1,7 +1,7 @@
 _base_ = '../foundationssc/foundationssc_semantic_kitti.py'
 
 #! 必须指定已训练的完整单帧 checkpoint（不是 FoundationStereo 权重）。
-load_from = None
+load_from = "/c20250502/wangyushen/Outputs/drive_occworld/foundationssc/train2/best_current_mIoU_epoch_15.pth"
 auto_resume = False
 work_dir = 'out/foundationssc_forecast'
 custom_imports = dict(imports=['projects.mmdet3d_plugin.foundationssc_forcesting'],
