@@ -29,14 +29,15 @@ def voxel_to_bev(voxel, empty_idx=0, ignore_idx=255):
     return bev
 
 
-def save_pair(pred, gt, path, empty_idx=0, ignore_idx=255):
+def save_pair(pred, gt, path, empty_idx=0, ignore_idx=255, step_name='current'):
     #* Agg 无需桌面/显示器；PNG 为顶视投影，不代表完整三维结构。
     os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib')
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    for ax, voxel, title in zip(axes, (pred, gt), ('Pred current', 'GT current')):
+    #! forecasting 复用同一绘图函数；默认标题不改变原单帧脚本行为。
+    for ax, voxel, title in zip(axes, (pred, gt), (f'Pred {step_name}', f'GT {step_name}')):
         bev = voxel_to_bev(voxel, empty_idx, ignore_idx)
         rgb = np.zeros((*bev.shape, 3), dtype=np.uint8)
         valid = (bev >= 0) & (bev < len(COLORS))
