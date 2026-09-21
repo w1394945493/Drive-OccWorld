@@ -60,8 +60,15 @@ def main():
         grads = [p.grad for p in model.dynamics.parameters()]
         assert all(g is not None and torch.isfinite(g).all() for g in grads)
         assert any(g.abs().sum() > 0 for g in grads)
-        assert all(p.grad is None for name, p in model.named_parameters() if not name.startswith('dynamics.'))
-        print(f'四步损失={total.item():.6f}；预测器梯度有效，单帧模块保持冻结。')
+        #! 跟随解冻配置检查：冻结参数无梯度，各解冻模块应有有效反向梯度。
+        assert all(p.grad is None for p in model.parameters() if not p.requires_grad)
+        for name in ('image_pyramid', 'voxel_encoder', 'occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head'):
+            params = [p for p in getattr(model, name).parameters() if p.requires_grad]
+            if params:
+                active = [p.grad for p in params if p.grad is not None]
+                assert active and all(torch.isfinite(g).all() for g in active), f'{name} 梯度异常'
+                assert any(g.abs().sum() > 0 for g in active), f'{name} 无有效梯度'
+        print(f'四步损失={total.item():.6f}；梯度检查通过；freeze_frontend={model.freeze_frontend}，freeze_decoder={model.freeze_decoder}')
     print(f'显存峰值：{torch.cuda.max_memory_allocated() / 2**30:.2f} GiB')
 
 
