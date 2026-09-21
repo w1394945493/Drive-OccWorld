@@ -57,6 +57,11 @@ def main():
         model.train()
         losses = model(return_loss=True, **batch)
         total = sum(losses.values())
+        #! 当前占据监督仅在前端或解码器解冻时存在，与未来步损失分开记录。
+        current_losses = {key: value for key, value in losses.items() if key.endswith('_current')}
+        assert bool(current_losses) == (not model.freeze_frontend or not model.freeze_decoder)
+        if current_losses:
+            print('当前占据损失：' + ', '.join(f'{key}={value.item():.6f}' for key, value in current_losses.items()))
         if not model.freeze_frontend:
             assert 'loss_depth' in losses and 'loss_seg_ce' in losses
             print(f"当前辅助损失：depth={losses['loss_depth'].item():.6f}，seg_ce={losses['loss_seg_ce'].item():.6f}")
@@ -76,7 +81,7 @@ def main():
                 active = [p.grad for p in params if p.grad is not None]
                 assert active and all(torch.isfinite(g).all() for g in active), f'{name} 梯度异常'
                 assert any(g.abs().sum() > 0 for g in active), f'{name} 无有效梯度'
-        print(f'四步损失={total.item():.6f}；梯度检查通过；freeze_frontend={model.freeze_frontend}，freeze_decoder={model.freeze_decoder}')
+        print(f'训练总损失={total.item():.6f}；梯度检查通过；freeze_frontend={model.freeze_frontend}，freeze_decoder={model.freeze_decoder}')
     print(f'显存峰值：{torch.cuda.max_memory_allocated() / 2**30:.2f} GiB')
 
 

@@ -1,6 +1,8 @@
 """联合训练原可训练感知模块与未来预测器；FoundationStereo 仍冻结。"""
 _base_ = './foundationssc_forecast.py'
 
+load_from = None #* 不加载预训练权重
+
 freeze_frontend = False  #* 修改1：解冻图像金字塔与 voxel_encoder；FoundationStereo 仍冻结。
 freeze_decoder = False  #* 修改2：解冻 3D ResNet、FPN 和占据头，与 dynamics 联合优化。
 model = dict(freeze_frontend=freeze_frontend, freeze_decoder=freeze_decoder)  #* 显式覆盖 model，顶层变量不会自动更新父配置字典。
@@ -15,4 +17,4 @@ train_pipeline = [
     dict(type='PackFoundationSSCInputs', runner_format=True),
 ]
 data = dict(train=dict(pipeline=train_pipeline))
-# 其余继承父配置；未来四步占据损失 + 当前辅助损失，无当前帧占据损失。解冻增加显存。
+# 其余继承父配置；当前占据损失 + 未来四步占据损失平均 + 当前辅助损失。解冻增加显存。

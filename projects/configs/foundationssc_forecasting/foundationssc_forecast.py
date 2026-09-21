@@ -4,7 +4,7 @@ _base_ = '../foundationssc/foundationssc_semantic_kitti.py'
 freeze_frontend = True  # 图像金字塔 + voxel_encoder；不包含始终冻结的 FoundationStereo。
 freeze_decoder = True  # 3D ResNet + 3D FPN + 占据分类头。
 # 解冻前端时模型自动启用当前帧辅助深度/语义损失，需搭配 no_freeze 的训练 pipeline。
-# 当前帧占据损失未启用；仅命令行修改 freeze_frontend 不会自动增加点云投影 pipeline。
+# 前端或解码器解冻时启用当前帧占据损失；仅修改 freeze_frontend 不会自动增加点云投影 pipeline。
 # 解冻会增加显存；CLI 覆盖时使用 model.freeze_frontend=False / model.freeze_decoder=False。
 #! 必须指定已训练的完整单帧 checkpoint（不是 FoundationStereo 权重）。
 load_from = "/c20250502/wangyushen/Outputs/drive_occworld/foundationssc/train2/best_current_mIoU_epoch_15.pth"

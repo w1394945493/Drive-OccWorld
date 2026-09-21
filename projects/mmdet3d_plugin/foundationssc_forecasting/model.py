@@ -140,9 +140,19 @@ class FoundationSSCForecastModel(FoundationSSCImageModel):
         # 是否训练图像金字塔/voxel_encoder 由 freeze_frontend 控制，Stereo 始终冻结。
         features = self._features(img_inputs, img_metas, return_aux=True)
         state = features['voxel_feats']
+
         #! 新增当前帧辅助深度 BCE / 二维语义 CE；仅解冻前端时启用，只计算一次，不除未来步数。
         losses = self.compute_auxiliary_losses(features, img_metas, gt_semantics)
         del features
+
+        #! 新增当前帧三维占据监督：前端或解码器解冻时，约束当前场景重建能力。
+        #* 在任何未来更新之前，用当前 state 与 gt_occ[:,0] 计算；权重为1，不除未来步数。
+        # 两者均冻结时跳过；当前损失不经过 dynamics，不直接更新未来预测器。
+        if not self.freeze_frontend or not self.freeze_decoder:
+            current_losses = self.pts_bbox_head.loss(self._decode(state), gt_occ[:, 0])
+            losses.update({f'{key}_current': value for key, value in current_losses.items()})
+
+        # 当前解码不替换 state，未来递推仍从当前连续体素特征开始。
         #! ================== 2. 新增未来位姿条件与自回归更新 ==================
         # pipeline 已构造 [B,K,4,4]：每步目标→上一时刻，不是目标→初始当前帧。
         # 列向量格式，平移在最后一列；GT 保留各帧自身 LiDAR 坐标系。
@@ -160,9 +170,10 @@ class FoundationSSCForecastModel(FoundationSSCImageModel):
             #* freeze_decoder 仅控制解码器参数是否更新，不阻断 loss 到 dynamics 的梯度。
             #* 解码仅用于监督，下一步递推仍使用上面的 state，而不是 logits 或 argmax 标签。
             step_losses = self.pts_bbox_head.loss(self._decode(state), gt_occ[:, step])
-            # 新增逐步损失命名并除以K；这里只监督未来1..K步，尚未计算当前帧损失。
+            # 未来1..K步损失除以K取平均；与上方当前帧损失、辅助损失分别命名并相加。
             losses.update({f'{key}_step_{step}': value / self.future_steps
                            for key, value in step_losses.items()})
+
         return losses
 
     def forward_test(self, img_inputs, img_metas, gt_occ=None, return_outputs=False, **kwargs):
