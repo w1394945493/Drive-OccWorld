@@ -8,7 +8,8 @@ freeze_decoder = True  # 3D ResNet + 3D FPN + 占据分类头。
 # 解冻会增加显存；CLI 覆盖时使用 model.freeze_frontend=False / model.freeze_decoder=False。
 #! 必须指定已训练的完整单帧 checkpoint（不是 FoundationStereo 权重）。
 load_from = "/c20250502/wangyushen/Outputs/drive_occworld/foundationssc/train2/best_current_mIoU_epoch_15.pth"
-auto_resume = False
+# auto_resume = False
+auto_resume = True
 work_dir = 'out/foundationssc_forecast'
 custom_imports = dict(imports=['projects.mmdet3d_plugin.foundationssc_forecasting'],
                       allow_failed_imports=False)
