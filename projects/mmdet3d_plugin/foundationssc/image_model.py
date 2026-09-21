@@ -258,6 +258,13 @@ class FoundationSSCImageModel(BaseModule):
         #* 四（2）、训练监督：三项三维占据损失 + 可选深度 BCE/二维语义 CE。
         #* 深度监督约束第二部分 depth_prob；二维语义头约束第二部分左图 context。
         losses = self.pts_bbox_head.loss(output['output_voxels'], gt_occ)
+        #! 拆出辅助损失供未来预测复用；单帧训练仍计算原有占据及辅助损失。
+        losses.update(self.compute_auxiliary_losses(output, img_metas, gt_semantics))
+        return losses
+
+    def compute_auxiliary_losses(self, output, img_metas, gt_semantics=None):
+        #! 仅监督当前输入帧的 depth_prob/context，不需要解码当前 occupancy。
+        losses = {}
         #* （FoundationSSC 辅助深度&语义损失) 仅训练/显式损失检查访问 GT，推理不需要 LiDAR。
         if self.use_depth_loss or self.use_semantic_loss:
             if 'gt_depths' not in img_metas or 'projection_camera_indices' not in img_metas:

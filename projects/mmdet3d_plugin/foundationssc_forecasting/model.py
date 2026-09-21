@@ -81,11 +81,12 @@ class FoundationSSCForecastModel(FoundationSSCImageModel):
     #* 保持父类参数路径，load_from 可加载已训练的单帧 checkpoint；仅 dynamics 是新参数。
     def __init__(self, future_steps=4, attention_heads=4, sampling_points=4,
                  freeze_frontend=True, freeze_decoder=True, **kwargs):
+        #! 辅助监督跟随前端开关：解冻时保留两项监督，冻结时不创建语义辅助头。
+        kwargs['use_depth_loss'] = not freeze_frontend
+        kwargs['use_semantic_loss'] = not freeze_frontend
         super().__init__(**kwargs)
         if future_steps < 1:
             raise ValueError('future_steps 必须为正整数')
-        if self.use_depth_loss or self.use_semantic_loss:
-            raise ValueError('当前 forecasting 损失接口尚未接入辅助监督，请关闭辅助损失')
         self.future_steps = int(future_steps)
         #* 默认复现原冻结策略；前端/解码器可分别解冻，FoundationStereo 始终冻结。
         self.freeze_frontend = freeze_frontend
@@ -95,6 +96,8 @@ class FoundationSSCForecastModel(FoundationSSCImageModel):
         self.requires_grad_(False)
         for name in ('image_pyramid', 'voxel_encoder'):
             getattr(self, name).requires_grad_(not freeze_frontend)
+        if self.use_semantic_loss:
+            self.plugin_head.requires_grad_(True)
         for name in ('occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head'):
             getattr(self, name).requires_grad_(not freeze_decoder)
         #! 核心新增模块：未来各步共享这一套位姿条件三维注意力参数。
@@ -107,25 +110,27 @@ class FoundationSSCForecastModel(FoundationSSCImageModel):
         for name, module in self.named_children():
             #* 冻结模块保持 eval（包括 BN/Dropout），解冻模块跟随外层 train/eval。
             trainable = (name == 'dynamics'
-                         or (name in ('image_pyramid', 'voxel_encoder') and not self.freeze_frontend)
+                         or (name in ('image_pyramid', 'voxel_encoder', 'plugin_head') and not self.freeze_frontend)
                          or (name in ('occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head') and not self.freeze_decoder))
             module.train(mode and trainable)
         return self
 
-    def _features(self, img_inputs, img_metas):
+    def _features(self, img_inputs, img_metas, return_aux=False):
         #* 感知前端只访问当前图像；未来真实位姿在后续 attention 中作为 oracle 条件。
         #* 解冻时保留前端计算图；nullcontext 不会覆盖推理外层的 no_grad。
         # FoundationStereo 自身仍由父类 extract_image_features 内的 no_grad 冻结。
         with torch.no_grad() if self.freeze_frontend else nullcontext():
             image = self.extract_image_features(img_inputs, img_metas)
-            return self.voxel_encoder(image, img_inputs, img_metas)['voxel_feats']
+            output = self.voxel_encoder(image, img_inputs, img_metas)
+            #! 训练时复用同一次前端输出的 context/depth_prob，不重复提取特征。
+            return output if return_aux else output['voxel_feats']
 
     def _decode(self, features):
         #* 复用原解码器，不使用 no_grad：未来 loss 必须穿过冻结解码器反传到 dynamics。
         encoded = self.occ_encoder_neck(self.occ_encoder_backbone(features))
         return self.pts_bbox_head([encoded[0]])['output_voxels']
 
-    def forward_train(self, img_inputs, img_metas, gt_occ, **kwargs):
+    def forward_train(self, img_inputs, img_metas, gt_occ, gt_semantics=None, **kwargs):
         #* ================== 1. 复用原单帧感知前端 ==================
         # gt_occ=[B,K+1,X,Y,Z]：第0项为当前标签，第1..K项为各未来帧原始标签。
         if gt_occ.ndim != 5 or gt_occ.shape[1] != self.future_steps + 1:
@@ -133,12 +138,15 @@ class FoundationSSCForecastModel(FoundationSSCImageModel):
         #* _features 复用 FoundationStereo → 图像金字塔 → voxel_encoder，仅运行一次。
         # state 为当前连续体素特征，默认 [B,128,128,128,16]；不是离散 occupancy。
         # 是否训练图像金字塔/voxel_encoder 由 freeze_frontend 控制，Stereo 始终冻结。
-        state = self._features(img_inputs, img_metas)
+        features = self._features(img_inputs, img_metas, return_aux=True)
+        state = features['voxel_feats']
+        #! 新增当前帧辅助深度 BCE / 二维语义 CE；仅解冻前端时启用，只计算一次，不除未来步数。
+        losses = self.compute_auxiliary_losses(features, img_metas, gt_semantics)
+        del features
         #! ================== 2. 新增未来位姿条件与自回归更新 ==================
         # pipeline 已构造 [B,K,4,4]：每步目标→上一时刻，不是目标→初始当前帧。
         # 列向量格式，平移在最后一列；GT 保留各帧自身 LiDAR 坐标系。
         transforms = img_metas['forecast_target_to_previous'].to(state)  # 仅转换 device/dtype。
-        losses = {}
         for step in range(1, self.future_steps + 1):
 
             #! dynamics 是新增的三维位姿条件注意力，所有未来步调用同一个实例、共享参数。

@@ -32,7 +32,10 @@ def main():
     print(f'加载权重（{"命令行 --checkpoint" if args.checkpoint else "配置 load_from"}）：{checkpoint_path}')
     for name in cfg.custom_imports.imports:
         importlib.import_module(name)
-    dataset = build_dataset(cfg.data.val)
+    #! 解冻反向检查需要训练 pipeline 提供当前帧辅助标签；普通推理仍使用 val。
+    split = 'train' if args.check_grad and not cfg.model.get('freeze_frontend', True) else 'val'
+    print(f'检查数据划分：{split}')
+    dataset = build_dataset(cfg.data[split])
     batch = scatter(collate([dataset[args.index]], samples_per_gpu=1), [0])[0]
     model = build_detector(cfg.model).cuda()
     checkpoint = load_checkpoint(model, checkpoint_path, map_location='cpu', strict=False)
@@ -54,6 +57,9 @@ def main():
         model.train()
         losses = model(return_loss=True, **batch)
         total = sum(losses.values())
+        if not model.freeze_frontend:
+            assert 'loss_depth' in losses and 'loss_seg_ce' in losses
+            print(f"当前辅助损失：depth={losses['loss_depth'].item():.6f}，seg_ce={losses['loss_seg_ce'].item():.6f}")
         if not torch.isfinite(total):
             raise AssertionError('损失非有限值')
         total.backward()
@@ -62,7 +68,9 @@ def main():
         assert any(g.abs().sum() > 0 for g in grads)
         #! 跟随解冻配置检查：冻结参数无梯度，各解冻模块应有有效反向梯度。
         assert all(p.grad is None for p in model.parameters() if not p.requires_grad)
-        for name in ('image_pyramid', 'voxel_encoder', 'occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head'):
+        for name in ('image_pyramid', 'voxel_encoder', 'occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head', 'plugin_head'):
+            if not hasattr(model, name):
+                continue
             params = [p for p in getattr(model, name).parameters() if p.requires_grad]
             if params:
                 active = [p.grad for p in params if p.grad is not None]
