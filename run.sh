@@ -146,6 +146,43 @@ python scripts/test_foundationssc.py \
 
 python scripts/test_foundationssc.py --check-grad
 
+# foundationssc-forcesting
+python scripts/test_foundationssc_forecast.py --check-grad
+
+python scripts/vis_foundationssc_forecast.py --indices 0 40 80
+
+# freeze
+CUDA_VISIBLE_DEVICES=4 \
+PYTHONPATH="$(pwd)" \
+python tools/train.py \
+  projects/configs/foundationssc_forecasting/foundationssc_forecast.py \
+  --work-dir out/foundationssc_forecast_train_debug \
+  --cfg-options \
+  total_epochs=2 \
+  data.train.max_samples=20 \
+  data.val.max_samples=5 \
+  data.workers_per_gpu=0 \
+  log_config.interval=1 \
+  lr_config.warmup_iters=5 \
+  checkpoint_config.interval=1 \
+  evaluation.interval=1
+
+# no-freeze
+CUDA_VISIBLE_DEVICES=4 \
+PYTHONPATH="$(pwd)" \
+python tools/train.py \
+  projects/configs/foundationssc_forecasting/foundationssc_forecast_no_freeze.py \
+  --work-dir out/foundationssc_forecast_no_freeze_train_debug \
+  --cfg-options \
+  total_epochs=2 \
+  data.train.max_samples=20 \
+  data.val.max_samples=5 \
+  data.workers_per_gpu=0 \
+  log_config.interval=1 \
+  lr_config.warmup_iters=5 \
+  checkpoint_config.interval=1 \
+  evaluation.interval=1
+  
 # =====================================================================#
 #  火山服务器训练
 
@@ -178,3 +215,5 @@ cd /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld
 . /root/miniconda3/bin/activate
 conda activate /vepfs-mlp2/c20250502/haoce/conda_env/wys_temp_2
 bash sh/train_foundationssc_large.sh
+
+
