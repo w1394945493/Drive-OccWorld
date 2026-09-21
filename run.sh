@@ -216,4 +216,8 @@ cd /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld
 conda activate /vepfs-mlp2/c20250502/haoce/conda_env/wys_temp_2
 bash sh/train_foundationssc_large.sh
 
-
+# foundationssc_forecast no_freeze
+cd /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld
+. /root/miniconda3/bin/activate
+conda activate /vepfs-mlp2/c20250502/haoce/conda_env/wys_temp_2
+bash sh/train_foundationssc_forecast_no_freeze.sh
