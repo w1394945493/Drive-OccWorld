@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""仅验证历史双目/标定/位姿与当前 SSC 数据，不构建模型、不加载权重、不使用 CUDA。"""
+"""时序接口完整检查：数据 → 当前帧 SSC 前向 → 评估，可选损失反向；尚无历史融合。"""
 import argparse
 import copy
+import importlib
 import sys
 from pathlib import Path
 import torch
@@ -53,22 +54,52 @@ def check_temporal(batch):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default='projects/configs/foundationssc_temporal/foundationssc_temporal_semantic_kitti.py')
-    parser.add_argument('--split', choices=['train', 'val'], default='val')
+    parser.add_argument('--split', choices=['train', 'val'], default=None,
+                        help='默认推理用 val，--check-grad 用 train；辅助监督需训练 pipeline')
     parser.add_argument('--indices', type=int, nargs='+', default=[0, 10])
     parser.add_argument('--ann-file')
+    parser.add_argument('--checkpoint', help='优先于配置 load_from；均未设置时仅验证初始化模型接口')
+    parser.add_argument('--check-grad', action='store_true', help='检查真实损失与反向梯度，不更新参数')
+    parser.add_argument('--device', default='cuda:0')
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from mmcv import Config
-    from mmcv.parallel import collate
+    from mmcv.parallel import collate, scatter
+    from mmcv.runner import load_checkpoint
+    from mmdet.models import build_detector
     from mmdet3d.datasets import build_dataset
-    import projects.mmdet3d_plugin  # 注册数据接口；不导入 temporal 模型或调用 custom_imports。
+    import projects.mmdet3d_plugin
     cfg = Config.fromfile(args.config)
-    options = copy.deepcopy(cfg.data[args.split])
+    for name in cfg.get('custom_imports', {}).get('imports', []):
+        importlib.import_module(name)
+    device = torch.device(args.device)
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        raise RuntimeError('完整模型验证需要 CUDA 环境及已编译的体素算子')
+    torch.cuda.set_device(device)
+    split = args.split or ('train' if args.check_grad else 'val')
+    options = copy.deepcopy(cfg.data[split])
+    if args.check_grad and (cfg.model.get('use_depth_loss') or cfg.model.get('use_semantic_loss')):
+        if not any(step['type'] == 'ProjectFoundationSSCLidar' for step in options['pipeline']):
+            parser.error('辅助损失检查需要投影标签，请使用 --split train')
     if args.ann_file:
         options['ann_file'] = args.ann_file
     runner_dataset = build_dataset(options)
     options['pipeline'][-1]['runner_format'] = False
     dataset = build_dataset(options)
+    for index in args.indices:
+        if not 0 <= index < len(dataset):
+            raise IndexError(f'{index} 不在 [0,{len(dataset)})')
+    model = build_detector(cfg.model).to(device)
+    checkpoint = args.checkpoint or cfg.get('load_from')
+    if checkpoint:
+        #! 当前子类参数结构与单帧相同，严格加载，避免遗漏权重仍误报验证通过。
+        load_checkpoint(model, checkpoint, map_location='cpu', strict=True)
+        print(f'加载完整模型权重：{checkpoint}')
+    else:
+        print('未加载完整 SSC 检查点（立体骨干仍加载配置权重）；指标仅用于接口检查。')
+    print(f'数据划分：{split}；仅执行当前帧 SSC，历史输入暂不参与融合。')
+    results = []
+    torch.cuda.reset_peak_memory_stats(device)
     for index in args.indices:
         if not 0 <= index < len(dataset):
             raise IndexError(f'{index} 不在 [0,{len(dataset)})')
@@ -80,7 +111,50 @@ def main():
         torch.testing.assert_close(packed['history_img_inputs'][0].data[0], expected)
         assert len(packed['temporal_metas'].data[0]) == 2
         print(f'样本 {index}：数据与双样本 MMCV 打包通过。')
-    print('仅数据接口验证完成；未执行特征提取、时序融合、损失或模型前向。')
+        #! 使用正式 DataContainer→collate→scatter 路径，历史字段一并传入模型。
+        batch = scatter(collate([runner_dataset[index]], samples_per_gpu=1),
+                        [torch.cuda.current_device()])[0]
+        model.eval()
+        with torch.no_grad():
+            output = model(return_loss=False, return_outputs=True, **batch)
+            pred, logits = output['pred'], output['output_voxels']
+            assert pred.shape == batch['gt_occ'].shape
+            assert logits.shape == (pred.shape[0], model.pts_bbox_head.out_channel, *pred.shape[1:])
+            assert torch.isfinite(logits).all() and torch.isfinite(output['voxel_feats']).all()
+            print(f"voxel_feats={tuple(output['voxel_feats'].shape)}；logits={tuple(logits.shape)}；pred={tuple(pred.shape)}")
+            del output, pred, logits
+            # 单独验证正式评估入口，而非仅手工调用混淆矩阵函数。
+            items = model(return_loss=False, **batch)
+            assert len(items) == batch['gt_occ'].shape[0]
+            assert all(len(item['hist_for_iou_per_frame']) == 1 for item in items)
+            results.extend(items)
+        if args.check_grad:
+            model.train()
+            model.zero_grad(set_to_none=True)
+            losses = model(return_loss=True, **batch)
+            assert losses and all(torch.isfinite(value).all() for value in losses.values())
+            for enabled, key in ((model.use_depth_loss, 'loss_depth'), (model.use_semantic_loss, 'loss_seg_ce')):
+                assert (key in losses) == enabled, key
+            total = sum(value.mean() for key, value in losses.items() if 'loss' in key)
+            total.backward()
+            assert not model.img_backbone.training
+            assert all(p.grad is None for p in model.img_backbone.parameters())
+            names = ['image_pyramid', 'voxel_encoder', 'occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head']
+            if model.use_semantic_loss:
+                names.append('plugin_head')
+            for name in names:
+                grads = [p.grad for p in getattr(model, name).parameters() if p.grad is not None]
+                assert grads and all(torch.isfinite(g).all() for g in grads), f'{name} 梯度缺失或非有限'
+                assert any(g.abs().sum() > 0 for g in grads), f'{name} 梯度全零'
+            print('损失：' + ', '.join(f'{key}={value.mean().item():.6f}' for key, value in losses.items()))
+            print(f'总损失={total.item():.6f}；可训练模块梯度有效，冻结骨干无梯度；未执行 optimizer.step。')
+            model.zero_grad(set_to_none=True)
+            del losses, total, grads
+        del batch
+    print('所选样本评估（不是完整验证集指标）：')
+    dataset.evaluate(results)
+    print(f'显存峰值：{torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB')
+    print('数据、当前帧前向和评估流程通过；尚未实现/验证历史时序融合或 DDP 训练。')
 
 
 if __name__ == '__main__':

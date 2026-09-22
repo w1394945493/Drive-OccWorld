@@ -1,4 +1,4 @@
-"""时序接口验证：历史一帧＋当前双目，当前 SSC 标签；尚不支持模型训练。"""
+"""时序 SSC 接口：加载历史与当前双目；模型暂执行完整单帧前向，尚不融合历史。"""
 _base_ = '../foundationssc/foundationssc_semantic_kitti.py'
 custom_imports = dict(imports=['projects.mmdet3d_plugin.foundationssc_temporal'], allow_failed_imports=False)
 model = dict(type='FoundationSSCTemporalModel')
