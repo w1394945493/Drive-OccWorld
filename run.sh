@@ -146,6 +146,7 @@ python scripts/test_foundationssc.py \
 
 python scripts/test_foundationssc.py --check-grad
 
+# -------------------------------------------------------------------------
 # foundationssc-forcesting
 python scripts/test_foundationssc_forecast.py --check-grad
 
@@ -182,7 +183,20 @@ python tools/train.py \
   lr_config.warmup_iters=5 \
   checkpoint_config.interval=1 \
   evaluation.interval=1
-  
+
+python /vepfs-mlp2/c20250502/haoce/wangyushen/Drive-OccWorld/scripts/vis_foundationssc_forecast.py \
+  --checkpoint /c20250502/wangyushen/Outputs/drive_occworld/foundationssc_forecast_no_freeze/train2/epoch_24.pth \
+  --indices 0 40 80 \
+  --out-dir out/foundationssc_forecast_vis \
+
+
+# -------------------------------------------------------------------------
+# foundationssc-temporal
+# 数据检查 → 当前帧预测 → 所选样本评估
+python scripts/test_foundationssc_temporal.py --indices 0 20
+# 额外验证占据/辅助损失及反向梯度，默认使用 train 数据
+python scripts/test_foundationssc_temporal.py --indices 0 20 --check-grad
+
 # =====================================================================#
 #  火山服务器训练
 
