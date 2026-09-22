@@ -19,7 +19,8 @@ def check_temporal(batch):
         check_batch(dict(img_inputs=tuple(x[:, slot] for x in inputs),
                          img_metas=metas[slot], gt_occ=batch['gt_occ']))
         assert metas[slot]['scene_name'] == batch['img_metas']['scene_name']
-        assert metas[slot]['token'] == temporal['history_tokens'][slot]
+        #! default_collate 对两种嵌套结构分别产生 list/tuple；统一容器类型，仍逐项检查帧名。
+        assert tuple(metas[slot]['token']) == tuple(temporal['history_tokens'][slot])
     assert temporal['current_token'] == batch['img_metas']['token']
     a, inverse = temporal['current_to_history'], temporal['history_to_current']
     assert a.shape == (b, t, 4, 4) and torch.isfinite(a).all()
