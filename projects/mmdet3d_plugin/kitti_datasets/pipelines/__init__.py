@@ -7,9 +7,11 @@ from .foundationssc import (LoadFoundationSSCStereo, LoadFoundationSSCOccupancy,
 from .lidar_labels import LoadSemanticKITTIPointsAndLabels, ProjectFoundationSSCLidar
 #! 注册未来原始 occupancy 和位姿条件加载，不影响原单帧 pipeline。
 from .foundation_forecast import LoadFoundationForecastOccupancy
+from .foundation_temporal import LoadFoundationSSCHistory, PackFoundationSSCTemporalInputs
 
 __all__ = ['LoadTemporalKittiImages', 'NormalizeTemporalKittiImages',
            'PadTemporalKittiImages', 'LoadTemporalKittiOccupancy',
            'PackKittiWorldInputs', 'LoadFoundationSSCStereo',
            'LoadFoundationSSCOccupancy', 'PackFoundationSSCInputs',
-           'LoadSemanticKITTIPointsAndLabels', 'ProjectFoundationSSCLidar']
+           'LoadSemanticKITTIPointsAndLabels', 'ProjectFoundationSSCLidar',
+           'LoadFoundationSSCHistory', 'PackFoundationSSCTemporalInputs']

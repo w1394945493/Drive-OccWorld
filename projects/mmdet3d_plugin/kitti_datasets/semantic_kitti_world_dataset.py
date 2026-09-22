@@ -82,7 +82,8 @@ class SemanticKITTIWorldDataset(Dataset):
                  empty_idx=0,
                  max_samples=None,
                  format_for_train=False,
-                 test_mode=False):
+                 test_mode=False,
+                 pad_history_with_current=False):
         super().__init__()
         if use_camera not in self.CAMERA_GROUPS:
             raise ValueError(
@@ -100,6 +101,8 @@ class SemanticKITTIWorldDataset(Dataset):
         #* 0.5s/1s/... 这样的更直观时间标签。
         self.forecast_time_interval = 0.5
         self.filter_invalid = filter_invalid
+        #! 时序 SSC 可选：历史不足时用当前帧补齐；默认关闭，保留其他任务的过滤行为。
+        self.pad_history_with_current = pad_history_with_current
         self.load_occ = load_occ
         self.load_img = load_img
         self.to_float32 = to_float32
@@ -235,7 +238,23 @@ class SemanticKITTIWorldDataset(Dataset):
         prev_tokens = self._trace_tokens(
             cur_token, 'prev', self.history_queue_length)
         if prev_tokens is None:
-            return None
+            #! 历史不足：未开启补帧则返回无效窗口；开启后保留该样本，用当前帧填满缺失槽位。
+            if not self.pad_history_with_current:
+                return None
+            #! 重新沿 prev 链收集已有历史；上面的 _trace_tokens 在不足时只返回 None，不保留部分结果。
+            prev_tokens = []  # 暂按由近到远存放真实历史：[t-1, t-2, ...]。
+            token = cur_token  # 从当前帧开始向前查找，不是从整个数据列表直接减索引。
+            for _ in range(self.history_queue_length):
+                previous = self.data_infos[self.token2idx[token]]['prev']  # 上一个关键帧的 token。
+                if not previous or previous not in self.token2idx:
+                    break  # 到达 prev 链边界或引用缺失时停止；依赖 PKL 的 prev 链不跨场景。
+                prev_tokens.append(previous)  # 保留真实历史，不用当前帧覆盖已有历史。
+                token = previous  # 继续查找更早的一帧。
+            #! 只补缺失的历史槽位：重复当前 token，让后续 pipeline 加载当前图像/标定，不伪造历史位姿。
+            # 此时补在列表末尾；下方 reversed 后位于窗口开头，即最早的缺失槽位。
+            # 例：需要 3 帧历史、只有 t-1，补后为 [t-1,t,t]，反转后为 [t,t,t-1]。
+            # 时序 pipeline 会将这些副本标记 history_valid=False，时间差为 0；未来 GT 不在这里补齐。
+            prev_tokens += [cur_token] * (self.history_queue_length - len(prev_tokens))
         next_tokens = self._trace_tokens(
             cur_token, 'next', self.future_queue_length)
         if next_tokens is None:
