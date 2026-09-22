@@ -184,8 +184,17 @@ class PredictionTransformerLayer(MyCustomBaseTransformerLayer):
                 shape [bs, num_keys]. Default: None.
 
         Returns:
-            Tensor: forwarded results with shape [num_queries, bs, embed_dims].
+            Tensor: updated future BEV query with shape [bs, num_queries, embed_dims].
         """
+        #* ================== 1. 输入含义与注意力 mask 准备 ==================
+        #* 本层更新同一未来时刻的 BEV 特征，不是在此循环预测多个未来帧。
+        # query=[B,Q,C]，Q=bev_h*bev_w；prev_feats=[B,T,Q,C] 为可读取的 memory。
+        # T 是 memory 帧数，可包含历史/当前帧或此前预测帧，由外层递推维护。
+        # tgt_points=[B,Q,2]：目标 BEV 自身的归一化坐标，用于 query 内部自注意力。
+        # ref_points=[B,Q,T,2]：同一目标位置经位姿变换后在各 memory 中的采样参考点。
+        # 此处不重新计算位姿，也不预先 warp 整张 memory；后续注意力按参考点采样。
+        # bev_pos 是实际传入注意力的位置编码；签名中的 query_pos/key_pos 在此未直接使用。
+        # 三个 index 分别索引 attention/norm/FFN 子模块；identity 用于残差连接。
         norm_index = 0
         attn_index = 0
         ffn_index = 0
@@ -204,32 +213,38 @@ class PredictionTransformerLayer(MyCustomBaseTransformerLayer):
                                                      f'to the number of attention in ' \
                 f'operation_order {self.num_attn}'
 
-        #* 对应论文 WD 中 deformable attention 需要的采样坐标准备。
-        # Pre-process some parameters:
-        #   * change ref_points from [bs, bev_h * bev_w, 2] to
-        #     [bs, bev_h * bev_w, 1, 2] where 1 stands for num_level.
+        #* ================== 2. 采样坐标与 memory 展平布局 ==================
+        # 自注意力只读取目标 query 这一张 BEV：补 level 维，[B,Q,2] → [B,Q,1,2]。
         tgt_points = tgt_points.unsqueeze(2)
+        # 交叉注意力通常已有 T 个参考点；单 memory 输入 [B,Q,2] 时补成 [B,Q,1,2]。
         if len(ref_points.shape) != 4:
             ref_points = ref_points.unsqueeze(2)
-        #   * change prev_feats to from [bs, num_frames, bev_h * bev_w, dims]
-        #     to [bs, num_frames * bev_h * bev_w, dims]
+        # 各 memory 帧的网格尺寸必须一致，随后按帧依次拼成一条 token 序列。
         bs, num_frames, prev_token_num, prev_dims = prev_feats.shape
         assert prev_feats.shape[2] == bev_h * bev_w
 
+        # 自注意力：1 个二维 level，大小 H×W，序列起始位置为 0。
         self_attn_spatial_shapes = torch.tensor(
             [[bev_h, bev_w]], device=query.device)
         self_attn_level_start_index = torch.tensor([0], device=query.device)
 
+        # 交叉注意力：将 T 帧视为 T 个 level（这里不是图像金字塔尺度）。
+        # spatial_shapes=[T,2]；各帧起始下标为 0,Q,2Q,...，用于定位展平 memory。
         cross_attn_spatial_shapes = torch.tensor(
             [[bev_h, bev_w] for i in range(num_frames)], device=query.device)
         cross_attn_level_start_index = torch.cat((cross_attn_spatial_shapes.new_zeros(
             (1,)), cross_attn_spatial_shapes.prod(1).cumsum(0)[:-1]))
         prev_feats = prev_feats.view(bs, num_frames * prev_token_num, prev_dims)
 
+        #* ================== 3. 按配置顺序更新未来 query ==================
+        # 常用顺序：self_attn → norm → cross_attn → norm → cross_attn_action → norm → ffn → norm。
+        # 循环项是本层内的运算名，不是未来时间步；只有配置中的分支才会执行。
         for layer in self.operation_order:
-            #* 论文 WD step 1: deformable self-attention。
-            # 在目标 future frame 的 BEV query 内部建模空间关系。
-            # temporal self attention
+            #* ================================================================
+            #* 3.1 自注意力：目标 BEV query 之间交换信息，使用 tgt_points。
+            #* 当前 PredictionMSDeformableAttention 是稀疏可变形自注意力，不是 Q×Q 全局密集注意力。
+            # 每个 query/head 只读取 P 个学习采样点；偏移无固定窗口限制，可读取远处，但不保证覆盖全局。
+            # key/value 传 None，由注意力模块使用 query 自身；在参考点附近学习采样偏移。
             if layer == 'self_attn':
                 query = self.attentions[attn_index](
                     query,
@@ -248,12 +263,14 @@ class PredictionTransformerLayer(MyCustomBaseTransformerLayer):
                 identity = query
 
             elif layer == 'norm':
+                # 按 operation_order 在对应位置归一化，保持 [B,Q,C] 不变。
                 query = self.norms[norm_index](query)
                 norm_index += 1
 
-            #* 论文 WD step 2: temporal cross-attention with historical embeddings。
-            # query 在 ref_points 指定的位置读取 W_M 中历史/当前 BEV memory。
-            # Temporal cross-attention for query features from history memory bank.
+            #* ================================================================
+            #* 3.2 跨帧注意力：未来 query 从展平后的 memory[B,T*Q,C] 读取场景特征。
+            # key/value 均为 prev_feats；围绕已对齐的 ref_points 学习偏移并加权聚合。
+            # 更新的是 query，不直接改写 prev_feats；未来各帧递推由外层负责。
             elif layer == 'cross_attn':
                 query = self.attentions[attn_index](
                     query,
@@ -271,11 +288,10 @@ class PredictionTransformerLayer(MyCustomBaseTransformerLayer):
                 attn_index += 1
                 identity = query
 
-            #* 论文 WD step 3: conditional cross-attention with action conditions。
-            # action_condition 来自 can_bus/command/velocity/plan_traj 等条件编码。
-            #* 当前配置下 action_condition 包含 future_can_bus + command + velocity；
-            #* 这里把它作为 cross-attention 的 key/value，让未来 BEV query 按动作条件生成 occupancy。
-            # cross-attention with action condition
+            #* ================================================================
+            #* 3.3 动作条件交互：将上游编码的 action_condition 作为 key/value。
+            # 条件具体包含哪些 can_bus/command/velocity/plan_traj 信息由上游配置决定。
+            # [B,C] → [B,1,C]，作为条件 token；此处不读取原始 CAN bus，也不输出占据类别。
             elif layer == 'cross_attn_action':
                 action_condition = kwargs['action_condition'].unsqueeze(1)
                 query = self.attentions[attn_index](
@@ -289,16 +305,20 @@ class PredictionTransformerLayer(MyCustomBaseTransformerLayer):
                 identity = query
 
             elif layer == 'latent_render':
+                # 可选分支：恢复 [B,H,W,C] 做 latent_render，再还原 [B,Q,C]。
+                # 常用 operation_order 未包含此项时不执行。
                 bs, token_num, embed_dim = query.shape
                 query = self.latent_render(query.view(bs, bev_h, bev_w, embed_dim))
                 query = query.view(bs, token_num, embed_dim)
 
             elif layer == 'ffn':
-                #* 论文 WD step 4: feedforward network，完成每层 transformer 的特征更新。
+                #* 3.4 FFN：逐 token 做通道变换与残差更新，不改变 BEV 网格数量。
                 query = self.ffns[ffn_index](
                     query, identity if self.pre_norm else None)
                 ffn_index += 1
 
+        #* ================== 4. 返回本层未来 BEV 特征 ==================
+        # [B,Q,C]，交给下一层 WorldDecoder 或外层占据解码；不是 occupancy logits。
         return query
 
 
@@ -568,15 +588,15 @@ class PredictionMSDeformableAttention(BaseModule):
     @deprecated_api_warning({'residual': 'identity'},
                             cls_name='MultiScaleDeformableAttention')
     def forward(self,
-                query,
-                key=None,
-                value=None,
-                identity=None,
-                query_pos=None,
-                key_padding_mask=None,
-                reference_points=None,
-                spatial_shapes=None,
-                level_start_index=None,
+                query,  # [B,Q,C]，以下按当前 batch_first=True 路径标注。
+                key=None,  # [B,S,C] 或 None；本实现不使用 key 计算相似度。
+                value=None,  # [B,S,C]；自注意力默认使用 query，此时 S=Q。
+                identity=None,  # [B,Q,C]，残差；默认使用原始 query。
+                query_pos=None,  # [B,Q,C] 或可广播到该形状的位置编码。
+                key_padding_mask=None,  # [B,S]，True 对应的 value 置零。
+                reference_points=None,  # [B,Q,L,2]；框参考模式为 [B,Q,L,4]。
+                spatial_shapes=None,  # [L,2]，各 level 的 (H_l,W_l)。
+                level_start_index=None,  # [L]，各 level 在 S 维中的起始下标。
                 flag='decoder',
                 **kwargs):
         """Forward Function of MultiScaleDeformAttention.
@@ -613,57 +633,87 @@ class PredictionMSDeformableAttention(BaseModule):
                 as [0, h_0*w_0, h_0*w_0+h_1*w_1, ...].
 
         Returns:
-             Tensor: forwarded results with shape [num_query, bs, embed_dims].
+             Tensor: [bs, num_query, embed_dims] in the WorldDecoder batch_first=True path.
         """
 
+        #* ================== 1. 区分自注意力/跨帧注意力，准备残差 ==================
+        #* 两种注意力复用本类，但由外层创建两个独立实例，参数不共享。
+        # 自注意力：value=None → 读取 query 自身；reference_points 是 tgt_points。
+        # 跨帧注意力：value=prev_feats[B,T*H*W,C]；reference_points 是对齐后的 ref_points。
+        # 下文记 B=batch、Q=query数、S=value数、M=head数、L=level数、P=每level采样点数、C=通道数。
+        #* 这里不是标准 QK^T 注意力：key 保留兼容接口，后续不参与打分。
+        # 采样偏移和权重直接由 query 预测；实际被读取的内容来自 value。
         if value is None:
-            value = query
+            value = query  # [B,Q,C]，自注意力 S=Q。
         if key is None:
-            key = query
+            key = query  # [B,Q,C]，仅兼容接口。
 
         if identity is None:
-            identity = query
+            identity = query  # [B,Q,C]。
+        # 位置编码仅加入生成偏移/权重的 query；上面保留的 value/identity 不随之相加。
         if query_pos is not None:
-            query = query + query_pos
+            query = query + query_pos  # [B,Q,C]，shape 不变。
 
-        bs, num_query, _ = query.shape
-        bs, num_value, _ = value.shape
+        bs, num_query, _ = query.shape  # B,Q,C。
+        bs, num_value, _ = value.shape  # B,S,C。
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
-        value = self.value_proj(value)
+        #* ================== 2. value 通道投影与多头拆分 ==================
+        # S 必须等于各 level 的 H_l*W_l 之和；跨帧场景把各帧当作 level，而非图像尺度。
+        value = self.value_proj(value)  # [B,S,C]，只变换通道，不改变 token 顺序。
         if key_padding_mask is not None:
-            value = value.masked_fill(key_padding_mask[..., None], 0.0)
-        value = value.view(bs, num_value, self.num_heads, -1)
+            value = value.masked_fill(key_padding_mask[..., None], 0.0)  # mask=[B,S,1] → value=[B,S,C]。
+        value = value.view(bs, num_value, self.num_heads, -1)  # [B,S,M,C/M]。
 
-        # Predict sampling offsets / attention weight for each query.
+        #* ================== 3. query 预测采样偏移与注意力权重 ==================
+        # sampling_offsets=[B,Q,M,L,P,2]：每个 query/head/level 的 P 个二维偏移。
+        #* 自注意力读取目标 BEV 时，每个 head 仅采样 P 个位置，而非遍历全部 Q 个 token。
+        # 点参考模式下偏移以对应 BEV 网格单元为单位；不是三维 XYZ，也不是米。
         sampling_offsets = self.sampling_offsets(query).view(
-            bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+            bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)  # [B,Q,M*L*P*2] → [B,Q,M,L,P,2]。
         attention_weights = self.attention_weights(query).view(
-            bs, num_query, self.num_heads, self.num_levels * self.num_points)
-        attention_weights = attention_weights.softmax(-1)
+            bs, num_query, self.num_heads, self.num_levels * self.num_points)  # [B,Q,M*L*P] → [B,Q,M,L*P]。
+        #* 每个 query/head 联合对 L*P 个位置归一化，跨帧时也会分配不同帧的贡献。
+        # 自注意力也只对采样点分配权重，不形成标准全局自注意力的 Q×Q 相关矩阵。
+        # 不是每帧单独 softmax；权重来自 query，而非与每个 memory token 逐一计算相似度。
+        attention_weights = attention_weights.softmax(-1)  # [B,Q,M,L*P]，最后一维概率和为 1。
 
         attention_weights = attention_weights.view(bs, num_query,
                                                    self.num_heads,
                                                    self.num_levels,
-                                                   self.num_points)
+                                                   self.num_points)  # [B,Q,M,L,P]。
 
-        # Compute the deformable location for reference query points.
+        #* ================== 4. 几何参考点 + 学习偏移 → 实际采样位置 ==================
+        #* 位姿对齐已在外层完成；本模块在参考点周围进一步学习从哪里读取信息。
+        #* sampling_offsets 没有固定窗口/半径约束，可跨区域采样；不等于对全局所有位置做注意力。
+        # reference + offset 的写法不保证偏移很小；越界按后续零填充采样规则处理。
+        # reference_points=[B,Q,L,2]，sampling_locations=[B,Q,M,L,P,2]。
+        # 坐标顺序为布局 (x,y)/(宽,高)；不是物理 LiDAR 三维坐标。
         if reference_points.shape[-1] == 2:
+            # spatial_shapes 存 (H,W)，所以除数要换为 (W,H)，将网格偏移归一化。
             offset_normalizer = torch.stack(
-                [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)  # 1, 2
+                [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)  # [L,2]，每项为 (W_l,H_l)。
+            # 广播：[B,Q,1,L,1,2] + [B,Q,M,L,P,2] / [1,1,1,L,1,2]。
             sampling_locations = reference_points[:, :, None, :, None, :] \
                 + sampling_offsets \
-                / offset_normalizer[None, None, None, :, None, :]
+                / offset_normalizer[None, None, None, :, None, :]  # [B,Q,M,L,P,2]。
         elif reference_points.shape[-1] == 4:
+            # 通用框参考分支：(中心x,中心y,宽,高)，按框尺寸缩放偏移。
+            # 当前 WorldDecoder 传二维点，通常不走此分支。
+            # 中心/宽高均为 [B,Q,1,L,1,2]，与偏移 [B,Q,M,L,P,2] 广播。
             sampling_locations = reference_points[:, :, None, :, None, :2] \
                 + sampling_offsets / self.num_points \
                 * reference_points[:, :, None, :, None, 2:] \
-                * 0.5
+                * 0.5  # [B,Q,M,L,P,2]。
         else:
             raise ValueError(
                 f'Last dim of reference_points must be'
                 f' 2 or 4, but get {reference_points.shape[-1]} instead.')
 
+        #* ================== 5. 从 value 采样并加权汇聚 ==================
+        #* 每个 query/head 在各 level 的 P 个位置做二维双线性采样，再按权重求和。
+        # 因此无需构建 Q×S 的全连接注意力矩阵；学习后的位置可能越界，不会在此 clamp。
+        # 越界区域按零填充规则采样；得到 [B,Q,C]，已合并各 head 的输出。
         # Input_shapes:
         #   * value: bs, num_value, num_heads, embed // num_heads.
         #       multi-level features are stacked at the {num_value} dimension
@@ -677,21 +727,26 @@ class PredictionMSDeformableAttention(BaseModule):
         #       [bs ,num_queries, num_heads, num_levels, num_points].
         if torch.cuda.is_available() and value.is_cuda:
 
+            # GPU 张量走 CUDA 扩展；此处两个 dtype 分支均选择 fp32 包装器，保持原实现。
             # using fp16 deformable attention is unstable because it performs many sum operations
             if value.dtype == torch.float16:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             else:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             output = MultiScaleDeformableAttnFunction.apply(
-                value, spatial_shapes, level_start_index, sampling_locations,
-                attention_weights, self.im2col_step)
+                value, spatial_shapes, level_start_index, sampling_locations,  # [B,S,M,C/M], [L,2], [L], [B,Q,M,L,P,2]。
+                attention_weights, self.im2col_step)  # 权重 [B,Q,M,L,P]；输出 [B,Q,C]。
         else:
+            # 非 CUDA 路径：用 PyTorch 采样实现相同的汇聚流程。
             output = multi_scale_deformable_attn_pytorch(
-                value, spatial_shapes, sampling_locations, attention_weights)
+                value, spatial_shapes, sampling_locations, attention_weights)  # 输出 [B,Q,C]，与 CUDA 路径一致。
 
-        output = self.output_proj(output)
+        #* ================== 6. 输出投影 + Dropout + 残差 ==================
+        # 当前 WorldDecoder 使用 batch_first=True，输出与 identity 均为 [B,Q,C]。
+        # 本模块不做 LayerNorm/FFN，二者由外层 PredictionTransformerLayer 继续执行。
+        output = self.output_proj(output)  # [B,Q,C] → [B,Q,C]。
 
         if not self.batch_first:
             # (num_query, bs ,embed_dims)
-            output = output.permute(1, 0, 2)
-        return self.dropout(output) + identity
+            output = output.permute(1, 0, 2)  # [B,Q,C] → [Q,B,C]；当前配置不走此分支。
+        return self.dropout(output) + identity  # 当前 batch_first=True：返回 [B,Q,C]。

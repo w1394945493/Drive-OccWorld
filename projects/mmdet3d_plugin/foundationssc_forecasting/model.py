@@ -4,9 +4,11 @@ from contextlib import nullcontext
 from torch import nn
 from torch.nn import functional as F
 from mmdet.models import DETECTORS
+from mmdet.models.builder import NECKS, build_neck
 from ..foundationssc.image_model import FoundationSSCImageModel
 
 
+@NECKS.register_module()
 class PoseVoxelAttention(nn.Module):
     #! 三维可变形交叉注意力：未来网格 query 从上一时刻 voxel memory 采样。
     def __init__(self, channels, pc_range, heads=4, points=4):
@@ -79,7 +81,7 @@ class PoseVoxelAttention(nn.Module):
 @DETECTORS.register_module()
 class FoundationSSCForecastModel(FoundationSSCImageModel):
     #* 保持父类参数路径，load_from 可加载已训练的单帧 checkpoint；仅 dynamics 是新参数。
-    def __init__(self, future_steps=4, attention_heads=4, sampling_points=4,
+    def __init__(self, dynamics, future_steps=4,
                  freeze_frontend=True, freeze_decoder=True, **kwargs):
         #! 辅助监督跟随前端开关：解冻时保留两项监督，冻结时不创建语义辅助头。
         kwargs['use_depth_loss'] = not freeze_frontend
@@ -91,7 +93,6 @@ class FoundationSSCForecastModel(FoundationSSCImageModel):
         #* 默认复现原冻结策略；前端/解码器可分别解冻，FoundationStereo 始终冻结。
         self.freeze_frontend = freeze_frontend
         self.freeze_decoder = freeze_decoder
-        channels = kwargs['voxel_encoder'].get('channels', 128)
         #* 先冻结原模型，再按开关解冻；解码器虽冻结，未来分支仍需对输入特征求梯度。
         self.requires_grad_(False)
         for name in ('image_pyramid', 'voxel_encoder'):
@@ -100,9 +101,15 @@ class FoundationSSCForecastModel(FoundationSSCImageModel):
             self.plugin_head.requires_grad_(True)
         for name in ('occ_encoder_backbone', 'occ_encoder_neck', 'pts_bbox_head'):
             getattr(self, name).requires_grad_(not freeze_decoder)
-        #! 核心新增模块：未来各步共享这一套位姿条件三维注意力参数。
-        self.dynamics = PoseVoxelAttention(channels, kwargs['voxel_encoder']['point_cloud_range'],
-                                          attention_heads, sampling_points)
+
+
+        #! 复用 NECKS/build_neck 按配置 type 构建状态更新模块，未来各步共享同一个实例。
+        #* NECKS 仅负责注册与构建，不改变该模块在未来预测流程中的调用位置。
+        #* 替换接口：forward(state[B,C,X,Y,Z], target_to_memory[B,4,4]) → 同形状目标帧 state。
+        # 输入矩阵为目标→上一时刻的列向量变换；返回完整状态，而非需要外层再相加的残差。
+        # 保留 self.dynamics 名称和默认模块参数结构，已有注意力 checkpoint 的键名不变。
+        #* dynamics 的类型及参数全部由配置提供，不再从体素前端自动补齐。
+        self.dynamics = build_neck(dynamics)
         self.train(True)
 
     def train(self, mode=True):

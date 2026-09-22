@@ -16,8 +16,13 @@ custom_imports = dict(imports=['projects.mmdet3d_plugin.foundationssc_forecastin
 #! 各步查询上一时刻三维 memory，给定真实未来自车位姿；不再使用卷积残差基线。
 model = dict(type='FoundationSSCForecastModel', future_steps=4,
              freeze_frontend=freeze_frontend, freeze_decoder=freeze_decoder,
-             attention_heads=4, sampling_points=4,
+             #! 可替换的未来状态更新模块；显式指定全部构建参数。
+             #* channels/pc_range 必须与基础配置 voxel_encoder 的通道数/空间范围一致。
+             dynamics=dict(type='PoseVoxelAttention', channels=128,
+                           pc_range=(0, -25.6, -2, 51.2, 25.6, 4.4), heads=4, points=4),
              loss_depth_weight=1., loss_seg_weight=1.)  # 辅助损失启停由 freeze_frontend 决定。
+#* no_freeze 配置继承同一 dynamics；替换结构时用 dynamics=dict(_delete_=True, type='新注册类', ...)。
+# 新类用 @NECKS.register_module() 注册，并通过 custom_imports 导入；切换结构请更换 work_dir，避免自动恢复旧预测器。
 #! 仅当前双目图像，未来四帧标签用于监督；原始帧间隔5，按10Hz名义频率对应0.5秒。
 forecast_pipeline = [
     dict(type='LoadFoundationSSCStereo', input_size=(384, 1280)),

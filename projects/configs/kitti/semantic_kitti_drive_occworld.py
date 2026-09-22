@@ -211,6 +211,8 @@ model = dict(
         add_extra_convs='on_output',
         num_outs=4,
         relu_before_extra_convs=True),
+
+
     # *==============================#
     # * future pred head
     future_pred_head=dict(
@@ -312,7 +314,7 @@ model = dict(
                     feedforward_channels=_ffn_dim_,
                     ffn_dropout=0.1,
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
-                                     'cross_attn_action', 'norm', 'ffn', 'norm')))),
+                                     'cross_attn_action', 'norm', 'ffn', 'norm')))), # * operation_order
     ),
 
     pts_bbox_head=dict(
