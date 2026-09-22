@@ -121,8 +121,15 @@ def main():
             assert pred.shape == batch['gt_occ'].shape
             assert logits.shape == (pred.shape[0], model.pts_bbox_head.out_channel, *pred.shape[1:])
             assert torch.isfinite(logits).all() and torch.isfinite(output['voxel_feats']).all()
+            history = output['history_features']
+            assert len(history) == batch['history_img_inputs'][0].shape[1]
+            for features in history:
+                tensors = [features['img_feats'], *features['disparity'], *features['pyramid']]
+                tensors += [value for pair in features['dino_features'] for value in pair]
+                assert all(torch.isfinite(value).all() and not value.requires_grad for value in tensors)
+            print(f'历史图像特征：{len(history)} 帧，shape={[tuple(f["img_feats"].shape) for f in history]}，无梯度。')
             print(f"voxel_feats={tuple(output['voxel_feats'].shape)}；logits={tuple(logits.shape)}；pred={tuple(pred.shape)}")
-            del output, pred, logits
+            del output, pred, logits, history, features, tensors
             # 单独验证正式评估入口，而非仅手工调用混淆矩阵函数。
             items = model(return_loss=False, **batch)
             assert len(items) == batch['gt_occ'].shape[0]
